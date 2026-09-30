@@ -27,7 +27,7 @@
 ## Gap ledger (dedupe — READ FIRST, never re-pick)
 - `2026-08-26` issue #2690 (a11y) — pr-opened — fork PR #1 (fix/seed-comment-form-labels); fork CI not initialized at the time, verified locally
 - `2026-09-25..27` — error — engine/loop runs exited without an agent trace (Ollama web_search rejection era); no PR
-- `2026-09-30` — typo bundle (self-found) — see mined gaps below
+- `2026-09-30` — typo bundle (self-found, 10 fixes) — pr-opened — fork PR #36 (fix/typo-cleanup, +10/-10); fork CI green except the pre-existing Coordinator S1/S2 check (red on fork edge @3ee448588 and upstream edge @f9223dffe, unrelated)
 
 ## Mined gaps (discovered, not yet attempted)
 - `2026-09-30` typos in docs/config/UI text (Millenium, identifed, occured, recieve, contributer, accomodate, miliseconds, overriden, specificying x2) — status: attempted (this run)
