@@ -77,7 +77,7 @@ const BYODConfig = () => {
               Import external conversation data (comments and votes) from external sources for
               reporting metrics. This function requires uploading two CSV files, one containing
               comments, and another containing votes. Comment upload must occur first. After a
-              successful import job, you will recieve an email notifying you that the data is ready.
+              successful import job, you will receive an email notifying you that the data is ready.
             </Text>
           </Box>
 
