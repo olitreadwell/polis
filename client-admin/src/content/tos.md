@@ -60,7 +60,7 @@ These Terms of Use are a legally binding contract between you and The Computatio
    For clarity, The Computational Democracy Project does not permit copyright-infringing activities on the Service.
 
 10. **DMCA Takedown Requests.** &nbsp;
-    If you believe your copyright-protected work was posted to our Service without authorization, you may notify in accordance with the Digital Millenium Copyright Act at the following email address: <hello@compdemocracy.org>.
+    If you believe your copyright-protected work was posted to our Service without authorization, you may notify in accordance with the Digital Millennium Copyright Act at the following email address: <hello@compdemocracy.org>.
 
 11. **Prohibited Conduct.** &nbsp;
     **BY USING THE SERVICE YOU AGREE NOT TO:**

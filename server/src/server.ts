@@ -746,7 +746,7 @@ Thanks for using Polis!
     ).then(
       () => {
         emailTeam(
-          "contributer agreement signed",
+          "contributor agreement signed",
           [uid, agreement_version, github_id, name, email, company_name].join(
             "\n"
           )
