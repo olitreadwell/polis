@@ -34,7 +34,7 @@ const RawDataExport = ({ conversation, report_id }) => {
         <strong>Raw Data Export (Anonymous)</strong>
       </p>
       <p style={{ wordBreak: "break-all", fontFamily: "monospace", fontStyle: "italic" }}>
-        {`The following data exports are anonymized. Participants are identifed by an integer representing the order in which they first voted. For a full description of files and columns, please see: `}
+        {`The following data exports are anonymized. Participants are identified by an integer representing the order in which they first voted. For a full description of files and columns, please see: `}
         <a href="https://compdemocracy.org/export/"> https://compdemocracy.org/export/ </a>
         {` and, for the vote sign of each file: `}
         <a href="https://github.com/compdemocracy/polis/blob/edge/docs/export-format.md">
