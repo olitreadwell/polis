@@ -41,7 +41,7 @@ app.get('/api/v3/public', hybridAuthOptional(assignToP), handler);
 
 For complete authentication documentation including flows, token structures, and client integration, see:
 
-📖 **[/docs/AUTHENTICATION.md](../../docs/AUTHENTICATION.md)**
+📖 **[server/docs/authentication.md](../../docs/authentication.md)**
 
 ## Testing
 

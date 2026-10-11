@@ -103,5 +103,5 @@ npm test
 or in "watch" mode (re-run on file changes)
 
 ```sh
-npm run test:watch
+npm test -- --watch
 ```

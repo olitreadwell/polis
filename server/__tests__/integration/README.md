@@ -217,7 +217,7 @@ The test helpers are designed to handle various quirks of the legacy server:
 
 ### Email Testing
 
-The `email-helpers.js` file provides utilities for testing email functionality:
+The `email-helpers.ts` file provides utilities for testing email functionality:
 
 - **Finding Emails**: `findEmailByRecipient()` locates emails sent to specific recipients
 - **Content Extraction**: Functions to extract specific content like reset URLs from emails
@@ -277,7 +277,7 @@ And these agent-based versions of common test operations:
 - `submitVote(agent, options)`: Submits a vote using an agent
 - `setupAuthAndConvo(options)`: Sets up auth and creates a conversation using agents
 
-See `__tests__/integration/example-global-agent.test.js` for a full example of this pattern.
+See `__tests__/integration/example-global-agent.test.ts` for a full example of this pattern.
 
 ### Best Practices
 
@@ -323,8 +323,8 @@ const response = await agent.get("/api/v3/conversations");
 You can now run multiple test files without port conflicts:
 
 ```bash
-npm test -- __tests__/integration/comment.test.js
-npm test -- __tests__/integration/vote.test.js
+npm test -- __tests__/integration/comment.test.ts
+npm test -- __tests__/integration/vote.test.ts
 ```
 
 Or run all integration tests at once:
@@ -361,8 +361,8 @@ To improve test reliability and performance, we use shared test agents across al
 
 ### 2. Lifecycle Management
 
-- `globalSetup.js` creates a test server on a dynamic port and initializes agents if needed
-- `globalTeardown.js` closes the server but preserves agent instances
+- `globalSetup.ts` creates a test server on a dynamic port and initializes agents if needed
+- `globalTeardown.ts` closes the server but preserves agent instances
 - This allows agents to maintain their state (auth, etc.) across test files
 
 ### Using Agents in Tests
@@ -370,7 +370,7 @@ To improve test reliability and performance, we use shared test agents across al
 Always use the getter functions to access agents:
 
 ```javascript
-import { getTestAgent } from "../setup/api-test-helpers.js";
+import { getTestAgent } from "../setup/api-test-helpers.ts";
 
 describe("My Test Suite", () => {
   test("My Test", async () => {
@@ -384,7 +384,7 @@ describe("My Test Suite", () => {
 Or use the helper functions that utilize agents internally:
 
 ```javascript
-import { createComment, getTestAgent } from "../setup/api-test-helpers.js";
+import { createComment, getTestAgent } from "../setup/api-test-helpers.ts";
 
 describe("My Test Suite", () => {
   test("My Test", async () => {

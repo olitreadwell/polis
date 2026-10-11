@@ -45,7 +45,7 @@ Polis comes with Docker infrastructure for running a complete system, whether fo
 As a consequence, the only prerequisite to running Polis is that you install a recent `docker` (and Docker Desktop if you are on Mac or Windows).
 
 If you aren't able to use Docker for some reason, the various Dockerfiles found in subdirectories (`server`, `delphi`, `*-client`) of this repository _can_ be used as a reference for how you'd set up a system manually.
-If you're interested in doing the legwork to support alternative infrastructure, please [let us know in an issue](https://github.com/compdemocracy.org/issues).
+If you're interested in doing the legwork to support alternative infrastructure, please [let us know in an issue](https://github.com/compdemocracy/polis/issues).
 
 ### Quick Start
 

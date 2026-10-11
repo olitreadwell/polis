@@ -62,8 +62,8 @@ Detailed documentation is available in the following files:
 
 ## Dependencies
 
-- [EVōC](https://github.com/TuringLab/evoc) - For parameter-free clustering
-- [DataMapPlot](https://github.com/TuringLab/datamapplot) - For interactive visualization
+- [EVōC](https://github.com/TutteInstitute/evoc) - For parameter-free clustering
+- [DataMapPlot](https://github.com/TutteInstitute/datamapplot) - For interactive visualization
 - [UMAP](https://github.com/lmcinnes/umap) - For dimensionality reduction
 - [Sentence Transformers](https://github.com/UKPLab/sentence-transformers) - For text embeddings
 

@@ -39,7 +39,7 @@ npm run test:feature
 
 ```bash
 # Run tests in a specific file
-npm test -- __tests__/integration/participation.test.js
+npm test -- __tests__/integration/participation.test.ts
 
 # Run tests that match a specific name
 npm test -- -t "should do something specific"

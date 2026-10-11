@@ -47,7 +47,7 @@ python setup_minio.py
 ```
 
 ```bash
-./run_delphi.sh --zid=36416
+./run_delphi.py --zid=36416
 ```
 
 This is a Python implementation of the mathematical components of the [Pol.is](https://pol.is) conversation system, converted from the original Clojure codebase.
@@ -57,7 +57,7 @@ This is a Python implementation of the mathematical components of the [Pol.is](h
 - Processes Pol.is conversations using Python-based mathematical algorithms
 - Uses DynamoDB for storing intermediate and final results
 - Generates interactive and static visualizations for conversations
-- Stores visualizations in S3-compatible storage (see [S3_STORAGE.md](S3_STORAGE.md) for details)
+- Stores visualizations in S3-compatible storage (see [S3_STORAGE.md](docs/S3_STORAGE.md) for details)
 
 ## Topic-cluster naming (LLM provider)
 
