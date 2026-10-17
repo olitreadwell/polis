@@ -41,7 +41,7 @@ const Narrative = ({ sectionData, model }) => {
     console.log(error);
     return (
       <article style={{ maxWidth: "600px" }}>
-        <h5>An error occured</h5>
+        <h5>An error occurred</h5>
       </article>
     )
   }
