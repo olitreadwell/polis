@@ -11,7 +11,7 @@ But for even moderate scale in terms of size and number of concurrent conversati
 #### On a single machine
 
 Compose's replica option uses the current service name: `docker compose up --scale server=N`. Review the selected overlays, fixed host-port mappings and reverse-proxy routing before using multiple replicas; the root [service definition](../docker-compose.yml#L52) is the source for this topology.
-Typically, this would be run on a single machine, and thus for even moderate scale requires that the machine being deployed on have room to accomodate running a large number of containers, and an active math worker.
+Typically, this would be run on a single machine, and thus for even moderate scale requires that the machine being deployed on have room to accommodate running a large number of containers, and an active math worker.
 This complicates the process of adjusting in real time to changing demand in a cost and resource effective manner.
 
 For small to medium size deployments with rather steady or predictable participation rates, this may be a tenable solution.
