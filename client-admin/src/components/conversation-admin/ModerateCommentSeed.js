@@ -98,6 +98,7 @@ const ModerateCommentsSeed = ({ params }) => {
                 border: '1px solid',
                 borderColor: 'mediumGray'
               }}
+              aria-label="Seed comment text"
               onChange={handleTextareaChange}
               maxLength="400"
               data-testid="seed_form"
@@ -150,7 +151,12 @@ const ModerateCommentsSeed = ({ params }) => {
           </>
         )}
         <Box sx={{ mt: 2, display: 'block' }}>
-          <input onChange={handleFileChange} type="file" id="csvFile" accept=".csv"></input>
+          <input
+            onChange={handleFileChange}
+            type="file"
+            id="csvFile"
+            accept=".csv"
+            aria-label="Upload seed comments from a CSV file"></input>
           <Button
             disabled={loading || !csvText}
             onClick={handleSubmitSeedBulk}
