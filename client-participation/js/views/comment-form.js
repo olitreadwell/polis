@@ -7,9 +7,9 @@ var template = require("../templates/comment-form.handlebars");
 var display = require("../util/display");
 var eb = require("../eventBus");
 var Handlebones = require("handlebones");
-var M = require("../util/metrics");
 var ProfilePicView = require("../views/profilePicView");
 var serialize = require("../util/serialize");
+var VoteConvention = require("../util/voteConvention");
 var Strings = require("../strings");
 var Utils = require("../util/utils");
 var $ = require("jquery");
@@ -238,12 +238,9 @@ module.exports = Handlebones.ModelView.extend({
     var xid = Utils.getXid();
     var hasSocial = !_.isUndefined(xid);
     var needsSocial = false;
-    M.add(M.COMMENT_SUBMIT_CLICK);
     if (hasSocial || !needsSocial) {
-      M.add(M.COMMENT_SUBMIT_INIT);
       doSubmitComment();
     } else {
-      M.add(M.COMMENT_SUBMIT_SOCIAL_NEEDED);
       this.showSocialAuthChoices();
     }
   },
@@ -255,7 +252,7 @@ module.exports = Handlebones.ModelView.extend({
     attrs.pid = -1;
     attrs.conversation_id = this.conversation_id;
     // participants' comments are automatically agreed to. Needed for now since math assumes every comment has at least one vote.
-    attrs.vote = Constants.REACTIONS.AGREE;
+    attrs.vote = VoteConvention.toWire(VoteConvention.AGREE);
 
     if (/^\s*$/.exec(attrs.txt)) {
       alert(Strings.commentIsEmpty);

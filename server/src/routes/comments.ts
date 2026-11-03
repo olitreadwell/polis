@@ -1,20 +1,16 @@
 import _ from "underscore";
-import { ManagementClient } from "auth0";
-import { parse } from "csv-parse/sync";
-import badwords from "badwords/object";
 
 import { addParticipant } from "../participant";
 import { CommentOptions, GetCommentsParams, RequestWithP } from "../d";
 import { failJson } from "../utils/fail";
+import { parseSeedCsv } from "../utils/seedCsv";
 import { getConversationInfo } from "../conversation";
-import { getNextComment } from "../nextComment";
-import { getPidPromise, getUserInfoForUid2 } from "../user";
+import { getNextComment, checkInitialComment } from "../nextComment";
+import { getPidPromise } from "../user";
 import { getZinvite } from "../utils/zinvite";
 import { isModerator, polisTypes } from "../utils/common";
 import { MPromise } from "../utils/metered";
 import { votesPost } from "./votes";
-import analyzeComment from "../utils/moderation";
-import Config from "../config";
 import logger from "../utils/logger";
 import pg from "../db/pg-query";
 import {
@@ -30,14 +26,36 @@ import {
   finishOne,
   safeTimestampToMillis,
   sendEmailByUid,
-  updateConversationModifiedTime,
   updateLastInteractionTimeForConversation,
-  updateVoteCount,
 } from "../server-helpers";
 import { parsePagination, createPaginationMeta } from "../utils/pagination";
 
+/**
+ * A seed statement never gets an automatic vote from its author: not on
+ * POST /comments, not on a CSV upload (POST /comments-bulk), in any
+ * conversation. A statement records a vote for its author only when the
+ * request carries one, so an owner is offered their own seeds to vote on.
+ *
+ * History of the automatic pass that used to be cast here:
+ *  - The original handler (server/src/server.ts) gave a seed created with no
+ *    vote a pass from its author only in old conversations:
+ *    `is_seed && _.isUndefined(vote) && Number(zid) <= 17037`. #2024
+ *    (2025-07-24) kept that condition.
+ *  - #2117 (2025-08-08) dropped `Number(zid) <= 17037`, so every seed in
+ *    every conversation took the automatic pass.
+ *  - #2213 (2025-10-09) added an unconditional automatic pass for every seed
+ *    uploaded as a CSV.
+ *  - #2964 (2026-10-05) restored the cutoff for single seeds as a named
+ *    constant (17037). That number is a pol.is conversation number: a fresh
+ *    database numbers conversations from 1, so every other installation
+ *    stayed on the automatic-pass side, and the CSV path was untouched.
+ *  - Now there is no automatic pass and no cutoff (follow-up to #2952 and
+ *    #2964). Vote rows written by the earlier rules are left as they are.
+ */
+
 /* this is a concept and can be generalized to other handlers */
 interface PolisRequestParams {
+  initial_tid?: number;
   zid?: number;
   xid?: string;
   uid?: number;
@@ -79,22 +97,26 @@ interface PolisRequest {
   timedout?: any;
 }
 
-function hasBadWords(txt: string) {
-  txt = txt.toLowerCase();
-  const tokens = txt.split(" ");
-  for (let i = 0; i < tokens.length; i++) {
-    if (badwords[tokens[i]]) {
-      return true;
-    }
-  }
-  return false;
-}
+// The unique index on a conversation's statement texts, (zid, txt). A database
+// built from the migrations names it comments_zid_txt_key; databases whose
+// comments table predates them name it comments_txt_unique_constraint.
+const STATEMENT_TEXT_UNIQUE = new Set([
+  "comments_zid_txt_key",
+  "comments_txt_unique_constraint",
+]);
 
-const managementClient = new ManagementClient({
-  domain: Config.authDomain!,
-  clientId: Config.authClientId!,
-  clientSecret: Config.authClientSecret!,
-});
+// A unique violation means the statement is a duplicate only when it is on
+// (zid, txt). Any other one (the (zid, tid) statement-number index, a
+// participant constraint) is a server error, not the participant's duplicate.
+function isDuplicateStatement(
+  err: { code?: unknown; constraint?: unknown } | null | undefined
+): boolean {
+  return (
+    (err?.code === "23505" || err?.code === 23505) &&
+    typeof err.constraint === "string" &&
+    STATEMENT_TEXT_UNIQUE.has(err.constraint)
+  );
+}
 
 async function commentExists(zid: number, txt: string): Promise<boolean> {
   const rows = (await pg.queryP(
@@ -139,14 +161,38 @@ async function handle_GET_comments_translations(
   }
 }
 
+/**
+ * GET /api/v3/comments with moderation=true is the moderation list: every
+ * statement of the conversation with its moderation state (mod, active,
+ * velocity). It is for the conversation's moderators (isModerator: the owner,
+ * a user on the owner's site, a polis dev). Any other caller, signed in or
+ * not, gets the statements participants can see (the plain list's rows)
+ * without those fields, so rejected statements, a strict conversation's
+ * unmoderated queue and their authors' pids stay with the moderators. The vote
+ * counts asked for with include_voting_patterns remain, because public report
+ * pages read them. Report pages and the participation page's topic list send
+ * moderation=true without moderator rights, so the list narrows instead of
+ * refusing. A request without a uid is never a moderator's, so it costs no
+ * extra query; a request without moderation=true is passed through untouched.
+ */
+async function commentsListParams(
+  p: RequestWithP["p"]
+): Promise<GetCommentsParams> {
+  if (!p.moderation) return p as GetCommentsParams;
+  const moderator =
+    p.uid !== undefined && p.uid !== null && (await isModerator(p.zid, p.uid));
+  return { ...p, participantVisibleOnly: !moderator } as GetCommentsParams;
+}
+
 async function handle_GET_comments(req: RequestWithP, res: any): Promise<void> {
   try {
+    const listParams = await commentsListParams(req.p);
     // Check if pagination is explicitly requested for backwards compatibility
     const isPaginationRequested = req.p.limit !== undefined;
 
     if (!isPaginationRequested) {
       // Legacy response format: return array directly via finishArray
-      let comments = (await getComments(req.p as GetCommentsParams)) as any[];
+      let comments = (await getComments(listParams)) as any[];
 
       // Handle report selections if needed
       if (req.p.rid) {
@@ -181,11 +227,11 @@ async function handle_GET_comments(req: RequestWithP, res: any): Promise<void> {
     );
 
     // Get total count
-    const total = await getCommentsCount(req.p as GetCommentsParams);
+    const total = await getCommentsCount(listParams);
 
     // Get comments with pagination
     const params = {
-      ...req.p,
+      ...listParams,
       limit: pagination.limit,
       offset: pagination.offset,
     } as GetCommentsParams;
@@ -239,46 +285,10 @@ async function handle_GET_comments(req: RequestWithP, res: any): Promise<void> {
 }
 
 function addNotificationTask(zid: number): Promise<any> {
-  return pg.queryP(
+  return pg.queryP_notification(
     "insert into notification_tasks (zid) values ($1) on conflict (zid) do update set modified = now_as_millis();",
     [zid]
-  );
-}
-
-interface CommentModerationResult {
-  active: boolean;
-  mod: number;
-  classifications: string[];
-}
-
-export async function isProConvo(owner: number): Promise<boolean> {
-  try {
-    const { email } = await getUserInfoForUid2(owner);
-    if (!email) {
-      logger.warn(`No email found for owner ID: ${owner}`);
-      return false;
-    }
-    const users = await managementClient.usersByEmail.getByEmail({ email });
-
-    if (!users || users.data.length === 0) {
-      logger.warn(`No OIDC user found for email: ${email}`);
-      return false;
-    }
-    const user = users.data[0];
-    const userId = user.user_id;
-
-    if (!userId) {
-      logger.error(`OIDC user object for ${email} is missing a user_id.`);
-      return false;
-    }
-    const roles = await managementClient.users.getRoles({ id: userId });
-    const hasRole = roles.data.some((role) => role.name === "delphi-enabled");
-
-    return hasRole;
-  } catch (error) {
-    logger.error(error);
-    return false;
-  }
+  ).catch((error) => logger.warn("notification_task_deferred", { error }));
 }
 
 function moderateCommentQuery(
@@ -315,49 +325,6 @@ function moderateCommentQuery(
       }
     });
   });
-}
-
-// Perform content moderation checks (Pro feature - toxicity analysis and profanity filtering)
-// Note: Seed and moderator comments bypass this function entirely
-async function moderateComment(
-  txt: string,
-  conversation: any,
-  ip?: string | undefined
-): Promise<CommentModerationResult> {
-  let active = true;
-  const classifications: string[] = [];
-  let mod = 0;
-
-  // Run moderation checks in parallel
-  const [polisModResponse, bad] = await Promise.all([
-    analyzeComment(txt, conversation.topic, ip),
-    Promise.resolve(hasBadWords(txt)),
-  ]);
-
-  if (bad && conversation.profanity_filter) {
-    active = false;
-    classifications.push("bad");
-    logger.info("active=false because (bad && conv.profanity_filter)");
-  }
-
-  const commentToxicityThreshold = 100;
-
-  const toxicityScore = Number(polisModResponse);
-
-  if (typeof toxicityScore === "number" && !isNaN(toxicityScore)) {
-    logger.debug(
-      `Polismod toxicity Score for comment "${txt}": ${toxicityScore}`
-    );
-
-    if (toxicityScore >= commentToxicityThreshold) {
-      active = false;
-      mod = -1;
-      classifications.push("bad");
-      logger.info("active=false because (Toxicity)");
-    }
-  }
-
-  return { active, mod, classifications };
 }
 
 /**
@@ -462,25 +429,18 @@ async function handle_POST_comments(req: RequestWithP, res: any) {
       return;
     }
 
-    const ip =
-      req.headers["x-forwarded-for"] ||
-      req.connection?.remoteAddress ||
-      req.socket?.remoteAddress ||
-      req.connection?.socket?.remoteAddress;
-
     // 4. Moderate the comment
     let active = true;
     let mod = 0;
 
-    // Always auto-approve seed comments regardless of pro status
-    if (is_seed || is_moderator) {
+    // Only a moderator can contribute a seed statement: from anyone else the
+    // flag is ignored and the statement is moderated like any other.
+    const seed = Boolean(is_seed) && is_moderator;
+
+    // Seed and moderator statements are approved on arrival.
+    if (seed || is_moderator) {
       mod = polisTypes.mod.ok;
       active = true;
-    } else if (await isProConvo(conversation.owner)) {
-      // Only apply pro moderation features to non-seed comments
-      const moderationResult = await moderateComment(txt, conversation, ip);
-      active = moderationResult.active;
-      mod = moderationResult.mod;
     }
 
     // 5. Detect language
@@ -504,7 +464,7 @@ async function handle_POST_comments(req: RequestWithP, res: any) {
         mod,
         uid,
         false, // anon
-        is_seed || false,
+        seed,
         lang,
         lang_confidence,
       ]
@@ -513,12 +473,10 @@ async function handle_POST_comments(req: RequestWithP, res: any) {
     const comment = insertedComment[0];
     const tid = comment.tid;
 
-    // 7. Handle voting on the comment if specified
-    const shouldDefaultVote = req.p.is_seed && _.isUndefined(vote);
-    const finalVote = shouldDefaultVote ? 0 : vote;
-
-    if (!_.isUndefined(finalVote)) {
-      await votesPost(uid, pid, zid, tid, finalVote, 0, false);
+    // 7. Record the author's vote only when the request carries one. A seed
+    // gets no automatic vote (see the note above PolisRequestParams).
+    if (!_.isUndefined(vote)) {
+      await votesPost(uid, pid, zid, tid, vote, 0, false);
     }
 
     // 8. Handle moderation notifications
@@ -547,15 +505,8 @@ async function handle_POST_comments(req: RequestWithP, res: any) {
       addNotificationTask(zid);
     }
 
-    // 9. Schedule async updates
-    const createdTimeMillis = safeTimestampToMillis(comment.created);
-    setTimeout(() => {
-      updateConversationModifiedTime(zid, new Date(createdTimeMillis));
-      updateLastInteractionTimeForConversation(zid, uid);
-      if (!_.isUndefined(finalVote)) {
-        updateVoteCount(zid, pid);
-      }
-    }, 100);
+    // Notification state cannot occupy a participation connection.
+    void updateLastInteractionTimeForConversation(zid, uid);
 
     // 10. Build response
     const response: any = {
@@ -578,7 +529,7 @@ async function handle_POST_comments(req: RequestWithP, res: any) {
       stack: err.stack,
     });
 
-    if (err.code === "23505" || err.code === 23505) {
+    if (isDuplicateStatement(err)) {
       failJson(res, 409, "polis_err_post_comment_duplicate", err);
     } else if (
       err.code === "23503" &&
@@ -711,9 +662,24 @@ async function handle_GET_nextComment(
     return;
   }
 
-  const pid = req.p.pid || req.p.not_voted_by_pid;
+  const pid = req.p.pid ?? req.p.not_voted_by_pid;
 
   try {
+    if (req.p.initial_tid !== undefined) {
+      const initial = await checkInitialComment(
+        req.p.zid!,
+        pid ?? -1,
+        req.p.initial_tid,
+        req.p.lang
+      );
+      if (!req.timedout)
+        res.status(200).json({
+          ...initial.comment,
+          currentPid: pid,
+          initialStatus: initial.status,
+        });
+      return;
+    }
     const next = await getNextComment(
       req.p.zid,
       pid,
@@ -848,8 +814,10 @@ async function handle_POST_comments_bulk(
   }
 
   try {
-    const [finalPid, is_moderator] = await Promise.all([
-      doGetPid(),
+    // Refuse a non-moderator before resolving a participant. Creating the row
+    // first left a refused caller as an existing member, and an invite-only
+    // conversation admits existing members on every later vote and comment.
+    const [is_moderator] = await Promise.all([
       isModerator(zid!, uid!),
       getConversationInfo(zid!),
     ]);
@@ -859,15 +827,22 @@ async function handle_POST_comments_bulk(
       return;
     }
 
+    // Validate before creating a participant or storing any comments. Otherwise
+    // a headerless upload consumes its first comment as column names.
+    const records = parseSeedCsv(String(csv));
+    if (!records) {
+      failJson(res, 400, "polis_err_csv_header", undefined, {
+        message:
+          "CSV header must be comment_text, optionally with original_id.",
+      });
+      return;
+    }
+
+    const finalPid = await doGetPid();
     if (finalPid < 0) {
       failJson(res, 500, "polis_err_post_comment_bad_pid");
       return;
     }
-
-    const records = parse(String(csv), {
-      columns: true,
-      skip_empty_lines: true,
-    });
 
     const results = [];
     let lastInteractionTime = new Date(0);
@@ -946,14 +921,9 @@ async function handle_POST_comments_bulk(
           lastInteractionTime = createdTime;
         }
 
-        // Handle default vote for seed comments (matching handle_POST_comments behavior)
-        if (is_seed) {
-          await votesPost(uid!, finalPid, zid!, tid, 0, 0, false);
-          // Schedule vote count update
-          setTimeout(() => {
-            updateVoteCount(zid!, finalPid);
-          }, 100);
-        }
+        // No vote is recorded for the uploader: an uploaded seed gets no
+        // automatic vote, and this route carries no vote of its own (see the
+        // note above PolisRequestParams).
 
         if (!active) {
           addNotificationTask(zid!);
@@ -962,20 +932,16 @@ async function handle_POST_comments_bulk(
         results.push({ txt, status: "success", tid, original_id });
       } catch (err: any) {
         logger.error("polis_err_bulk_comment_item", { error: err, txt });
-        let reason = "polis_err_post_comment";
-        if (err.code === "23505" || err.code === 23505) {
-          reason = "polis_err_post_comment_duplicate";
-        }
+        const reason = isDuplicateStatement(err)
+          ? "polis_err_post_comment_duplicate"
+          : "polis_err_post_comment";
         results.push({ txt, status: "error", reason });
       }
     }
 
-    setTimeout(() => {
-      if (lastInteractionTime > new Date(0)) {
-        updateConversationModifiedTime(zid!, lastInteractionTime);
-        updateLastInteractionTimeForConversation(zid!, uid!);
-      }
-    }, 100);
+    if (lastInteractionTime > new Date(0)) {
+      void updateLastInteractionTimeForConversation(zid!, uid!);
+    }
 
     res.json({
       results,

@@ -1,3 +1,4 @@
+import { resultClient } from "../../../utils/delphiResults";
 import { Request, Response } from "express";
 import logger from "../../../utils/logger";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -10,12 +11,9 @@ const dynamoDBConfig: any = {
 };
 if (Config.dynamoDbEndpoint) {
   dynamoDBConfig.endpoint = Config.dynamoDbEndpoint;
-  dynamoDBConfig.credentials = {
-    accessKeyId: "DUMMYIDEXAMPLE",
-    secretAccessKey: "DUMMYEXAMPLEKEY",
-  };
   logger.info(`Using local DynamoDB at endpoint: ${Config.dynamoDbEndpoint}`);
-} else {
+}
+{
   if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
     dynamoDBConfig.credentials = {
       accessKeyId: Config.AWS_ACCESS_KEY_ID,
@@ -26,13 +24,12 @@ if (Config.dynamoDbEndpoint) {
     logger.info(`Using default AWS credential provider chain`);
   }
 }
-const client = new DynamoDBClient(dynamoDBConfig);
-const docClient = DynamoDBDocumentClient.from(client, {
+const docClient = resultClient(() => DynamoDBDocumentClient.from(new DynamoDBClient(dynamoDBConfig), {
   marshallOptions: {
     convertEmptyValues: true,
     removeUndefinedValues: true,
   },
-});
+}));
 
 /**
  * Handler for feeds directory listing - shows available feeds for a report

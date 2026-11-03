@@ -530,6 +530,8 @@ def _create_tables(dynamodb, tables, existing_tables):
 def create_tables(endpoint_url=None, region_name='us-east-1', 
                  delete_existing=False, evoc_only=False, polismath_only=False,
                  aws_profile=None):
+    if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+        return []
     # Use the environment variable if endpoint_url is not provided
     if endpoint_url is None:
         endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
@@ -546,13 +548,6 @@ def create_tables(endpoint_url=None, region_name='us-east-1',
         polismath_only: If True, create only Polis math tables
         aws_profile: AWS profile to use (optional)
     """
-    # Set up environment variables for credentials if not already set (for local development)
-    if not os.environ.get('AWS_ACCESS_KEY_ID') and endpoint_url and ('localhost' in endpoint_url or 'host.docker.internal' in endpoint_url or 'polis-dynamodb-local' in endpoint_url):
-        os.environ['AWS_ACCESS_KEY_ID'] = 'fakeMyKeyId'
-    
-    if not os.environ.get('AWS_SECRET_ACCESS_KEY') and endpoint_url and ('localhost' in endpoint_url or 'host.docker.internal' in endpoint_url or 'polis-dynamodb-local' in endpoint_url):
-        os.environ['AWS_SECRET_ACCESS_KEY'] = 'fakeSecretAccessKey'
-    
     # Create DynamoDB session and resource
     session_args = {'region_name': region_name}
     if aws_profile:
@@ -601,6 +596,9 @@ def create_tables(endpoint_url=None, region_name='us-east-1',
     return created_tables
 
 def main():
+    if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+        print('Postgres result schema is managed by migrations; no Dynamo bootstrap')
+        return
     # Parse arguments
     parser = argparse.ArgumentParser(description='Create DynamoDB tables for Delphi system')
     parser.add_argument('--endpoint-url', type=str, default=None,

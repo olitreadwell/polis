@@ -3,7 +3,6 @@ import crypto from "crypto";
 import { encode } from "html-entities";
 import { Promise as BluebirdPromise } from "bluebird";
 
-import { emailTeam } from "../email/senders";
 import { failJson } from "../utils/fail";
 import { getConversationInfo } from "../conversation";
 import { getNumberOfCommentsRemaining } from "../comment";
@@ -115,7 +114,7 @@ function unsubscribeFromNotifications(zid: number, uid?: number) {
 }
 
 function maybeAddNotificationTask(zid: number, timeInMillis: number) {
-  return pg.queryP(
+  return pg.queryP_notification(
     "insert into notification_tasks (zid, modified) values ($1, $2) on conflict (zid) do nothing;",
     [zid, timeInMillis]
   );
@@ -123,7 +122,7 @@ function maybeAddNotificationTask(zid: number, timeInMillis: number) {
 
 function claimNextNotificationTask() {
   return pg
-    .queryP(
+    .queryP_notification(
       "delete from notification_tasks where zid = (select zid from notification_tasks order by random() for update skip locked limit 1) returning *;"
     )
     .then((rows: string | any[]) => {
@@ -146,7 +145,9 @@ function doNotificationBatch() {
             // Since we claimed the task above, there will be no record, so we need to
             // put it back to trigger a retry - unless there's a new one there, in which case we should
             // leave the new one.
-            maybeAddNotificationTask(task.zid, task.modified);
+            return maybeAddNotificationTask(task.zid, task.modified).then(
+              () => undefined
+            );
           }
         }
       );
@@ -156,7 +157,7 @@ function doNotificationBatch() {
 
 function getDbTime() {
   return pg
-    .queryP("select now_as_millis();", [])
+    .queryP_notification("select now_as_millis();", [])
     .then((rows: { now_as_millis: any }[]) => {
       return rows[0].now_as_millis;
     });
@@ -166,8 +167,19 @@ function doNotificationsForZid(zid: number, timeOfLastEvent: any) {
   let shouldTryAgain = false;
 
   return pg
-    .queryP(
-      "select * from participants where zid = ($1) and last_notified < ($2) and subscribed > 0;",
+    .queryP_notification(
+      `SELECT p.*,
+        GREATEST(p.last_interaction, activity.latest) AS last_interaction,
+        CASE WHEN activity.latest > p.last_interaction THEN 0 ELSE p.nsli END AS nsli
+       FROM participants p
+       CROSS JOIN LATERAL (
+         SELECT GREATEST(
+           (SELECT MAX(v.created) FROM votes v WHERE v.zid=p.zid AND v.pid=p.pid),
+           (SELECT MAX(c.created) FROM comments c WHERE c.zid=p.zid AND c.uid=p.uid),
+           (SELECT MAX(m.created) FROM crowd_mod m WHERE m.zid=p.zid AND m.pid=p.pid)
+         ) AS latest
+       ) activity
+       WHERE p.zid = ($1) AND p.last_notified < ($2) AND p.subscribed > 0;`,
       [zid, timeOfLastEvent]
     )
     .then((candidates: any[]) => {
@@ -265,7 +277,7 @@ function doNotificationsForZid(zid: number, timeOfLastEvent: any) {
           const pids = _.pluck(needNotification, "pid");
 
           return pg
-            .queryP(
+            .queryP_notification(
               "select uid, subscribe_email from participants_extended where uid in (select uid from participants where pid in (" +
                 pids.join(",") +
                 "));",
@@ -289,9 +301,14 @@ function doNotificationsForZid(zid: number, timeOfLastEvent: any) {
                     conversation_id,
                     uidToEmail[uid]
                   ).then(() => {
-                    return pg.queryP(
-                      "update participants set last_notified = now_as_millis(), nsli = nsli + 1 where uid = ($1) and zid = ($2);",
-                      [uid, zid]
+                    return pg.queryP_notification(
+                      "update participants set last_notified = now_as_millis(), last_interaction = GREATEST(last_interaction, $3::bigint), nsli = CASE WHEN last_interaction > $3::bigint THEN nsli ELSE $4::integer + 1 END where uid = ($1) and zid = ($2);",
+                      [
+                        uid,
+                        zid,
+                        pid_to_ptpt[item.pid].last_interaction,
+                        pid_to_ptpt[item.pid].nsli,
+                      ]
                     );
                   });
                 }
@@ -309,9 +326,9 @@ let notificationLoopStarted = false;
 
 function doNotificationLoop() {
   logger.debug("doNotificationLoop");
-  doNotificationBatch().then(() => {
-    setTimeout(doNotificationLoop, 10000);
-  });
+  doNotificationBatch()
+    .catch((error) => logger.warn("notification_batch_deferred", { error }))
+    .finally(() => setTimeout(doNotificationLoop, 10000));
 }
 
 function sendNotificationEmail(
@@ -486,8 +503,17 @@ function handle_POST_convSubscriptions(
   }
 
   if (type === 1) {
-    subscribeToNotifications(zid, uid, email)
-      .then(finish)
+    getConversationInfo(zid)
+      .then(function (info) {
+        // A conversation with subscriptions turned off (subscribe_type 0)
+        // collects no addresses: the request is refused before anything is
+        // stored.
+        if (!info || !info.subscribe_type) {
+          failJson(res, 403, "polis_err_subscriptions_disabled");
+          return;
+        }
+        return subscribeToNotifications(zid, uid, email).then(finish);
+      })
       .catch(function (err: any) {
         failJson(res, 500, "polis_err_sub_conv " + zid + " " + uid, err);
       });
@@ -507,43 +533,8 @@ function handle_POST_convSubscriptions(
   }
 }
 
-function handle_POST_notifyTeam(
-  req: {
-    p: {
-      webserver_pass: string | undefined;
-      webserver_username: string | undefined;
-      subject: any;
-      body: any;
-    };
-  },
-  res: {
-    status: (arg0: number) => {
-      (): any;
-      new (): any;
-      json: { (arg0: {}): void; new (): any };
-    };
-  }
-) {
-  if (
-    req.p.webserver_pass !== Config.webserverPass ||
-    req.p.webserver_username !== Config.webserverUsername
-  ) {
-    return failJson(res, 403, "polis_err_notifyTeam_auth");
-  }
-  const subject = req.p.subject;
-  const body = req.p.body;
-  emailTeam(subject, body)
-    .then(() => {
-      res.status(200).json({});
-    })
-    .catch((err: any) => {
-      return failJson(res, 500, "polis_err_notifyTeam", err);
-    });
-}
-
 export {
   handle_GET_notifications_subscribe,
   handle_GET_notifications_unsubscribe,
   handle_POST_convSubscriptions,
-  handle_POST_notifyTeam,
 };

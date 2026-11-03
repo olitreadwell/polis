@@ -12,7 +12,7 @@
 //   server-helpers.ts:287   lost the consensus/repness tids -> no featured
 //                           comment authors at all
 //
-// The second reviewer's review rejected treating that as a cost-authorized waiver, and asked
+// The review rejected treating that as a cost-authorized waiver, and asked
 // for a latest-EXISTING read that still returns undefined after a single query
 // when a conversation has no math row. That is `getLatestExistingPca`.
 //
@@ -21,8 +21,8 @@
 // functions on thin express routes rather than importing `routes/comments.ts`
 // and `routes/votes.ts`: the changed lines live in `nextComment.ts` and
 // `server-helpers.ts`, and both route handlers are thin pass-throughs, so
-// pulling in their unrelated import graphs (auth0, csv-parse, badwords,
-// moderation, ...) would mock far more than it proves.
+// pulling in their unrelated import graphs (auth0, csv-parse, ...) would
+// mock far more than it proves.
 
 import {
   afterEach,
@@ -87,6 +87,10 @@ const COMMENTS = [
 jest.mock("../../src/comment", () => ({
   __esModule: true,
   getComments: () => Promise.resolve(COMMENTS.map((c) => ({ ...c }))),
+  getNextCommentCandidates: () =>
+    Promise.resolve(COMMENTS.map((c) => ({ tid: c.tid }))),
+  getNextCommentRow: (_zid: number, tid: number) =>
+    Promise.resolve({ ...COMMENTS.find((c) => c.tid === tid) }),
   getNumberOfCommentsRemaining: () =>
     Promise.resolve([{ total: 2, remaining: 2 }]),
   translateAndStoreComment: (c: unknown) => Promise.resolve(c),
@@ -147,7 +151,7 @@ import { getNextComment } from "../../src/nextComment";
 import { doFamousQuery } from "../../src/server-helpers";
 
 // Priorities that make the choice observable: with them, tid 0 wins; without
-// them every comment defaults to weight 1 and tid 1 wins. The second reviewer's review used
+// them every comment defaults to weight 1 and tid 1 wins. The review used
 // exactly this shape ({0:100, 1:1}, random fraction 0.75).
 const PRIORITIES = { "0": 100, "1": 1 };
 const FIXED_RANDOM = 0.75;
@@ -196,6 +200,19 @@ function installPg(mathRow: { math_tick: string } | null) {
         ptptstats_data: {}, ptptstats_math_tick: mathRow.math_tick,
         ticks_math_tick: mathRow.math_tick,
       }] : []);
+    }
+    // The next-statement draw reads only the priorities field of the row.
+    if (s.includes("data->'comment-priorities' as priorities from math_main")) {
+      return Promise.resolve(
+        mathRow
+          ? [
+              {
+                math_tick: mathRow.math_tick,
+                priorities: mathBlob()["comment-priorities"],
+              },
+            ]
+          : []
+      );
     }
     if (s.includes("from math_main")) {
       return Promise.resolve(
@@ -273,7 +290,7 @@ describe("nextComment over HTTP reads the latest EXISTING generation", () => {
   });
 
   test("a conversation with no math row still routes, and still costs one query", async () => {
-    // The cheap path the second reviewer asked to preserve: no `math_main` row means one
+    // The cheap path the reviewer asked to preserve: no `math_main` row means one
     // query and an immediate undefined -- never createEmptyPcaStructure's
     // second `select tid from comments` synthesis.
     installPg(null);

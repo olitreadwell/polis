@@ -10,7 +10,7 @@ import { getMathBundle } from "./utils/mathBundle";
 import { getSocialParticipants } from "./participant";
 import { getUserInfoForUid2 } from "./user";
 import { getZinvite, getZinvites } from "./utils/zinvite";
-import { ifDefinedFirstElseSecond, polisTypes } from "./utils/common";
+import { ifDefinedFirstElseSecond } from "./utils/common";
 import { MPromise } from "./utils/metered";
 import { PcaCacheItem } from "./utils/pca";
 import { sendTextEmail } from "./email/senders";
@@ -18,6 +18,8 @@ import { UserInfo } from "./d";
 import Config from "./config";
 import logger from "./utils/logger";
 import pg from "./db/pg-query";
+import { conversationModifiedSql } from "./db/activity";
+import { storageToSemantic } from "./votes/convention";
 
 // TODO consider "p2a24a2dadadu15" format
 const votesForZidPidCache = new LruCache({
@@ -60,9 +62,10 @@ function safeTimestampToMillis(timestamp: any): number {
       return Date.now();
     }
 
-    // If timestamp looks like Unix seconds (less than year 2100 in milliseconds)
+    // Legacy Unix seconds between 2001 and 2100; the upper bound is in seconds.
+    // Current database BIGINT milliseconds must survive repeated normalization.
     const timestampMs =
-      timestamp < 4102444800000 && timestamp > 1000000000
+      timestamp < 4102444800 && timestamp > 1000000000
         ? timestamp * 1000
         : timestamp;
     const date = new Date(timestampMs);
@@ -86,7 +89,7 @@ function safeTimestampToMillis(timestamp: any): number {
     }
 
     // Try parsing as number first (for string numbers)
-    const numericValue = parseFloat(timestamp);
+    const numericValue = Number(timestamp);
     if (!isNaN(numericValue) && Number.isFinite(numericValue)) {
       return safeTimestampToMillis(numericValue);
     }
@@ -437,17 +440,13 @@ function updateConversationModifiedTime(zid: number, t?: Date | number) {
 }
 
 function updateLastInteractionTimeForConversation(zid: number, uid?: number) {
-  return pg.queryP(
+  return pg.queryP_notification(
     "update participants set last_interaction = now_as_millis(), nsli = 0 where zid = ($1) and uid = ($2);",
     [zid, uid]
-  );
-}
-
-function updateVoteCount(zid: number, pid: number) {
-  return pg.queryP(
-    "update participants set vote_count = (select count(*) from votes where zid = ($1) and pid = ($2)) where zid = ($1) and pid = ($2)",
-    [zid, pid]
-  );
+  ).catch((error) => {
+    // Best effort: a busy notification lane must never reject a committed vote.
+    logger.warn("notification_interaction_deferred", { error });
+  });
 }
 
 function addStar(
@@ -489,7 +488,6 @@ function pullXInfoIntoSubObjects(ptptoiRecord: any) {
   if (p.x_profile_image_url || p.xid || p.x_email) {
     p.xInfo = {};
     p.xInfo.x_profile_image_url = p.x_profile_image_url;
-    p.xInfo.xid = p.xid;
     p.xInfo.x_name = p.x_name;
     // p.xInfo.x_email = p.x_email;
     delete p.x_profile_image_url;
@@ -606,12 +604,12 @@ function aggregateVotesToPidVotesObj(votes: any[]): { [key: string]: string } {
     // set up a vector for the participant, if not there already
     vectors[v.pid] = vectors[v.pid] || createEmptyVoteVector(greatestTid);
     // assign a vote value at that location
-    const vote = v.vote;
-    if (polisTypes.reactions.push === vote) {
+    const vote = storageToSemantic(v.vote, { onInvalid: "skip" });
+    if (vote === "disagree") {
       vectors[v.pid][v.tid] = "d";
-    } else if (polisTypes.reactions.pull === vote) {
+    } else if (vote === "agree") {
       vectors[v.pid][v.tid] = "a";
-    } else if (polisTypes.reactions.pass === vote) {
+    } else if (vote === "pass") {
       vectors[v.pid][v.tid] = "p";
     } else {
       logger.error("unknown vote value");
@@ -676,7 +674,7 @@ function getOneConversation(zid: number, uid?: number, lang?: string) {
   return new Promise(function (resolve: any, _reject: any) {
     Promise.all([
       pg.queryP_readOnly(
-        "select * from conversations left join  (select uid, site_id from users) as u on conversations.owner = u.uid where conversations.zid = ($1);",
+        `select conversations.*, u.*, ${conversationModifiedSql("conversations")} as modified from conversations left join (select uid, site_id from users) as u on conversations.owner = u.uid where conversations.zid = ($1);`,
         [zid]
       ),
       getConversationHasMetadata(zid),
@@ -734,6 +732,5 @@ export {
   sendEmailByUid,
   updateConversationModifiedTime,
   updateLastInteractionTimeForConversation,
-  updateVoteCount,
   userHasAnsweredZeQuestions,
 };

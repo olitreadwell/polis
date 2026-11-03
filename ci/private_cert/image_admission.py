@@ -18,7 +18,7 @@ from control import encoded, sha
 
 SCHEMA = 'polis-private-images/1'
 ROLES = {'producer': 'produce', 'verifier': 'verify'}
-# BOARD [677]: step-2 paired-recording scope; shadow diagnostics are separate.
+# step-2 paired-recording scope; shadow diagnostics are separate.
 GATES = {'inventory', 'strict', 'g12'}
 CONTROLS = {'missing-evidence', 'forged-evidence', 'truncated-evidence',
             'short-inventory', 'wrong-input', 'wrong-policy', 'stale-checkpoint',
@@ -44,6 +44,18 @@ def digest_stream(f):
 def file_digest(path):
     with Path(path).open('rb') as f:
         return digest_stream(f)[0]
+
+
+# The launcher source each image kind is staged and admitted with. launcher.py
+# stays byte-identical for every kind admitted before backfill-verify: their
+# archives recorded its digest, and re-admission compares against the file.
+# A new kind gets its own launcher file rather than editing that one.
+LAUNCHERS = {'backfill-verify': 'launcher_verify.py', 'vote-census': 'launcher_vote_census.py'}
+
+
+def launcher_source(recipe):
+    kind = recipe.get('kind') if recipe.get('schema') == 'polis-private-image-recipe/2' else None
+    return Path(__file__).resolve().parent / 'images' / LAUNCHERS.get(kind, 'launcher.py')
 
 
 def json_bytes(raw):
@@ -73,7 +85,7 @@ def validate_recipe(recipe):
     kind = recipe.get('kind') if census else None
     if census:
         fields.add('kind')
-        if kind not in ('roles-census', 'light-shadow-compare'):
+        if kind not in ('roles-census', 'light-shadow-compare', 'backfill-verify', 'vote-census'):
             raise ValueError('IMAGE_RECIPE_KIND')
     if (type(recipe) is not dict or set(recipe) != fields
             or recipe['schema'] != ('polis-private-image-recipe/2' if census else 'polis-private-image-recipe/1')
@@ -116,6 +128,29 @@ def validate_recipe(recipe):
         if any(p.startswith('math/') or (recipe['role'] == 'reader' and p.startswith('delphi/'))
                for p in files):
             raise ValueError('SHADOW_SOURCE_CLOSURE')
+    elif kind == 'vote-census':
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'probe_box'))
+        from vote_census import POLICY_SHA as VOTE_POLICY_SHA, SQL_SHA256
+        expected = {'ci/probe_box/' + n + '.py' for n in ('vote_census', 'receipt', 'contracts')}
+        expected.add('ci/private_cert/images/vote_census_' + recipe['role'] + '.py')
+        if recipe['role'] == 'reader':
+            expected.add('ci/probe_box/vote_census.sql')
+        if (recipe['entrypoint'] != 'ci/private_cert/images/vote_census_' + recipe['role'] + '.py'
+                or recipe['policySha256'] != VOTE_POLICY_SHA or set(files) != expected
+                or (recipe['role'] == 'reader' and files['ci/probe_box/vote_census.sql'] != SQL_SHA256)):
+            raise ValueError('VOTE_CENSUS_SOURCE_CLOSURE')
+    elif kind == 'backfill-verify':
+        if recipe['entrypoint'] != 'ci/private_cert/images/backfill_verify_' + recipe['role'] + '.py':
+            raise ValueError('VERIFY_ENTRYPOINT')
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'probe_box'))
+        from backfill_verify import POLICY_SHA as VERIFY_POLICY_SHA
+        if recipe['policySha256'] != VERIFY_POLICY_SHA:
+            raise ValueError('VERIFY_POLICY')
+        # Aggregate SQL and closed schemas only: no engine, no Clojure tree.
+        if any(p.startswith(('delphi/', 'math/')) for p in files):
+            raise ValueError('VERIFY_SOURCE_CLOSURE')
     elif census:
         expected = 'ci/private_cert/images/roles_' + recipe['role'] + '.py'
         if recipe['entrypoint'] != expected:

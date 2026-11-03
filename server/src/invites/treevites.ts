@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
+import type { PoolClient } from "pg";
 
 import { failJson } from "../utils/fail";
 import { generateRandomCode, generateLoginCode } from "../auth/generate-token";
@@ -13,7 +14,39 @@ import {
 import Config from "../config";
 import pg from "../db/pg-query";
 import logger from "../utils/logger";
+import { isModerator } from "../utils/common";
+import { getPidPromise } from "../user";
+import { addParticipant } from "../participant";
 
+// Administering an invite-only conversation's waves and owner invite codes is
+// work performed against someone else's conversation: the invite codes are the
+// keys that let a stranger past the participation gate. So the admin routes take
+// the same ownership gate as the other conversation-admin routes (the data
+// export, the conversation UUID): only the conversation's owner, or a moderator
+// on the owner's site, may read or mint them. Everyone else is refused with 403
+// before any read or write. Returns true when the caller is authorised; when it
+// is not, it has already answered the request and the handler must stop.
+async function requireConversationOwnerOrModerator(
+  req: { p: { uid?: number; zid: number } },
+  res: any
+): Promise<boolean> {
+  const { uid, zid } = req.p;
+  let isMod: boolean;
+  try {
+    isMod = await isModerator(zid, uid);
+  } catch (err) {
+    failJson(res, 500, "polis_err_treevite_auth_check", err);
+    return false;
+  }
+  if (!isMod) {
+    failJson(res, 403, "polis_err_treevite_not_conversation_owner");
+    return false;
+  }
+  return true;
+}
+
+// Inserts one invite with a fresh code, on `client` when given (to be part of
+// its transaction), otherwise as a statement of its own.
 async function insertInviteWithRetry(
   params: {
     zid: number;
@@ -21,20 +54,67 @@ async function insertInviteWithRetry(
     parentInviteId: number | null;
     inviteOwnerPid: number | null;
   },
+  client?: PoolClient,
   maxAttempts = 5
 ): Promise<number> {
   const { zid, waveId, parentInviteId, inviteOwnerPid } = params;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const code = generateRandomCode(10);
-    const rows = await pg.queryP<{ id: number }>(
-      "insert into treevite_invites (zid, wave_id, parent_invite_id, invite_code, invite_owner_pid) values (($1), ($2), ($3), ($4), ($5)) on conflict (zid, invite_code) do nothing returning id;",
-      [zid, waveId, parentInviteId, code, inviteOwnerPid]
-    );
+    const sql =
+      "insert into treevite_invites (zid, wave_id, parent_invite_id, invite_code, invite_owner_pid) values (($1), ($2), ($3), ($4), ($5)) on conflict (zid, invite_code) do nothing returning id;";
+    const values = [zid, waveId, parentInviteId, code, inviteOwnerPid];
+    const rows = client
+      ? (await client.query<{ id: number }>(sql, values)).rows
+      : await pg.queryP<{ id: number }>(sql, values);
     if (rows && (rows as any).length) {
       return (rows as any)[0].id as number;
     }
   }
   throw new Error("polis_err_treevite_invite_code_collision");
+}
+
+/**
+ * Bring participant `pid` to exactly `invitesPerUser` codes of child wave
+ * `waveId`: count the codes they already own in that wave and insert only the
+ * missing ones. Returns how many it inserted.
+ *
+ * Both issuing paths come through here: wave creation, for members of the
+ * parent wave who have already joined, and acceptInvite, for a member joining
+ * a wave whose child waves already exist. The two can run at once for the same
+ * member (a wave created while that member is joining), and a member can be
+ * found twice (one participant who used two codes of the parent wave). So the
+ * count and the inserts run in one transaction under an advisory lock on
+ * (wave, participant): whichever issuer comes second sees the first one's
+ * codes and adds none. The lock is held for that count and those few inserts,
+ * and only another issue of the same participant's codes in the same wave ever
+ * waits on it.
+ */
+async function issuePerUserInviteCodes(params: {
+  zid: number;
+  waveId: number;
+  parentInviteId: number;
+  pid: number;
+  invitesPerUser: number;
+}): Promise<number> {
+  const { zid, waveId, parentInviteId, pid, invitesPerUser } = params;
+  return pg.withTransaction(async (client) => {
+    await client.query(
+      "select pg_advisory_xact_lock(hashtextextended(jsonb_build_array('treevite:per-user-codes', ($1)::bigint, ($2)::int)::text, 0));",
+      [waveId, pid]
+    );
+    const held = await client.query<{ n: number }>(
+      "select count(*)::int as n from treevite_invites where wave_id = ($1) and invite_owner_pid = ($2);",
+      [waveId, pid]
+    );
+    const missing = Math.max(invitesPerUser - held.rows[0].n, 0);
+    for (let i = 0; i < missing; i++) {
+      await insertInviteWithRetry(
+        { zid, waveId, parentInviteId, inviteOwnerPid: pid },
+        client
+      );
+    }
+    return missing;
+  });
 }
 
 function computeFingerprint(zid: number, pid: number, code: string): string {
@@ -99,18 +179,16 @@ async function createParticipantInviteCodes(
   // Create invite codes for each child wave
   for (const childWave of childWaveRows) {
     logger.info(
-      `Creating ${childWave.invites_per_user} invite codes for pid ${pid} in child wave ${childWave.wave} (id: ${childWave.id})`
+      `Issuing up to ${childWave.invites_per_user} invite codes for pid ${pid} in child wave ${childWave.wave} (id: ${childWave.id})`
     );
 
-    for (let i = 0; i < childWave.invites_per_user; i++) {
-      await insertInviteWithRetry({
-        zid,
-        waveId: childWave.id,
-        parentInviteId,
-        inviteOwnerPid: pid,
-      });
-      totalCodes++;
-    }
+    totalCodes += await issuePerUserInviteCodes({
+      zid,
+      waveId: childWave.id,
+      parentInviteId,
+      pid,
+      invitesPerUser: childWave.invites_per_user,
+    });
   }
 
   logger.info(
@@ -138,17 +216,13 @@ async function createRetroactiveInviteCodes(
 
   // Create invite codes for each existing participant
   for (const participant of existingParticipants) {
-    const ownerPid = participant.invite_used_by_pid;
-
-    for (let i = 0; i < invitesPerUser; i++) {
-      await insertInviteWithRetry({
-        zid,
-        waveId: newWaveId,
-        parentInviteId: participant.parent_invite_id,
-        inviteOwnerPid: ownerPid,
-      });
-      createdCount++;
-    }
+    createdCount += await issuePerUserInviteCodes({
+      zid,
+      waveId: newWaveId,
+      parentInviteId: participant.parent_invite_id,
+      pid: participant.invite_used_by_pid,
+      invitesPerUser,
+    });
   }
 
   logger.info(
@@ -199,6 +273,10 @@ export async function handle_POST_treevite_waves(req: any, res: any) {
 
     if (typeof zid !== "number") {
       failJson(res, 400, "polis_err_treevite_missing_zid");
+      return;
+    }
+
+    if (!(await requireConversationOwnerOrModerator(req, res))) {
       return;
     }
 
@@ -277,22 +355,15 @@ export async function handle_POST_treevite_waves(req: any, res: any) {
           return;
         }
 
-        const parentMembers = (await pg.queryP_readOnly(
-          "select id as parent_invite_id, invite_used_by_pid from treevite_invites where wave_id = ($1) and invite_used_by_pid is not null;",
-          [parentWaveId]
-        )) as { parent_invite_id: number; invite_used_by_pid: number }[];
-
-        for (const member of parentMembers) {
-          const ownerPid = member.invite_used_by_pid || null;
-          for (let i = 0; i < invitesPerUser; i++) {
-            await insertInviteWithRetry({
-              zid,
-              waveId,
-              parentInviteId: member.parent_invite_id,
-              inviteOwnerPid: ownerPid,
-            });
-          }
-        }
+        // Members who have already joined the parent wave are given their
+        // codes now; anyone who joins it later is given them on joining
+        // (acceptInvite). Each member is issued once, whichever comes first.
+        await createRetroactiveInviteCodes(
+          zid,
+          waveId,
+          parentWaveId,
+          invitesPerUser
+        );
       } else {
         // parentWave == 0 → create invites_per_user root invites
         for (let i = 0; i < invitesPerUser; i++) {
@@ -303,26 +374,6 @@ export async function handle_POST_treevite_waves(req: any, res: any) {
             inviteOwnerPid: null,
           });
         }
-      }
-    }
-
-    // Create invite codes for existing participants from parent wave
-    if (invitesPerUser > 0 && parentWave > 0) {
-      // Find parent wave id for retroactive code creation
-      const parentWaveRows = (await pg.queryP_readOnly(
-        "select id from treevite_waves where zid = ($1) and wave = ($2);",
-        [zid, parentWave]
-      )) as { id: number }[];
-      const parentWaveId =
-        parentWaveRows && parentWaveRows[0] && parentWaveRows[0].id;
-
-      if (parentWaveId) {
-        await createRetroactiveInviteCodes(
-          zid,
-          waveId,
-          parentWaveId,
-          invitesPerUser
-        );
       }
     }
 
@@ -352,6 +403,10 @@ export async function handle_GET_treevite_waves(req: any, res: any) {
       return;
     }
 
+    if (!(await requireConversationOwnerOrModerator(req, res))) {
+      return;
+    }
+
     let q =
       "select id, zid, wave, parent_wave, invites_per_user, owner_invites, size, created_at, updated_at from treevite_waves where zid = ($1)";
     const params: any[] = [zid];
@@ -366,6 +421,21 @@ export async function handle_GET_treevite_waves(req: any, res: any) {
   } catch (err) {
     failJson(res, 500, "polis_err_treevite_list_waves", err);
   }
+}
+
+// The invitee's participants row, created as every other join creates it
+// (addParticipant): the wait for the conversation's participant lock (the
+// pid_auto trigger's session advisory lock) is bounded, a connection that saw
+// an error is closed rather than pooled, and an INSERT that loses the race for
+// a participant number to a concurrent join is tried once more instead of
+// refusing the invitee. Only the participants row is created, as an accept
+// always has.
+async function insertInvitedParticipant(
+  zid: number,
+  uid: number
+): Promise<number> {
+  const rows = await addParticipant(zid, uid, { extendedRow: false });
+  return rows[0].pid;
 }
 
 // POST /api/v3/treevite/acceptInvite
@@ -401,9 +471,19 @@ export async function handle_POST_treevite_acceptInvite(req: any, res: any) {
 
     // Check if we already have a participant from existing auth
     if (req.p.uid && req.p.pid && req.p.pid > 0) {
-      // Use existing authenticated participant
+      // A pid only has meaning in the conversation whose token carried it. The
+      // bearer token may have been issued for another conversation
+      // (hybridAuthOptional accepts it and sets req.p.pid from it), so the token's
+      // pid must never be trusted to identify a participant here. Resolve this
+      // user's participant for THIS conversation on the primary instead — the same
+      // scoping the vote and comment paths apply to a token presented for another
+      // conversation — and create it for a legitimate first-time accept so a real
+      // accept is never rejected.
       uid = req.p.uid;
-      pid = req.p.pid;
+      pid = await getPidPromise(zid, uid, true);
+      if (pid < 0) {
+        pid = await insertInvitedParticipant(zid, uid);
+      }
     } else {
       // Create new anonymous user and participant
       // This bypasses the normal treevite protection since we have a valid invite
@@ -412,11 +492,7 @@ export async function handle_POST_treevite_acceptInvite(req: any, res: any) {
       )) as { uid: number }[];
       uid = uidRows[0].uid;
 
-      const partRows = (await pg.queryP(
-        "insert into participants (uid, zid) values (($1), ($2)) returning pid;",
-        [uid, zid]
-      )) as { pid: number }[];
-      pid = partRows[0].pid;
+      pid = await insertInvitedParticipant(zid, uid);
     }
 
     // Now mark the invite as used with the actual pid (atomically)
@@ -628,6 +704,10 @@ export async function handle_GET_treevite_invites(req: any, res: any) {
       return;
     }
 
+    if (!(await requireConversationOwnerOrModerator(req, res))) {
+      return;
+    }
+
     // Parse pagination parameters
     const pagination = parsePagination(
       {
@@ -695,6 +775,10 @@ export async function handle_GET_treevite_invites_csv(req: any, res: any) {
 
     if (typeof zid !== "number") {
       failJson(res, 400, "polis_err_treevite_missing_zid");
+      return;
+    }
+
+    if (!(await requireConversationOwnerOrModerator(req, res))) {
       return;
     }
 

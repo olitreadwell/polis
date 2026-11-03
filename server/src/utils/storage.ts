@@ -1,3 +1,4 @@
+import { resultClient } from "./delphiResults";
 import {
   DeleteItemCommand,
   DescribeTableCommand,
@@ -33,7 +34,7 @@ export default class DynamoStorageService {
   constructor(tableName: string, disableCache?: boolean) {
     // Shared credential precedence: local endpoint -> real configured keys ->
     // default AWS credential provider chain (the EC2 instance role in prod).
-    this.client = makeDynamoClient();
+    this.client = resultClient(() => makeDynamoClient());
     this.tableName = tableName;
     this.cacheDisabled = disableCache || false;
   }
@@ -244,13 +245,15 @@ export default class DynamoStorageService {
         itemsToDelete = scanResponse.Items;
         lastEvaluatedKey = scanResponse.LastEvaluatedKey;
 
+        // A filtered Scan page can be empty while later pages still hold
+        // matches (another report's rows filled it): keep paging.
         if (!itemsToDelete || itemsToDelete.length === 0) {
-          if (!lastEvaluatedKey) {
+          if (!lastEvaluatedKey && totalDeletedCount === 0) {
             logger.debug(
               `No items found with report ID prefix: ${reportIdPrefix}`
             );
           }
-          break;
+          continue;
         }
         logger.debug(
           `Found ${itemsToDelete.length} items to delete in this batch.`
@@ -321,13 +324,20 @@ export default class DynamoStorageService {
       },
     };
 
-    const scanCommand = new ScanCommand(scanParams);
-
     try {
-      const scanResponse = await this.client.send(scanCommand);
-      const items = scanResponse.Items;
+      const items: any[] = [];
+      let lastEvaluatedKey: Record<string, any> | undefined;
+      do {
+        const scanResponse = await this.client.send(new ScanCommand({
+          ...scanParams,
+          ExclusiveStartKey: lastEvaluatedKey,
+        }));
+        items.push(...(scanResponse.Items || []));
+        lastEvaluatedKey = scanResponse.LastEvaluatedKey;
+        // Filtering can leave a page empty while later pages still match.
+      } while (lastEvaluatedKey);
 
-      if (!items || items.length === 0) {
+      if (items.length === 0) {
         logger.debug(`No items found with report ID prefix: ${reportIdPrefix}`);
         return { success: true, data: [] };
       }

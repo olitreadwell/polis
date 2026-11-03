@@ -1,6 +1,6 @@
 /*
- * CO08/D4 first-generation route coverage, from the second reviewer's round-2 probe
- * (cost-reduction/scripts/p2727-r2-node-review.cjs), committed unchanged in
+ * CO08/D4 first-generation route coverage, from the review's round-2 probe
+ * (a Node review script kept outside this repository), committed unchanged in
  * substance.
  *
  * It mounts the REAL `handle_GET_math_pca2` on a real Express app over loopback
@@ -56,10 +56,12 @@ async function main() {
   try {
     const whole=await get();
     const subset=await get('?keys=math_tick,n,tids');
-    const conditional=await get('',{'If-None-Match':'"0"'});
+    // Echo the validator the route served; a bare numeric tag is the legacy client form.
+    const conditional=await get('',{'If-None-Match':whole.etag});
+    const legacyConditional=await get('',{'If-None-Match':'"0"'});
     const warm=await pca.getPca(1,undefined);
     console.log(JSON.stringify({pgTickType:typeof raw[0].math_tick,coldUndefinedPresent:!!cold,
-      whole,subset,conditional,warmUndefinedPresent:!!warm}));
+      whole,subset,conditional,legacyConditional,warmUndefinedPresent:!!warm}));
   } finally {await new Promise(resolve=>server.close(resolve));}
 }
 main().then(()=>process.exit(0),e=>{console.error(e);process.exit(1);});

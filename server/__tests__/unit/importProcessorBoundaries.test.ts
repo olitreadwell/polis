@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, jest, test } from "@jest/globals";
 import { Readable } from "node:stream";
+// The fixture vote helper: the stored value of a vote named by meaning.
+import { seedVote } from "../../characterization/seed-vote.cjs";
 
 jest.mock("@aws-sdk/client-s3", () => ({
   S3Client: jest.fn().mockImplementation(() => ({ send: jest.fn() })),
@@ -32,7 +34,17 @@ jest.mock("../../src/email/senders", () => ({ sendTextEmail: jest.fn() }));
 import pg from "../../src/db/pg-query";
 import logger from "../../src/utils/logger";
 import { sendTextEmail } from "../../src/email/senders";
-import { processImportJob, s3Client } from "../../src/workers/import-processor";
+import {
+  processImportJob,
+  s3Client,
+  splitImportDeclaration,
+} from "../../src/workers/import-processor";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  semanticToStorage,
+  VOTE_DECLARATION_ERRORS,
+} from "../../src/votes/convention";
 
 const query = jest.mocked(pg.queryP);
 const connect = jest.mocked(pg.connect);
@@ -47,6 +59,7 @@ const payload = {
 const header = "vote_id,user_id,vote_value,timestamp,comment_id\n";
 const events: string[] = [];
 let csv: string;
+let resetDatabase: () => void;
 let client: { query: jest.Mock; release: jest.Mock };
 
 function jobUpdates(status: string) {
@@ -64,18 +77,49 @@ beforeEach(() => {
   jest.resetAllMocks();
   events.length = 0;
   csv = header + "v1,public-one,1,2024-01-01T00:00:00Z,comment-one\n";
+  const identities = new Map<string, number>();
+  const latest = new Map<string, any>();
+  let count = 0;
+  resetDatabase = () => {
+    identities.clear();
+    latest.clear();
+    count = 0;
+  };
   client = {
     query: jest.fn(async (sql: unknown, values?: any[]) => {
       const text = String(sql);
       events.push(text.trim().split(/\s+/).slice(0, 3).join(" "));
-      if (text.includes("SELECT p.pid")) {
-        return {
-          rows: [...new Set(values![1])].map((username, pid) => ({
-            username,
-            pid,
-          })),
-        };
+      if (text.includes("AS occupied")) return { rows: [{ occupied: false }] };
+      if (text.includes("pg_try_advisory_xact_lock"))
+        return { rows: [{ acquired: true }] };
+      if (text.includes("INSERT INTO participants")) {
+        const rows = values![2].map((name: string) => {
+          const pid = identities.size;
+          identities.set(name, pid);
+          return { pid, uid: pid };
+        });
+        return { rows };
       }
+      if (text.includes("SELECT p.pid"))
+        return {
+          rows: [...identities]
+            .filter(([, pid]) => values![1].includes(pid))
+            .map(([username, pid]) => ({ username, pid })),
+        };
+      if (text.includes("SELECT count(*)")) return { rows: [{ n: count }] };
+      if (text.includes("INSERT INTO votes (")) {
+        const [, pids, tids, votes, timestamps] = values!;
+        count += pids.length;
+        pids.forEach((pid: number, i: number) =>
+          latest.set(`${pid}:${tids[i]}`, {
+            pid,
+            tid: tids[i],
+            vote: votes[i],
+            modified: String(timestamps[i]),
+          })
+        );
+      }
+      if (text.includes("SELECT v.pid")) return { rows: [...latest.values()] };
       return { rows: [] };
     }),
     release: jest.fn(),
@@ -83,6 +127,7 @@ beforeEach(() => {
   connect.mockResolvedValue(client as never);
   query.mockImplementation(async (sql: string) => {
     events.push(sql.replace(/\s+/g, " ").trim());
+    if (sql.includes("AS occupied")) return [{ occupied: false }];
     return sql.includes("SELECT tid, original_id")
       ? [{ tid: 0, original_id: "comment-one" }]
       : [];
@@ -95,6 +140,13 @@ beforeEach(() => {
 });
 
 describe("CSV import transaction and lifecycle boundaries", () => {
+  test("stores an out-of-range vote_value unchanged, as before the convention module", async () => {
+    csv += "v2,public-one,2,2024-01-02T00:00:00Z,comment-one\n";
+    csv += "v3,public-two,-7,2024-01-03T00:00:00Z,comment-one\n";
+    await processImportJob(payload);
+    expect(voteInserts()[0][1][3]).toEqual([-1, 2, -7]);
+  });
+
   test("maps public CSV signs and comment IDs, retains participant zero, and skips unknown comments", async () => {
     csv += "v2,public-one,-1,2024-01-02T00:00:00Z,comment-one\n";
     csv += "v3,public-two,0,2024-01-03T00:00:00Z,comment-one\n";
@@ -105,17 +157,24 @@ describe("CSV import transaction and lifecycle boundaries", () => {
       7,
       [0, 0, 1],
       [0, 0, 0],
-      [-1, 1, 0],
+      // The three CSV vote_value cells (export convention) stored as agree, disagree, pass.
+      [seedVote("agree"), seedVote("disagree"), seedVote("pass")],
       [1704067200000, 1704153600000, 1704240000000],
     ]);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("missing-comment")
     );
     expect(client.release).toHaveBeenCalledTimes(1);
+    // Closed, not pooled: the batch's participant lock must not outlive it.
+    expect(client.release).toHaveBeenCalledWith(true);
     expect(jobUpdates("completed")).toHaveLength(1);
     expect(jobUpdates("failed")).toHaveLength(0);
     expect(events.indexOf("COMMIT")).toBeLessThan(
-      events.findIndex((e) => e.startsWith("INSERT INTO votes_latest_unique"))
+      events.findIndex(
+        (e, i) =>
+          i > events.indexOf("COMMIT") &&
+          e.startsWith("INSERT INTO votes_latest_unique")
+      )
     );
     const completed = events.findIndex((e) => e.includes("'completed'"));
     const latest = events.findIndex((e) =>
@@ -166,7 +225,9 @@ describe("CSV import transaction and lifecycle boundaries", () => {
   });
 
   test("no mapped comments aborts before downloading or opening a transaction", async () => {
-    query.mockResolvedValue([]);
+    query.mockImplementation(async (sql) =>
+      sql.includes("AS occupied") ? [{ occupied: false }] : []
+    );
     await expect(processImportJob(payload)).rejects.toThrow(
       "No comments found"
     );
@@ -215,6 +276,7 @@ describe("CSV import transaction and lifecycle boundaries", () => {
     expect(client.query).toHaveBeenCalledWith("ROLLBACK");
     expect(client.query).not.toHaveBeenCalledWith("COMMIT");
     expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
     expect(
       query.mock.calls.some(([sql]) =>
         String(sql).includes("INSERT INTO votes_latest_unique")
@@ -274,5 +336,86 @@ describe("CSV import transaction and lifecycle boundaries", () => {
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining("CRITICAL DOUBLE FAULT")
     );
+  });
+});
+
+// The declared sign (P-078 PR-E). Fixture files hold the declaration lines; see
+// docs/export-format.md for the rule.
+const declarationFixture = (name: string) =>
+  readFileSync(
+    join(__dirname, "..", "fixtures", "vote-declaration", name),
+    "utf8"
+  );
+const withoutFirstLine = (text: string) => text.slice(text.indexOf("\n") + 1);
+const storedValues = () => voteInserts()[0][1][3];
+
+describe("a declared vote sign on the import file", () => {
+  test("absent: the file is read in the export convention, as before", async () => {
+    csv = withoutFirstLine(declarationFixture("import-declared.csv"));
+    await processImportJob(payload);
+    expect(storedValues()).toEqual(
+      (["agree", "disagree", "pass"] as const).map((v) => semanticToStorage(v))
+    );
+    expect(jobUpdates("completed")).toHaveLength(1);
+  });
+
+  test("present and matching: the declaration line is dropped and every row stores what the undeclared file stores", async () => {
+    csv = withoutFirstLine(declarationFixture("import-declared.csv"));
+    await processImportJob(payload);
+    const undeclared = storedValues();
+    jest.clearAllMocks();
+    // This comparison is a new empty target, not redelivery of a prior import.
+    client.query.mockClear();
+    resetDatabase();
+    csv = declarationFixture("import-declared.csv");
+    await processImportJob(payload);
+    expect(voteInserts()).toHaveLength(1);
+    expect(storedValues()).toEqual(undeclared);
+    expect(voteInserts()[0][1][1]).toEqual([0, 1, 2]); // three participants, header read
+    expect(jobUpdates("completed")).toHaveLength(1);
+    expect(jobUpdates("failed")).toHaveLength(0);
+  });
+
+  test("present with CRLF line endings and no format id: accepted", async () => {
+    csv = declarationFixture("import-declared-crlf-no-format.csv");
+    await processImportJob(payload);
+    expect(storedValues()).toEqual([semanticToStorage("agree")]);
+    expect(jobUpdates("completed")).toHaveLength(1);
+  });
+
+  test.each([
+    ["import-mismatch-sign.csv", VOTE_DECLARATION_ERRORS.mismatch],
+    ["import-mismatch-format.csv", VOTE_DECLARATION_ERRORS.mismatch],
+    ["import-malformed.csv", VOTE_DECLARATION_ERRORS.malformed],
+  ])("%s: refused with %s before any row is written", async (file, code) => {
+    csv = declarationFixture(file);
+    await expect(processImportJob(payload)).rejects.toThrow(code);
+    expect(connect).not.toHaveBeenCalled();
+    expect(jobUpdates("failed")[0][1]).toEqual([11, code]);
+    expect(jobUpdates("completed")).toHaveLength(0);
+    expect(mail.mock.calls[0][3]).toContain(code);
+  });
+
+  test("the declaration is found however the object body is chunked, and no byte after it is lost", async () => {
+    const text = declarationFixture("import-declared.csv");
+    const chunks = Array.from(text, (c) => Buffer.from(c));
+    const { body, declared } = await splitImportDeclaration(
+      Readable.from(chunks)
+    );
+    expect(declared).not.toBeNull();
+    let rest = "";
+    for await (const chunk of body) rest += Buffer.from(chunk).toString();
+    expect(rest).toBe(withoutFirstLine(text));
+  });
+
+  test("an undeclared body is replayed byte for byte", async () => {
+    const text = withoutFirstLine(declarationFixture("import-declared.csv"));
+    const { body, declared } = await splitImportDeclaration(
+      Readable.from([text.slice(0, 7), text.slice(7)])
+    );
+    expect(declared).toBeNull();
+    let rest = "";
+    for await (const chunk of body) rest += Buffer.from(chunk).toString();
+    expect(rest).toBe(text);
   });
 });

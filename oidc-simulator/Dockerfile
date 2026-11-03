@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.4
 # Use an official Node.js runtime as a parent image
-FROM node:24-slim
+FROM node:24.22.1-bookworm-slim
 
 # Install curl for health checks, openssl for certificate generation, and create certificate directory
-RUN apt-get update && apt-get install -y curl openssl && rm -rf /var/lib/apt/lists/* && \
+RUN apt-get update && apt-get install -y curl openssl ca-certificates=20250419~deb12u2 && rm -rf /var/lib/apt/lists/* && \
     mkdir -p /root/.simulacrum/certs
 
 # Set the working directory in the container
@@ -16,7 +16,7 @@ COPY package*.json ./
 RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 20000 && \
     npm config set fetch-retry-maxtimeout 120000
-RUN --mount=type=cache,target=/root/.npm npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
 
 # Bundle app source
 COPY . .

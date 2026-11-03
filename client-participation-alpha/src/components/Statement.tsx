@@ -3,16 +3,16 @@ import { uiLanguage } from '../lib/lang'
 import type { Translations } from '../strings/types'
 import InfoIcon from './icons/InfoIcon'
 import type { StatementData } from './types'
+import type { Vote } from '../api/votes'
 
 interface StatementProps {
   statement: StatementData
-  onVote: (voteType: number, tid: number | string) => void
+  onVote: (vote: Vote, tid: number | string) => void
   isVoting: boolean
   s: Translations
   isStatementImportant: boolean
   setIsStatmentImportant: React.Dispatch<React.SetStateAction<boolean>>
   voteError: string | null
-  importanceEnabled?: boolean
 }
 
 export function Statement({
@@ -22,8 +22,7 @@ export function Statement({
   s,
   isStatementImportant,
   setIsStatmentImportant,
-  voteError,
-  importanceEnabled = false
+  voteError
 }: StatementProps) {
   const [showImportanceDesc, setShowImportanceDesc] = useState<boolean>(false)
   const [translationsEnabled, setTranslationsEnabled] = useState<boolean>(false)
@@ -60,9 +59,9 @@ export function Statement({
   const shouldShowHideButton =
     translationsEnabled && (hasNonOfficialTranslation || !statement.translations)
 
-  const handleVoteClick = (voteType: number) => {
+  const handleVoteClick = (vote: Vote) => {
     if (isVoting) return
-    onVote(voteType, statement.tid)
+    onVote(vote, statement.tid)
   }
 
   const passUnsureText = s.pass
@@ -86,11 +85,7 @@ export function Statement({
             {s.anonPerson} {s.x_wrote}
           </span>
         </div>
-        {remainingText && (
-          <span className="statement-remaining">
-            {remainingText}
-          </span>
-        )}
+        {remainingText && <span className="statement-remaining">{remainingText}</span>}
       </div>
 
       {/* Show official translation (replaces original) or original text */}
@@ -163,32 +158,28 @@ export function Statement({
         </p>
       )}
 
-      {importanceEnabled ? (
-        <>
-          <div className="importance-container">
-            <label htmlFor="important">{s.importantCheckbox}</label>
-            <input
-              id="important"
-              type="checkbox"
-              onChange={() => setIsStatmentImportant((prev) => !prev)}
-              checked={isStatementImportant}
-            />
-            <InfoIcon
-              size={17}
-              className="info-icon"
-              onClick={() => setShowImportanceDesc((prev) => !prev)}
-              aria-label={s.infoIconAriaLabel}
-            />
-          </div>
+      <div className="importance-container">
+        <label htmlFor="important">{s.importantCheckbox}</label>
+        <input
+          id="important"
+          type="checkbox"
+          onChange={() => setIsStatmentImportant((prev) => !prev)}
+          checked={isStatementImportant}
+        />
+        <InfoIcon
+          size={17}
+          className="info-icon"
+          onClick={() => setShowImportanceDesc((prev) => !prev)}
+          aria-label={s.infoIconAriaLabel}
+        />
+      </div>
 
-          {showImportanceDesc && <p className="importance-desc">{s.importantCheckboxDesc}</p>}
-        </>
-      ) : null}
+      {showImportanceDesc && <p className="importance-desc">{s.importantCheckboxDesc}</p>}
 
       <div className="vote-buttons">
         <button
           className="vote-button agree"
-          onClick={() => handleVoteClick(-1)}
+          onClick={() => handleVoteClick('agree')}
           disabled={isVoting}
           aria-label={s.agree}
           data-testid="vote-agree"
@@ -197,7 +188,7 @@ export function Statement({
         </button>
         <button
           className="vote-button disagree"
-          onClick={() => handleVoteClick(1)}
+          onClick={() => handleVoteClick('disagree')}
           disabled={isVoting}
           aria-label={s.disagree}
           data-testid="vote-disagree"
@@ -206,7 +197,7 @@ export function Statement({
         </button>
         <button
           className="vote-button pass"
-          onClick={() => handleVoteClick(0)}
+          onClick={() => handleVoteClick('pass')}
           disabled={isVoting}
           aria-label={passUnsureText}
           data-testid="vote-pass"

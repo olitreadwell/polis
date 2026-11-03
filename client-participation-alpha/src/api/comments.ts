@@ -1,6 +1,7 @@
 import { uiLanguage } from '../lib/lang'
 import PolisNet from '../lib/net'
 import type { Comment, NextCommentResponse } from './types'
+import { toWire, type Vote } from './votes'
 
 export async function fetchComments(
   conversationId: string,
@@ -22,11 +23,14 @@ export async function fetchComments(
 
 export async function fetchNextComment(
   conversationId: string,
-  lang?: string
-): Promise<NextCommentResponse> {
+  lang?: string,
+  initialTid?: number | string
+): Promise<NextCommentResponse & { initialStatus?: 'eligible' | 'voted' | 'unavailable' }> {
   const params: Record<string, string> = {
     conversation_id: conversationId
   }
+
+  if (initialTid !== undefined) params.initial_tid = String(initialTid)
 
   // Auto-detect language only if not provided (undefined)
   const detectedLang = lang !== undefined ? lang : uiLanguage()
@@ -42,8 +46,10 @@ export async function submitComment(payload: {
   txt: string
   pid: number
   is_seed?: boolean
-  vote?: number
+  /** The author's own vote on the new comment, sent as its wire number. */
+  vote?: Vote
   agid?: number
 }): Promise<unknown> {
-  return await PolisNet.polisPost('/comments', payload)
+  const body = payload.vote === undefined ? payload : { ...payload, vote: toWire(payload.vote) }
+  return await PolisNet.polisPost('/comments', body)
 }

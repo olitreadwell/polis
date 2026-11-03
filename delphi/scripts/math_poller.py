@@ -9,6 +9,8 @@ delphi/docs/MATH_POLLER_DESIGN.md.
 Usage:
     uv run python scripts/math_poller.py            # run forever (SIGTERM stops)
     uv run python scripts/math_poller.py --once      # one poll cycle then exit
+    uv run python scripts/math_poller.py --job       # one queue job (the large class
+                                                     # as a polis-jobs child, P-073 r2)
 """
 
 import argparse
@@ -25,6 +27,20 @@ import time
 import psycopg2
 
 from polismath.database.postgres import PostgresClient, PostgresConfig
+from polismath.poller.capacity import (
+    CLASS_ENV,
+    CLASS_LARGE,
+    CLASS_SMALL,
+    CapacityRouter,
+    CapacitySettings,
+)
+from polismath.poller.readiness import (
+    ReadinessConfigError,
+    ReadinessReporter,
+    ReadinessSettings,
+    check_identity_source,
+    identity,
+)
 from polismath.poller.service import MathPollerService, PollerConfig, PoolDrainTimeout
 
 
@@ -69,6 +85,25 @@ def _refuse_served_env(math_env: str) -> None:
         raise SystemExit(2)
 
 
+def _refuse_large_class() -> None:
+    """``MATH_CAPACITY_CLASS`` other than small refuses to start (exit 2).
+
+    The large memory class (P-073 r2) runs only as a queue child
+    (``--job``, started by the polis-jobs daemon for one conversation): a
+    resident large worker no longer exists, and a box configured as one must
+    never run as an ordinary poller. The small poller keeps PR2's rule (a bad
+    MATH_CAPACITY_* value turns routing off)."""
+    raw = (os.environ.get(CLASS_ENV) or "").strip()
+    if raw == CLASS_LARGE:
+        print(f"refusing to start: {CLASS_ENV}={CLASS_LARGE} is not a poller; the large class "
+              "runs one queue job at a time as `math_poller.py --job` under the polis-jobs "
+              "daemon (worker class large)", file=sys.stderr)
+        raise SystemExit(2)
+    if raw not in ("", CLASS_SMALL):
+        print(f"refusing to start: {CLASS_ENV}={raw!r} must be {CLASS_SMALL}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 # --- Single-writer admission -------------------------------------------------
 #
 # Every Delphi-role host runs this entrypoint, and PollerConfig's shards are
@@ -88,6 +123,8 @@ LOCK_LIVENESS_ENV = "MATH_POLLER_LOCK_LIVENESS_S"
 DEFAULT_LOCK_RETRY_S = 30.0
 DEFAULT_LOCK_LIVENESS_S = 5.0
 LOCK_LOST_EXIT_CODE = 3
+# Added to the liveness interval for the handover wait after admission.
+HANDOVER_MARGIN_S = 0.5
 # Accepted range for both intervals, in seconds.
 LOCK_INTERVAL_MIN_S = 1.0
 LOCK_INTERVAL_MAX_S = 3600.0
@@ -169,8 +206,17 @@ def _open_lock_connection(config: PollerConfig):
     return conn
 
 
-def _acquire_single_writer_lock(conn, math_env: str, retry_s: float, log) -> None:
-    """Block until this session holds the label's advisory lock."""
+# A queue child that finds the staged label held by another writer: the
+# attempt fails and the daemon retries it later (never a retry loop under a
+# lease).
+LOCK_HELD_EXIT_CODE = 1
+
+
+def _acquire_single_writer_lock(conn, math_env: str, retry_s: float, log, *,
+                                once: bool = False) -> None:
+    """Block until this session holds the label's advisory lock. ``once``:
+    try one time and exit LOCK_HELD_EXIT_CODE when another session holds it
+    (the queue child's rule)."""
     key = _lock_key(math_env)
     while True:
         with conn.cursor() as cur:
@@ -183,17 +229,48 @@ def _acquire_single_writer_lock(conn, math_env: str, retry_s: float, log) -> Non
             holder = "released"
         else:
             holder = f"{row[1] or 'not visible'} (pid {row[0]})"
+        if once:
+            print(f"polis-jobs child: the single-writer lock for {math_env.strip()} is held by "
+                  f"{holder}; this attempt fails", file=sys.stderr, flush=True)
+            raise SystemExit(LOCK_HELD_EXIT_CODE)
         log.warning("waiting for single-writer lock; holder=%s", holder)
         time.sleep(retry_s)
 
 
+# The process's readiness reporter (P-072), once started: the lock-lost exit
+# tries to log its final standby line before terminating.
+_READINESS: "ReadinessReporter | None" = None
+
+# How long the lock-lost exit gives its last words (the final standby line,
+# the critical log line, the flush) before terminating regardless. Reporting
+# must never delay or prevent the exit: a reporter lock, a blocked snapshot,
+# a blocked log handler or a full pipe only costs the line.
+LOCK_LOST_REPORT_BUDGET_S = 0.1
+
+
 def _exit_lock_lost(log, reason: str) -> None:
-    """Terminate the whole process (code 3). Never returns."""
+    """Terminate the whole process (code 3) within LOCK_LOST_REPORT_BUDGET_S.
+    Never returns."""
     try:
-        log.critical("single-writer lock lost (%s); exiting with code %d", reason, LOCK_LOST_EXIT_CODE)
-        for stream in (sys.stdout, sys.stderr):
-            with contextlib.suppress(OSError, ValueError):
-                stream.flush()
+        done = threading.Event()
+
+        def last_words():
+            try:
+                if _READINESS is not None:
+                    with contextlib.suppress(Exception):
+                        _READINESS.lock_lost()
+                log.critical("single-writer lock lost (%s); exiting with code %d", reason,
+                             LOCK_LOST_EXIT_CODE)
+                for stream in (sys.stdout, sys.stderr):
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.flush()
+            finally:
+                done.set()
+
+        # A helper thread, so nothing it waits on can hold the exit: the
+        # watchdog waits at most the budget, then terminates.
+        threading.Thread(target=last_words, name="lock-lost-report", daemon=True).start()
+        done.wait(LOCK_LOST_REPORT_BUDGET_S)
     finally:
         # os._exit, not SystemExit: this runs on the watchdog thread, and the
         # service's worker threads must not get another write in.
@@ -235,20 +312,52 @@ def _start_lock_watchdog(conn, math_env: str, interval_s: float, log) -> threadi
     return thread
 
 
-def _hold_single_writer_lock(config: PollerConfig, log):
+def _hold_single_writer_lock(config: PollerConfig, log, *, once: bool = False):
     """Admit this process as the label's only writer; returns the lock
-    connection, which must stay open (and referenced) for the process life."""
+    connection, which must stay open (and referenced) for the process life.
+    ``once``: a held lock is a failed attempt, not a wait (the queue child)."""
     retry_s = _interval_seconds(LOCK_RETRY_ENV, DEFAULT_LOCK_RETRY_S)
     liveness_s = _interval_seconds(LOCK_LIVENESS_ENV, DEFAULT_LOCK_LIVENESS_S)
     conn = _open_lock_connection(config)
-    _acquire_single_writer_lock(conn, config.math_env, retry_s, log)
+    _acquire_single_writer_lock(conn, config.math_env, retry_s, log, once=once)
     log.info(
         "holding single-writer lock for math_env=%s as %s",
         config.math_env.strip(),
         _lock_application_name(config.math_env),
     )
     _start_lock_watchdog(conn, config.math_env, liveness_s, log)
+    # Handover: a previous holder whose session was terminated server-side
+    # (so this process could be admitted) notices on its next watchdog check,
+    # at most liveness_s later, and then exits within the report budget.
+    # Wait out that window before building the service, so it is gone before
+    # this process computes. A scheduling target, like the watchdog itself:
+    # not a fence (a previous holder's check query can be slower).
+    handover_s = liveness_s + LOCK_LOST_REPORT_BUDGET_S + HANDOVER_MARGIN_S
+    log.info("admitted; waiting %.1fs for any previous holder to exit before computing", handover_s)
+    time.sleep(handover_s)
+    if _READINESS is not None:
+        _READINESS.became_primary()
     return conn
+
+
+def _start_readiness(config: PollerConfig, log, klass: str = CLASS_SMALL) -> ReadinessReporter:
+    """The readiness/liveness lines (P-072), from before the lock is taken,
+    so a waiting standby is visible too. A bad interval setting refuses to
+    start (exit 2): an unmonitored poller must not look monitored. The large
+    worker's lines carry its class token (P-073)."""
+    global _READINESS
+    try:
+        settings = ReadinessSettings.from_env()
+        check_identity_source()
+    except ReadinessConfigError as exc:
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    reporter = ReadinessReporter(settings, config, klass=klass)
+    _READINESS = reporter
+    reporter.start()
+    log.info("readiness lines every %gs (run=%s poller_config=%s stale_after=%gs)",
+             settings.interval_s, reporter.run, reporter.poller_config, settings.stale_s)
+    return reporter
 
 
 def _backfill_config(log):
@@ -299,6 +408,38 @@ def _build_service(config: PollerConfig) -> MathPollerService:
     pg.initialize()
     return MathPollerService(
         pg, config, backfill_config=_backfill_config(log), admission=admission,
+        # One run id for the readiness lines and the backfill's report lines.
+        run_id=_READINESS.run if _READINESS is not None else None,
+    )
+
+
+def _run_job(job_arg: str, config: PollerConfig, log) -> int:
+    """The large memory class as a queue child (P-073 r2;
+    polismath.poller.rebuild_child): exactly one conversation, staged under
+    this process's label, no readiness reporter, the lock taken once."""
+    from polismath.poller.rebuild_child import run
+
+    if not config.database_url:
+        print("DATABASE_URL is required", file=sys.stderr)
+        raise SystemExit(2)
+
+    def build(admission):
+        pg = PostgresClient(PostgresConfig(url=config.database_url, math_env=config.math_env))
+        pg.initialize()
+        service = MathPollerService(
+            pg, config, backfill_config=None, admission=admission,
+            capacity=CapacityRouter(admission, CapacitySettings()),
+        )
+        # One conversation, one exclusive reservation against the whole budget.
+        service.exclusive_live = True
+        service.set_dynamic_allowlist(frozenset())
+        return service, pg
+
+    return run(
+        job_arg, label=config.math_env, source_commit=identity()["source_commit"],
+        admission_fn=lambda: _memory_admission(config, log), build_fn=build,
+        lock_fn=lambda: _hold_single_writer_lock(config, log, once=True),
+        served_env=SERVED_MATH_ENV,
     )
 
 
@@ -309,6 +450,16 @@ def main(argv=None) -> int:
         action="store_true",
         help="Run a single vote+moderation poll cycle, block until processed, exit.",
     )
+    parser.add_argument(
+        "--job",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="JOB_ID",
+        help="Run one math_rebuild job as a polis-jobs child (the large memory class): the "
+             "attempt's identity and frame come from the daemon's environment; a JOB_ID, when "
+             "given, must equal DELPHI_JOB_ID.",
+    )
     args = parser.parse_args(argv)
 
     _configure_logging()
@@ -316,9 +467,15 @@ def main(argv=None) -> int:
 
     config = PollerConfig.from_env()
     _refuse_served_env(config.math_env)
+    _refuse_large_class()
+    if args.job is not None:
+        return _run_job(args.job, config, log)
+    readiness = None if args.once else _start_readiness(config, log, CLASS_SMALL)
     # Held (and referenced) until the process exits; closing it releases the lock.
     lock_conn = _hold_single_writer_lock(config, log)  # noqa: F841
     service = _build_service(config)
+    if readiness is not None and hasattr(service, "readiness_snapshot"):
+        readiness.set_source(service.readiness_snapshot)
 
     if args.once:
         log.info("Running a single poll cycle (--once)")

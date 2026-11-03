@@ -287,10 +287,13 @@ async function runCase(c, tokens, tables, normalizer) {
   }
 }
 async function observeCase(c, tokens, tables, normalizer) {
+  const observation = c.observationProfile === undefined
+    ? { oracle }
+    : require("./post-comments/observation.cjs").observation(c);
   await get("/begin?seed=" + c.seed + "&case=" + encodeURIComponent(c.caseId));
   const before = await snapshot(tables),
     obsBefore = await get("/state");
-  const response = await send(c.request, tokens);
+  const response = await send(c.request, tokens, observation.deadlineMs);
   readContext.phase = "after-request";
   // Capture delayed 100 ms writes, then demand quiescence; do not treat an arbitrary delay as proof.
   await wait(200);
@@ -359,6 +362,9 @@ async function observeCase(c, tokens, tables, normalizer) {
       ? JSON.parse(Buffer.from(tokens[c.auth].split(".")[1], "base64url")).sub
       : undefined,
     xid: c.request.body?.xid,
+    // Additional vote identities declare the expected subject independently of
+    // the response; signature, participant and conversation checks still apply.
+    ...c.credentialBinding,
   };
   const wire = response.wire;
   wire.response.headers = require("./headers.cjs").headers(
@@ -422,9 +428,11 @@ async function observeCase(c, tokens, tables, normalizer) {
     jwts: issued,
     jwtMinted: (obsAfter.jwtIssues || 0) - (obsBefore.jwtIssues || 0),
   };
-  const o = oracle(response, processErrors, c.case === "proxy-tail");
+  const o = observation.oracle(response, processErrors, c.case === "proxy-tail");
   try {
-    assertAttempts(effects.outbound);
+    if (process.env.P027_COMMENTS_PROFILE === "1" && c.caseId.startsWith("post-comments/"))
+      require("./post-comments/admission.cjs").assertCommentsAttempts(effects.outbound, c.notificationPolicy);
+    else assertAttempts(effects.outbound);
   } catch (e) {
     o.pass = false;
     o.failures.push(e.message);
@@ -456,6 +464,7 @@ async function observeCase(c, tokens, tables, normalizer) {
   return {
     ...c,
     version: 1,
+    ...(!stable ? { unsettledWork: obsAfter.work } : {}),
     ...(c.caseId.startsWith("comments-read/")
       ? { commentsContext: obsAfter.commentsContext }
       : {}),
@@ -484,10 +493,9 @@ async function main() {
   ] = process.argv.slice(2);
   if (
     !/^\d+$/.test(fromRoute) ||
-    Number(fromRoute) < 1 ||
-    Number(fromRoute) > 201
+    !inventory.routes.some((r) => r.id === Number(fromRoute))
   )
-    throw Error("from-route must be an inventory ID from 1 through 201");
+    throw Error("from-route must be a live inventory ID");
   if (command === "seed-pages") {
     const TableName = "Delphi_NarrativeReports";
     await dynamo.send(
@@ -629,14 +637,22 @@ async function main() {
       after.process.slice(before.process.length)
     );
     console.log(
-      JSON.stringify({ route: "GET /api/v3/testConnection", response, verdict })
+      JSON.stringify({
+        route: "GET /api/v3/testConnection",
+        response,
+        verdict,
+      })
     );
     if (!verdict.pass) process.exitCode = 1;
     return;
   }
   if (command === "coverage") {
     console.log(
-      `PASS: ${dump.routes.length} runtime entries -> ${routes.length} enabled + 1 explicitly disabled = 201`
+      `PASS: ${dump.routes.length} runtime entries -> ${
+        routes.length
+      } enabled; ${inventory.routes.length - routes.length} disabled; ${
+        (inventory.retired || []).length
+      } retired`
     );
     return;
   }
@@ -825,12 +841,27 @@ async function main() {
       if (expected.manifest[k] !== v) throw Error(`manifest ${k} mismatch`);
   }
   const diffs = [];
+  // Stored votes are compared by meaning (P-078 PR-G): the recording's by the
+  // convention it states (its vote-convention.json, else the committed
+  // baseline's companion), the live rows by the replay database's own. The
+  // recorder writes the live one into the recording it makes.
+  const liveConvention = await require("./seed-vote.cjs").databaseConvention(
+    pool
+  );
+  // Only a convention bound to the recording's verified index is honoured;
+  // with none, stored votes are compared raw.
+  const recorded = expected
+    ? require("./compare.cjs").recordingConvention(dir)
+    : null;
+  const conventions = recorded
+    ? { expected: recorded.storageAgreeValue, actual: liveConvention }
+    : null;
   const { results, fatal } = await executeCases(
     planned,
     (c) => runCase(c, tokens, selected, norm),
     (actual, i) => {
       const field = expected
-        ? firstDifference(expected.cases[i], actual)
+        ? firstDifference(expected.cases[i], actual, conventions)
         : null;
       diffs.push({
         route: actual.routeId,
@@ -912,6 +943,9 @@ async function main() {
           }
         : {}),
       "schema.json": schemaRows,
+      // The storage convention the recorded database's vote rows are in.
+      "vote-convention.json":
+        require("./compare.cjs").recordingConventionArtifact(liveConvention),
       "boot.json": dump.boot,
       "routes.json": dump,
       "normalization.json": {
@@ -1028,7 +1062,7 @@ async function close() {
 // sender, snapshot and schema reader rather than reimplementing request
 // semantics. Requiring the module must not run the recorder, and a consumer
 // needs a way to release the pg pool and the DynamoDB client it opens on import.
-module.exports = { send, snapshot, schema, close };
+module.exports = { send, snapshot, schema, close, runCase };
 
 if (require.main === module) {
   main()

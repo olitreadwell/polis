@@ -4,12 +4,12 @@ name: Public battery certification (EC2)
 # repository's PUBLIC fixtures on one disposable EC2 worker, then destroys it.
 #
 # THIS IS NOT PRIVATE CERTIFICATION and its verdict (`PUBLIC-BATTERY-PASS`) must
-# never be read as one. The second reviewer's #2715 review found that round 1 staged the
+# never be read as one. The PR #2715 review found that round 1 staged the
 # private prod-derived bundle on a box GitHub could open a root shell on, and
 # returned its raw log to public Actions artifacts. Round 2 removes the private
 # data path outright: there is no fixture bucket, no evidence bucket, and the
-# instance role cannot read either. Private certification needs the isolated
-# worker in cost-reduction/04-plans/P-022-E-ci-spec.md and does not exist yet.
+# instance role cannot read either. Private certification needs a separate
+# isolated worker (see docs/ci-ec2.md) and does not exist yet.
 #
 # Nothing here works until the CDK construct behind `-c enableCiEc2=true` has
 # been deployed once and CERTIFY_OIDC_ROLE_ARN / CERTIFY_LAUNCH_TEMPLATE_ID are

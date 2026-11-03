@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 
+from polismath.utils.cli_flags import parse_bool_flag
+
 # Define colors for output
 GREEN = '\033[0;32m'
 YELLOW = '\033[0;33m'
@@ -25,6 +27,86 @@ def show_usage():
     print("  --validate                Run extra validation checks")
     print("  --help                    Show this help message")
 
+# The stages, in order: the reset, the UMAP narrative pipeline (embeddings with
+# all-MiniLM-L6-v2, UMAP, EVoC clustering, keywords, topic names), then one
+# datamapplot visualisation per layer.
+#
+# A run does not compute its own math. The PCA, k-means, representativeness,
+# participant projections and comment routing of polismath/run_math_pipeline.py,
+# the group extremity of 501 and the priorities of 502 are not stages: the math
+# engine's math_main is the one source of that math, the narrative filters read
+# the engine's pca.comment-extremity themselves (801_narrative_report_batch.py),
+# and nothing read the families those stages wrote. So a run reads no votes and
+# no math_main beyond the input census taken before the first stage.
+
+
+# --- run by the polis-jobs daemon (P-077 P1) --------------------------------
+# Active only when DELPHI_OUTPUT_MANIFEST is set. The legacy DynamoDB poller
+# never sets it, so on that path none of these functions is called and nothing
+# new is imported or printed.
+
+def _start_daemon_job(zid):
+    """Check the daemon's environment and frame, and observe the run's inputs, before any stage runs."""
+    from polismath import job_child
+    from polismath.job_child import census, input_bundle
+
+    try:
+        job = job_child.JobContext.from_env(
+            expected_stage=job_child.STAGE_FULL_PIPELINE, zid=zid,
+            allowed_phases={job_child.PHASE_RUN}, default_phase=job_child.PHASE_RUN,
+        )
+        # The input bundle, when the frame names one: the stages read its files
+        # instead of Postgres. A bundle that fails its checks refuses the run.
+        bundle = input_bundle.load(zid)
+    except (job_child.JobEnvError, input_bundle.BundleError) as e:
+        job_child.refuse(str(e))
+    try:
+        if bundle is not None:
+            job.inputs = census.observe_inputs_from_bundle(bundle, job_child.effective_math_env())
+        else:
+            job.inputs = census.observe_inputs(zid, job_child.effective_math_env(), census.default_pg_query())
+    except census.CensusError as e:
+        print(f"polis-jobs child: {e}", file=sys.stderr, flush=True)
+        sys.exit(job_child.EXIT_MANIFEST_UNBUILDABLE)
+    return job
+
+
+def _topic_model_name():
+    if os.environ.get("LLM_PROVIDER", "anthropic").lower() == "ollama":
+        return os.environ.get("OLLAMA_MODEL") or None
+    return (os.environ.get("ANTHROPIC_TOPIC_MODEL") or os.environ.get("ANTHROPIC_MODEL")
+            or "claude-haiku-4-5-20251001")
+
+
+def _finish_daemon_job(job, zid, region):
+    """Count what the run wrote and write the output manifest; exit 5 if that cannot be done."""
+    from polismath import job_child
+    from polismath.job_child import census
+    # The clustering run_pipeline.py ran: UMAP and EVoC from the default seed.
+    from umap_narrative.numerical_stages import CLUSTER_MODEL, DEFAULT_SEED
+
+    try:
+        outputs = census.count_full_pipeline_outputs(zid, census.default_dynamodb(region))
+        manifest = job_child.build_manifest(
+            job, outcome="succeeded", inputs=job.inputs, outputs=outputs,
+            models={
+                "embed": os.environ.get("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2"),
+                "topic": _topic_model_name(),
+                "narrative": None,
+                "cluster": CLUSTER_MODEL,
+                "cluster_seed": DEFAULT_SEED,
+            },
+            # Topic naming's provider batches are submitted and awaited inside
+            # the UMAP stage; P1 does not observe them, so cost stays unknown.
+            cost={"llm_tokens_in": None, "llm_tokens_out": None, "provider_batches": None},
+        )
+        job_child.write_manifest(job, manifest)
+    except (census.CensusError, job_child.ManifestError, OSError) as e:
+        print(f"polis-jobs child: the stages succeeded but the manifest could not be written: {e}",
+              file=sys.stderr, flush=True)
+        sys.exit(job_child.EXIT_MANIFEST_UNBUILDABLE)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process a Polis conversation with the Delphi analytics pipeline.", add_help=False)
     parser.add_argument("--zid", required=True, help="The Polis conversation ID to process")
@@ -33,8 +115,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force reprocessing even if data exists")
     parser.add_argument("--validate", action="store_true", help="Run extra validation checks")
     parser.add_argument("--help", action="store_true", help="Show this help message")
-    parser.add_argument('--include_moderation', type=bool, default=False, help='Whether or not to include moderated comments in reports. If false, moderated comments will appear.')
-    parser.add_argument('--exclude_comment_selections', type=bool, default=True, help='Whether to exclude comments with selection=-1 in report_comment_selections table.')
+    parser.add_argument('--include_moderation', type=parse_bool_flag, default=False, help='Whether or not to include moderated comments in reports. If false, moderated comments will appear.')
+    parser.add_argument('--exclude_comment_selections', type=parse_bool_flag, default=True, help='Whether to exclude comments with selection=-1 in report_comment_selections table.')
     parser.add_argument('--region', type=str, default='us-east-1', help='AWS region')
 
     args = parser.parse_args()
@@ -45,28 +127,42 @@ def main():
 
     zid = args.zid
     rid = args.rid
+    job = _start_daemon_job(zid) if os.environ.get("DELPHI_OUTPUT_MANIFEST", "").strip() else None
     verbose_arg = "--verbose" if args.verbose else ""
-    force_arg = "--force" if args.force else ""
-    # validate_arg is not used in the python script execution steps, but kept for parity with bash
-    # validate_arg = "--validate" if args.validate else ""
+    # --force and --validate are accepted for compatibility; no stage reads them.
 
-    # --- Reset all data before processing ---
-    print(f"{YELLOW}Resetting all existing data for conversation {zid} before processing...{NC}")
-    reset_command = [
-        "python",
-        "umap_narrative/reset_conversation.py",
-        f"--zid={zid}",
-    ]
-    # If a report ID is provided, pass it to the reset script for full cleanup
-    if rid:
-        reset_command.append(f"--rid={rid}")
-        print(f"{YELLOW}Using report ID {rid} for full narrative report cleanup.{NC}")
+    if os.environ.get("DELPHI_RESULT_BACKEND") == "postgres":
+        if job is None:
+            raise RuntimeError("Postgres pipelines must be admitted through polis-jobs")
+        # The embeddings-table switch (migration 000038) arrives in the frame the
+        # daemon writes. Propagate it to this pipeline's subprocesses (the embedding
+        # producer and the datamap reader read it from the environment). Default off.
+        import json as _json
+        _frame = _json.loads(open(os.environ["DELPHI_FRAME"]).read()) if os.environ.get("DELPHI_FRAME") else {}
+        if _frame.get("embeddings_table") or _frame.get("config", {}).get("embeddings_table"):
+            os.environ["DELPHI_EMBEDDINGS_TABLE"] = "1"
+        from polismath.delphi_storage.writer import WriterResource
+        # Clear only this attempt's private working copy; previous publications survive.
+        WriterResource().reset()
+    else:
+        # --- Reset all data before processing ---
+        print(f"{YELLOW}Resetting all existing data for conversation {zid} before processing...{NC}")
+        reset_command = [
+            "python",
+            "umap_narrative/reset_conversation.py",
+            f"--zid={zid}",
+        ]
+        # If a report ID is provided, pass it to the reset script for full cleanup
+        if rid:
+            reset_command.append(f"--rid={rid}")
+            print(f"{YELLOW}Using report ID {rid} for full narrative report cleanup.{NC}")
     
-    reset_process = subprocess.run(reset_command)
-    if reset_process.returncode != 0:
-        print(f"{RED}Data reset failed with exit code {reset_process.returncode}. Aborting pipeline.{NC}")
-        sys.exit(reset_process.returncode)
-    print(f"{GREEN}Data reset complete.{NC}")
+        reset_process = subprocess.run(reset_command)
+        if reset_process.returncode != 0:
+            print(f"{RED}Data reset failed with exit code {reset_process.returncode}. Aborting pipeline.{NC}")
+            # Under the daemon the exit-code set is closed (0/1/2/4/5/6): any other failure is 1.
+            sys.exit(1 if job is not None else reset_process.returncode)
+        print(f"{GREEN}Data reset complete.{NC}")
 
     print(f"{GREEN}Processing conversation {zid}...{NC}")
 
@@ -91,36 +187,11 @@ def main():
     # Set up environment for the pipeline
     app_path = os.environ.get('DELPHI_APP_PATH', '/app')
     os.environ["PYTHONPATH"] = f"{app_path}:{os.environ.get('PYTHONPATH', '')}"
-    max_votes = os.environ.get("MAX_VOTES")
-    max_votes_arg = f"--max-votes={max_votes}" if max_votes else ""
-    if max_votes:
-        print(f"{YELLOW}Limiting to {max_votes} votes for testing{NC}")
 
-    batch_size = os.environ.get("BATCH_SIZE")
-    batch_size_arg = f"--batch-size={batch_size}" if batch_size else "--batch-size=50000" # Default batch size
-    if batch_size:
-        print(f"{YELLOW}Using batch size of {batch_size}{NC}")
-    else:
-        print(f"{YELLOW}Using batch size of 50000 (default){NC}")
-
-
-    # Run the math pipeline
-    print(f"{GREEN}Running math pipeline...{NC}")
-    math_command = [
-        "python", f"{app_path}/polismath/run_math_pipeline.py",
-        f"--zid={zid}",
-    ]
-    if max_votes_arg:
-        math_command.append(max_votes_arg)
-    if batch_size_arg:
-        math_command.append(batch_size_arg)
-
-    math_process = subprocess.run(math_command)
-    math_exit_code = math_process.returncode
-
-    if math_exit_code != 0:
-        print(f"{RED}Math pipeline failed with exit code {math_exit_code}{NC}")
-        sys.exit(math_exit_code)
+    # Every stage that fails is recorded here. Stages after a failure still run
+    # as before, but the run exits non-zero so the job is marked FAILED rather
+    # than COMPLETED.
+    failed_stages = []
 
     # Run the UMAP narrative pipeline
     print(f"{GREEN}Running UMAP narrative pipeline...{NC}")
@@ -136,42 +207,8 @@ def main():
 
     pipeline_process = subprocess.run(umap_command)
     pipeline_exit_code = pipeline_process.returncode
-
-    # Calculate and store comment extremity values
-    print(f"{GREEN}Calculating comment extremity values...{NC}")
-    extremity_command = [
-        "python", f"{app_path}/umap_narrative/501_calculate_comment_extremity.py",
-        f"--zid={zid}",
-        f"--include_moderation={args.include_moderation}",
-        f"--exclude_comment_selections={args.exclude_comment_selections}"
-    ]
-    if verbose_arg:
-        extremity_command.append(verbose_arg)
-    if force_arg:
-        extremity_command.append(force_arg)
-    
-    extremity_process = subprocess.run(extremity_command)
-    extremity_exit_code = extremity_process.returncode
-
-    if extremity_exit_code != 0:
-        print(f"{RED}Warning: Extremity calculation failed with exit code {extremity_exit_code}{NC}")
-        print("Continuing with priority calculation...")
-
-    # Calculate comment priorities using group-based extremity
-    print(f"{GREEN}Calculating comment priorities with group-based extremity...{NC}")
-    priority_command = [
-        "python", f"{app_path}/umap_narrative/502_calculate_priorities.py",
-        f"--conversation_id={zid}",
-    ]
-    if verbose_arg:
-        priority_command.append(verbose_arg)
-    
-    priority_process = subprocess.run(priority_command)
-    priority_exit_code = priority_process.returncode
-
-    if priority_exit_code != 0:
-        print(f"{RED}Warning: Priority calculation failed with exit code {priority_exit_code}{NC}")
-        print("Continuing with visualization...")
+    if pipeline_exit_code != 0:
+        failed_stages.append(("UMAP narrative pipeline", pipeline_exit_code))
 
     if pipeline_exit_code == 0:
         print(f"{YELLOW}Creating visualizations with datamapplot...{NC}")
@@ -184,20 +221,19 @@ def main():
         # First, determine available layers from DynamoDB
         try:
             import boto3
+            from polismath.delphi_storage.resource import result_resource
             from boto3.dynamodb.conditions import Key
             
             raw_endpoint = os.environ.get('DYNAMODB_ENDPOINT')
             endpoint_url = raw_endpoint if raw_endpoint and raw_endpoint.strip() else None
             
-            # Using dummy credentials for local, IAM role for AWS
+            # Credentials come from the SDK default chain in every environment.
             if endpoint_url:
-                dynamodb = boto3.resource('dynamodb', 
+                dynamodb = result_resource('dynamodb', 
                                          endpoint_url=endpoint_url, 
-                                         region_name='us-east-1',
-                                         aws_access_key_id='dummy',
-                                         aws_secret_access_key='dummy')
+                                         region_name='us-east-1')
             else:
-                dynamodb = boto3.resource('dynamodb', region_name=args.region)
+                dynamodb = result_resource('dynamodb', region_name=args.region)
 
 
             table = dynamodb.Table('Delphi_CommentHierarchicalClusterAssignments')
@@ -255,30 +291,24 @@ def main():
             if result.returncode == 0:
                 print(f"{GREEN}Layer {layer_id} visualization completed{NC}")
             else:
-                print(f"{RED}Warning: Layer {layer_id} visualization failed{NC}")
+                print(f"{RED}Layer {layer_id} visualization failed with exit code {result.returncode}{NC}")
+                failed_stages.append((f"layer {layer_id} visualization", result.returncode))
 
-        print(f"{GREEN}UMAP Narrative pipeline completed successfully!{NC}")
-        print(f"Results stored in DynamoDB and visualizations for conversation {zid}")
+        print(f"{GREEN}UMAP Narrative pipeline stage finished.{NC}")
     else:
-        print(f"{RED}Warning: UMAP Narrative pipeline returned non-zero exit code: {pipeline_exit_code}{NC}")
-        print("The pipeline may have encountered errors but might still have produced partial results.")
-        # Don't fail the overall script, just warn
-        pipeline_exit_code = 0
+        print(f"{RED}UMAP Narrative pipeline failed with exit code {pipeline_exit_code}; skipping visualizations.{NC}")
 
-
-    exit_code = pipeline_exit_code # Based on the logic, this will be 0 unless math pipeline failed earlier
-
-    if exit_code == 0: # This condition relies on math_exit_code check above.
+    if not failed_stages:
         print(f"{GREEN}Pipeline completed successfully!{NC}")
         print(f"Results stored in DynamoDB for conversation {zid}")
-    else:
-        # This part of the logic seems unreachable given the sys.exit() after math_pipeline failure
-        # and resetting pipeline_exit_code to 0 in the warning case.
-        # However, keeping it for structural parity.
-        print(f"{RED}Pipeline failed with exit code {exit_code}{NC}")
-        print("Please check logs for more details")
+        if job is not None:
+            _finish_daemon_job(job, zid, args.region)
+        sys.exit(0)
 
-    sys.exit(exit_code)
+    summary = ", ".join(f"{name} (exit code {code})" for name, code in failed_stages)
+    print(f"{RED}Pipeline failed: {len(failed_stages)} stage(s) failed: {summary}{NC}")
+    print("Please check logs for more details")
+    sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,7 @@ var PostMessageUtils = require("../util/postMessageUtils");
 var preloadHelper = require("../util/preloadHelper");
 var template = require("../templates/vote-view.handlebars");
 var Utils = require("../util/utils");
+var VoteConvention = require("../util/voteConvention");
 var Strings = require("../strings");
 var $ = require("jquery");
 var _ = require("lodash");
@@ -85,7 +86,8 @@ module.exports = Handlebones.ModelView.extend({
         };
       }
     }
-    ctx.showImportantCheckbox = preload.conversation.importance_enabled;
+    // Importance is always collected; the conversation's importance_enabled is not read.
+    ctx.showImportantCheckbox = true;
     ctx.social = socialCtx;
     ctx.noModSet = !ctx.spamOn && !ctx.otOn && !ctx.importantOn;
     ctx.canSubscribe = !!preload.firstPtpt || this.votesByMe.size() > 0;
@@ -460,7 +462,7 @@ module.exports = Handlebones.ModelView.extend({
         starred = void 0; // don't bother sending up false, no need to put a vote value of 0 in the db.
       }
       this.wipVote = {
-        vote: -1,
+        vote: VoteConvention.toWire(VoteConvention.AGREE),
         conversation_id: conversation_id,
         high_priority: this.highPriority(),
         tid: tid
@@ -474,7 +476,7 @@ module.exports = Handlebones.ModelView.extend({
       var tid = this.model.get("tid");
       var starred = this.model.get("starred");
       this.wipVote = {
-        vote: 1,
+        vote: VoteConvention.toWire(VoteConvention.DISAGREE),
         conversation_id: conversation_id,
         high_priority: this.highPriority(),
         tid: tid
@@ -488,7 +490,7 @@ module.exports = Handlebones.ModelView.extend({
       var tid = this.model.get("tid");
       var starred = this.model.get("starred");
       this.wipVote = {
-        vote: 0,
+        vote: VoteConvention.toWire(VoteConvention.PASS),
         conversation_id: conversation_id,
         high_priority: this.highPriority(), // TODO: specify in help text that this is for "important but unsure"
         tid: tid
@@ -513,7 +515,7 @@ module.exports = Handlebones.ModelView.extend({
       var tid = this.model.get("tid");
       serverClient.addToVotesByMe({
         participantStarred: true,
-        vote: -1,
+        vote: VoteConvention.toWire(VoteConvention.AGREE),
         conversation_id: conversation_id,
         tid: tid
       });
@@ -543,11 +545,12 @@ module.exports = Handlebones.ModelView.extend({
         alert(2);
       }
 
-      if (this.wipVote.vote === -1) {
+      var wipVote = VoteConvention.fromWire(this.wipVote.vote);
+      if (wipVote === VoteConvention.AGREE) {
         serverClient.agree(tid, starred, high_priority).then(reloadPage, onFailAfterAuth);
-      } else if (this.wipVote.vote === 0) {
+      } else if (wipVote === VoteConvention.PASS) {
         serverClient.pass(tid, starred, high_priority).then(reloadPage, onFailAfterAuth);
-      } else if (this.wipVote.vote === 1) {
+      } else if (wipVote === VoteConvention.DISAGREE) {
         serverClient.disagree(tid, starred, high_priority).then(reloadPage, onFailAfterAuth);
       } else {
         alert(3);

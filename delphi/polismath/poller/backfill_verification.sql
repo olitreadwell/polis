@@ -27,6 +27,15 @@
 -- group-votes entry ({n-members, votes: {tid: {A, D, S}}}) and every repness
 -- entry (an array of objects), per review [1449] B.
 --
+-- Every payload reference is cast (m.data::jsonb): production's math data
+-- columns are json although the migrations declare jsonb, and the jsonb
+-- functions and operators used here do not exist for json. The cast is a
+-- no-op on jsonb, so the file runs on either column type.
+-- Each payload is cast once per row (md, bd, pd in the rule's scalar
+-- subquery, behind OFFSET 0 so the planner keeps it): every json cast
+-- re-parses the text, and one cast per reference ran a 14.7 MB payload past
+-- a 120 s statement timeout.
+--
 -- The switch needs, while the source-ahead ruling is unresolved (the default,
 -- MATH_BACKFILL_SOURCE_AHEAD_RULING=unresolved):
 --   query 2: missing_* = 0, unequal_generation = 0, uninitialized_generation
@@ -108,70 +117,66 @@ LEFT JOIN math_bidtopid b ON b.zid = s.zid AND b.math_env = :'target'
 LEFT JOIN math_ptptstats p ON p.zid = s.zid AND p.math_env = :'target'
 LEFT JOIN math_ticks k ON k.zid = s.zid AND k.math_env = :'target'
 CROSS JOIN LATERAL (SELECT COALESCE((
-        m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
-        AND m.math_tick >= 0 AND b.math_tick = m.math_tick
-        AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
-        AND m.last_vote_timestamp IS NOT NULL
-        AND jsonb_typeof(m.data) = 'object'
-        AND CASE WHEN jsonb_typeof(m.data->'zid') = 'number'
-                 THEN (m.data->>'zid')::numeric = m.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(m.data->'lastVoteTimestamp') = 'number'
-                 THEN (m.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        SELECT jsonb_typeof(md) = 'object'
+        AND CASE WHEN jsonb_typeof(md->'zid') = 'number'
+                 THEN (md->>'zid')::numeric = m.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(md->'lastVoteTimestamp') = 'number'
+                 THEN (md->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND jsonb_typeof(m.data->'tids') = 'array'
-        AND jsonb_typeof(m.data->'pca') = 'object'
-        AND jsonb_typeof(m.data->'repness') = 'object'
-        AND jsonb_typeof(b.data) = 'object'
-        AND CASE WHEN jsonb_typeof(b.data->'zid') = 'number'
-                 THEN (b.data->>'zid')::numeric = b.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(b.data->'lastVoteTimestamp') = 'number'
-                 THEN (b.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        AND jsonb_typeof(md->'tids') = 'array'
+        AND jsonb_typeof(md->'pca') = 'object'
+        AND jsonb_typeof(md->'repness') = 'object'
+        AND jsonb_typeof(bd) = 'object'
+        AND CASE WHEN jsonb_typeof(bd->'zid') = 'number'
+                 THEN (bd->>'zid')::numeric = b.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(bd->'lastVoteTimestamp') = 'number'
+                 THEN (bd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND jsonb_typeof(p.data) = 'object'
-        AND CASE WHEN jsonb_typeof(p.data->'zid') = 'number'
-                 THEN (p.data->>'zid')::numeric = p.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(p.data->'lastVoteTimestamp') = 'number'
-                 THEN (p.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        AND jsonb_typeof(pd) = 'object'
+        AND CASE WHEN jsonb_typeof(pd->'zid') = 'number'
+                 THEN (pd->>'zid')::numeric = p.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(pd->'lastVoteTimestamp') = 'number'
+                 THEN (pd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-             THEN p.data->'ptptstats' = '{}'::jsonb
-                  OR (jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                      AND jsonb_typeof(p.data->'ptptstats'->'gid') = 'array'
+        AND CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+             THEN pd->'ptptstats' = '{}'::jsonb
+                  OR (jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                      AND jsonb_typeof(pd->'ptptstats'->'gid') = 'array'
                       AND NOT EXISTS (
-                          SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-                                                        THEN p.data->'ptptstats' ELSE '{}'::jsonb END) e
+                          SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+                                                        THEN pd->'ptptstats' ELSE '{}'::jsonb END) e
                           WHERE (CASE WHEN jsonb_typeof(e.value) = 'array'
                                       THEN jsonb_array_length(e.value) END)
                                 IS DISTINCT FROM
-                                (CASE WHEN jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                                      THEN jsonb_array_length(p.data->'ptptstats'->'pid') END)))
+                                (CASE WHEN jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                                      THEN jsonb_array_length(pd->'ptptstats'->'pid') END)))
              ELSE false END
-        AND jsonb_typeof(m.data->'pca'->'center') = 'array'
-        AND jsonb_typeof(m.data->'pca'->'comps') = 'array'
+        AND jsonb_typeof(md->'pca'->'center') = 'array'
+        AND jsonb_typeof(md->'pca'->'comps') = 'array'
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'center') = 'array'
-                                                    THEN m.data->'pca'->'center' ELSE '[]'::jsonb END) x
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'center') = 'array'
+                                                    THEN md->'pca'->'center' ELSE '[]'::jsonb END) x
             WHERE jsonb_typeof(x) <> 'number')
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'comps') = 'array'
-                                                    THEN m.data->'pca'->'comps' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'comps') = 'array'
+                                                    THEN md->'pca'->'comps' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'group-clusters') = 'array'
-                                                    THEN m.data->'group-clusters' ELSE '[]'::jsonb END) g
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'group-clusters') = 'array'
+                                                    THEN md->'group-clusters' ELSE '[]'::jsonb END) g
             WHERE jsonb_typeof(g) <> 'object'
                OR jsonb_typeof(g->'id') IS DISTINCT FROM 'number'
                OR jsonb_typeof(g->'members') IS DISTINCT FROM 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(g->'members') = 'array'
                                                                   THEN g->'members' ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
-        AND jsonb_typeof(m.data->'group-votes') = 'object'
+        AND jsonb_typeof(md->'group-votes') = 'object'
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'group-votes') = 'object'
-                                          THEN m.data->'group-votes' ELSE '{}'::jsonb END) g
+            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'group-votes') = 'object'
+                                          THEN md->'group-votes' ELSE '{}'::jsonb END) g
             WHERE jsonb_typeof(g.value) IS DISTINCT FROM 'object'
                OR jsonb_typeof(g.value->'n-members') IS DISTINCT FROM 'number'
                OR jsonb_typeof(g.value->'votes') IS DISTINCT FROM 'object'
@@ -182,50 +187,55 @@ CROSS JOIN LATERAL (SELECT COALESCE((
                              OR jsonb_typeof(v.value->'D') IS DISTINCT FROM 'number'
                              OR jsonb_typeof(v.value->'S') IS DISTINCT FROM 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'repness') = 'object'
-                                          THEN m.data->'repness' ELSE '{}'::jsonb END) r
+            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'repness') = 'object'
+                                          THEN md->'repness' ELSE '{}'::jsonb END) r
             WHERE jsonb_typeof(r.value) IS DISTINCT FROM 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.value) = 'array'
                                                                   THEN r.value ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) IS DISTINCT FROM 'object'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-                                                    THEN m.data->'base-clusters'->'id' ELSE '[]'::jsonb END) x
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'id') = 'array'
+                                                    THEN md->'base-clusters'->'id' ELSE '[]'::jsonb END) x
             WHERE jsonb_typeof(x) <> 'number')
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-                                                    THEN m.data->'base-clusters'->'members' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'members') = 'array'
+                                                    THEN md->'base-clusters'->'members' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(b.data->'bidToPid') = 'array'
-                                                    THEN b.data->'bidToPid' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(bd->'bidToPid') = 'array'
+                                                    THEN bd->'bidToPid' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
-        AND CASE WHEN jsonb_typeof(m.data->'n') = 'number'
-                  AND jsonb_typeof(m.data->'base-clusters') = 'object'
-                  AND jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-                  AND jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-                  AND jsonb_typeof(m.data->'group-clusters') = 'array'
-                  AND jsonb_typeof(m.data->'in-conv') = 'array'
-                  AND jsonb_typeof(b.data->'bidToPid') = 'array'
-             THEN (m.data->>'n')::numeric >= 0
-                  AND jsonb_array_length(m.data->'base-clusters'->'members')
-                      = jsonb_array_length(m.data->'base-clusters'->'id')
-                  AND jsonb_array_length(b.data->'bidToPid')
-                      = jsonb_array_length(m.data->'base-clusters'->'id')
-                  AND jsonb_array_length(m.data->'in-conv') <= (m.data->>'n')::numeric
-                  AND ((m.data->>'n')::numeric > 0
-                       OR (jsonb_array_length(m.data->'base-clusters'->'id') = 0
-                           AND jsonb_array_length(m.data->'group-clusters') = 0
-                           AND jsonb_array_length(m.data->'in-conv') = 0
+        AND CASE WHEN jsonb_typeof(md->'n') = 'number'
+                  AND jsonb_typeof(md->'base-clusters') = 'object'
+                  AND jsonb_typeof(md->'base-clusters'->'id') = 'array'
+                  AND jsonb_typeof(md->'base-clusters'->'members') = 'array'
+                  AND jsonb_typeof(md->'group-clusters') = 'array'
+                  AND jsonb_typeof(md->'in-conv') = 'array'
+                  AND jsonb_typeof(bd->'bidToPid') = 'array'
+             THEN (md->>'n')::numeric >= 0
+                  AND jsonb_array_length(md->'base-clusters'->'members')
+                      = jsonb_array_length(md->'base-clusters'->'id')
+                  AND jsonb_array_length(bd->'bidToPid')
+                      = jsonb_array_length(md->'base-clusters'->'id')
+                  AND jsonb_array_length(md->'in-conv') <= (md->>'n')::numeric
+                  AND ((md->>'n')::numeric > 0
+                       OR (jsonb_array_length(md->'base-clusters'->'id') = 0
+                           AND jsonb_array_length(md->'group-clusters') = 0
+                           AND jsonb_array_length(md->'in-conv') = 0
                            AND m.last_vote_timestamp = 0
-                           AND p.data->'ptptstats' = '{}'::jsonb))
+                           AND pd->'ptptstats' = '{}'::jsonb))
              ELSE false END
+        FROM (SELECT m.data::jsonb AS md, b.data::jsonb AS bd, p.data::jsonb AS pd OFFSET 0) AS payload
+        WHERE m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
+        AND m.math_tick >= 0 AND b.math_tick = m.math_tick
+        AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
+        AND m.last_vote_timestamp IS NOT NULL
     ), false) AS valid) v
 CROSS JOIN LATERAL (SELECT CASE WHEN m.last_vote_timestamp < s.last_vote_timestamp
     THEN (SELECT COALESCE(max(x.created), 0) FROM votes x WHERE x.zid = s.zid)
@@ -253,25 +263,25 @@ SELECT
 --    (why invalid_payload is nonzero). Informational; query 2 decides.
 SELECT
   count(*) AS checked,
-  count(*) FILTER (WHERE jsonb_typeof(m.data) <> 'object') AS main_not_object,
+  count(*) FILTER (WHERE jsonb_typeof(m.data::jsonb) <> 'object') AS main_not_object,
   count(*) FILTER (
-    WHERE jsonb_typeof(m.data) = 'object'
-      AND NOT (m.data ?& ARRAY['zid', 'n', 'tids', 'pca', 'base-clusters',
+    WHERE jsonb_typeof(m.data::jsonb) = 'object'
+      AND NOT (m.data::jsonb ?& ARRAY['zid', 'n', 'tids', 'pca', 'base-clusters',
                               'group-clusters', 'group-votes', 'repness', 'in-conv',
                               'lastVoteTimestamp'])) AS main_missing_keys,
-  count(*) FILTER (WHERE (m.data->>'zid') IS DISTINCT FROM m.zid::text) AS main_zid_unbound,
+  count(*) FILTER (WHERE (m.data::jsonb->>'zid') IS DISTINCT FROM m.zid::text) AS main_zid_unbound,
   count(*) FILTER (
-    WHERE (m.data->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text)
+    WHERE (m.data::jsonb->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text)
     AS main_timestamp_unbound,
-  count(*) FILTER (WHERE jsonb_typeof(b.data->'bidToPid') IS DISTINCT FROM 'array'
-                      OR (b.data->>'zid') IS DISTINCT FROM b.zid::text) AS bidtopid_malformed,
-  count(*) FILTER (WHERE jsonb_typeof(p.data->'ptptstats') IS DISTINCT FROM 'object'
-                      OR (p.data->>'zid') IS DISTINCT FROM p.zid::text) AS ptptstats_malformed,
+  count(*) FILTER (WHERE jsonb_typeof(b.data::jsonb->'bidToPid') IS DISTINCT FROM 'array'
+                      OR (b.data::jsonb->>'zid') IS DISTINCT FROM b.zid::text) AS bidtopid_malformed,
+  count(*) FILTER (WHERE jsonb_typeof(p.data::jsonb->'ptptstats') IS DISTINCT FROM 'object'
+                      OR (p.data::jsonb->>'zid') IS DISTINCT FROM p.zid::text) AS ptptstats_malformed,
   count(*) FILTER (
-    WHERE (b.data->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text
-       OR (p.data->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text)
+    WHERE (b.data::jsonb->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text
+       OR (p.data::jsonb->>'lastVoteTimestamp') IS DISTINCT FROM m.last_vote_timestamp::text)
     AS companion_timestamp_unbound,
-  count(*) FILTER (WHERE v.valid AND m.data->>'n' = '0') AS empty_shape,
+  count(*) FILTER (WHERE v.valid AND m.data::jsonb->>'n' = '0') AS empty_shape,
   count(*) FILTER (WHERE NOT v.valid) AS invalid_payload
 FROM math_main s
 JOIN math_main m ON m.zid = s.zid AND m.math_env = :'target'
@@ -279,70 +289,66 @@ JOIN math_bidtopid b ON b.zid = s.zid AND b.math_env = :'target'
 JOIN math_ptptstats p ON p.zid = s.zid AND p.math_env = :'target'
 JOIN math_ticks k ON k.zid = s.zid AND k.math_env = :'target'
 CROSS JOIN LATERAL (SELECT COALESCE((
-        m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
-        AND m.math_tick >= 0 AND b.math_tick = m.math_tick
-        AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
-        AND m.last_vote_timestamp IS NOT NULL
-        AND jsonb_typeof(m.data) = 'object'
-        AND CASE WHEN jsonb_typeof(m.data->'zid') = 'number'
-                 THEN (m.data->>'zid')::numeric = m.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(m.data->'lastVoteTimestamp') = 'number'
-                 THEN (m.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        SELECT jsonb_typeof(md) = 'object'
+        AND CASE WHEN jsonb_typeof(md->'zid') = 'number'
+                 THEN (md->>'zid')::numeric = m.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(md->'lastVoteTimestamp') = 'number'
+                 THEN (md->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND jsonb_typeof(m.data->'tids') = 'array'
-        AND jsonb_typeof(m.data->'pca') = 'object'
-        AND jsonb_typeof(m.data->'repness') = 'object'
-        AND jsonb_typeof(b.data) = 'object'
-        AND CASE WHEN jsonb_typeof(b.data->'zid') = 'number'
-                 THEN (b.data->>'zid')::numeric = b.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(b.data->'lastVoteTimestamp') = 'number'
-                 THEN (b.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        AND jsonb_typeof(md->'tids') = 'array'
+        AND jsonb_typeof(md->'pca') = 'object'
+        AND jsonb_typeof(md->'repness') = 'object'
+        AND jsonb_typeof(bd) = 'object'
+        AND CASE WHEN jsonb_typeof(bd->'zid') = 'number'
+                 THEN (bd->>'zid')::numeric = b.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(bd->'lastVoteTimestamp') = 'number'
+                 THEN (bd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND jsonb_typeof(p.data) = 'object'
-        AND CASE WHEN jsonb_typeof(p.data->'zid') = 'number'
-                 THEN (p.data->>'zid')::numeric = p.zid ELSE false END
-        AND CASE WHEN jsonb_typeof(p.data->'lastVoteTimestamp') = 'number'
-                 THEN (p.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+        AND jsonb_typeof(pd) = 'object'
+        AND CASE WHEN jsonb_typeof(pd->'zid') = 'number'
+                 THEN (pd->>'zid')::numeric = p.zid ELSE false END
+        AND CASE WHEN jsonb_typeof(pd->'lastVoteTimestamp') = 'number'
+                 THEN (pd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
                  ELSE false END
-        AND CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-             THEN p.data->'ptptstats' = '{}'::jsonb
-                  OR (jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                      AND jsonb_typeof(p.data->'ptptstats'->'gid') = 'array'
+        AND CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+             THEN pd->'ptptstats' = '{}'::jsonb
+                  OR (jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                      AND jsonb_typeof(pd->'ptptstats'->'gid') = 'array'
                       AND NOT EXISTS (
-                          SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-                                                        THEN p.data->'ptptstats' ELSE '{}'::jsonb END) e
+                          SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+                                                        THEN pd->'ptptstats' ELSE '{}'::jsonb END) e
                           WHERE (CASE WHEN jsonb_typeof(e.value) = 'array'
                                       THEN jsonb_array_length(e.value) END)
                                 IS DISTINCT FROM
-                                (CASE WHEN jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                                      THEN jsonb_array_length(p.data->'ptptstats'->'pid') END)))
+                                (CASE WHEN jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                                      THEN jsonb_array_length(pd->'ptptstats'->'pid') END)))
              ELSE false END
-        AND jsonb_typeof(m.data->'pca'->'center') = 'array'
-        AND jsonb_typeof(m.data->'pca'->'comps') = 'array'
+        AND jsonb_typeof(md->'pca'->'center') = 'array'
+        AND jsonb_typeof(md->'pca'->'comps') = 'array'
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'center') = 'array'
-                                                    THEN m.data->'pca'->'center' ELSE '[]'::jsonb END) x
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'center') = 'array'
+                                                    THEN md->'pca'->'center' ELSE '[]'::jsonb END) x
             WHERE jsonb_typeof(x) <> 'number')
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'comps') = 'array'
-                                                    THEN m.data->'pca'->'comps' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'comps') = 'array'
+                                                    THEN md->'pca'->'comps' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'group-clusters') = 'array'
-                                                    THEN m.data->'group-clusters' ELSE '[]'::jsonb END) g
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'group-clusters') = 'array'
+                                                    THEN md->'group-clusters' ELSE '[]'::jsonb END) g
             WHERE jsonb_typeof(g) <> 'object'
                OR jsonb_typeof(g->'id') IS DISTINCT FROM 'number'
                OR jsonb_typeof(g->'members') IS DISTINCT FROM 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(g->'members') = 'array'
                                                                   THEN g->'members' ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
-        AND jsonb_typeof(m.data->'group-votes') = 'object'
+        AND jsonb_typeof(md->'group-votes') = 'object'
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'group-votes') = 'object'
-                                          THEN m.data->'group-votes' ELSE '{}'::jsonb END) g
+            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'group-votes') = 'object'
+                                          THEN md->'group-votes' ELSE '{}'::jsonb END) g
             WHERE jsonb_typeof(g.value) IS DISTINCT FROM 'object'
                OR jsonb_typeof(g.value->'n-members') IS DISTINCT FROM 'number'
                OR jsonb_typeof(g.value->'votes') IS DISTINCT FROM 'object'
@@ -353,50 +359,55 @@ CROSS JOIN LATERAL (SELECT COALESCE((
                              OR jsonb_typeof(v.value->'D') IS DISTINCT FROM 'number'
                              OR jsonb_typeof(v.value->'S') IS DISTINCT FROM 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'repness') = 'object'
-                                          THEN m.data->'repness' ELSE '{}'::jsonb END) r
+            SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'repness') = 'object'
+                                          THEN md->'repness' ELSE '{}'::jsonb END) r
             WHERE jsonb_typeof(r.value) IS DISTINCT FROM 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.value) = 'array'
                                                                   THEN r.value ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) IS DISTINCT FROM 'object'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-                                                    THEN m.data->'base-clusters'->'id' ELSE '[]'::jsonb END) x
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'id') = 'array'
+                                                    THEN md->'base-clusters'->'id' ELSE '[]'::jsonb END) x
             WHERE jsonb_typeof(x) <> 'number')
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-                                                    THEN m.data->'base-clusters'->'members' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'members') = 'array'
+                                                    THEN md->'base-clusters'->'members' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
         AND NOT EXISTS (
-            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(b.data->'bidToPid') = 'array'
-                                                    THEN b.data->'bidToPid' ELSE '[]'::jsonb END) c
+            SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(bd->'bidToPid') = 'array'
+                                                    THEN bd->'bidToPid' ELSE '[]'::jsonb END) c
             WHERE jsonb_typeof(c) <> 'array'
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                                   THEN c ELSE '[]'::jsonb END) x
                           WHERE jsonb_typeof(x) <> 'number'))
-        AND CASE WHEN jsonb_typeof(m.data->'n') = 'number'
-                  AND jsonb_typeof(m.data->'base-clusters') = 'object'
-                  AND jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-                  AND jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-                  AND jsonb_typeof(m.data->'group-clusters') = 'array'
-                  AND jsonb_typeof(m.data->'in-conv') = 'array'
-                  AND jsonb_typeof(b.data->'bidToPid') = 'array'
-             THEN (m.data->>'n')::numeric >= 0
-                  AND jsonb_array_length(m.data->'base-clusters'->'members')
-                      = jsonb_array_length(m.data->'base-clusters'->'id')
-                  AND jsonb_array_length(b.data->'bidToPid')
-                      = jsonb_array_length(m.data->'base-clusters'->'id')
-                  AND jsonb_array_length(m.data->'in-conv') <= (m.data->>'n')::numeric
-                  AND ((m.data->>'n')::numeric > 0
-                       OR (jsonb_array_length(m.data->'base-clusters'->'id') = 0
-                           AND jsonb_array_length(m.data->'group-clusters') = 0
-                           AND jsonb_array_length(m.data->'in-conv') = 0
+        AND CASE WHEN jsonb_typeof(md->'n') = 'number'
+                  AND jsonb_typeof(md->'base-clusters') = 'object'
+                  AND jsonb_typeof(md->'base-clusters'->'id') = 'array'
+                  AND jsonb_typeof(md->'base-clusters'->'members') = 'array'
+                  AND jsonb_typeof(md->'group-clusters') = 'array'
+                  AND jsonb_typeof(md->'in-conv') = 'array'
+                  AND jsonb_typeof(bd->'bidToPid') = 'array'
+             THEN (md->>'n')::numeric >= 0
+                  AND jsonb_array_length(md->'base-clusters'->'members')
+                      = jsonb_array_length(md->'base-clusters'->'id')
+                  AND jsonb_array_length(bd->'bidToPid')
+                      = jsonb_array_length(md->'base-clusters'->'id')
+                  AND jsonb_array_length(md->'in-conv') <= (md->>'n')::numeric
+                  AND ((md->>'n')::numeric > 0
+                       OR (jsonb_array_length(md->'base-clusters'->'id') = 0
+                           AND jsonb_array_length(md->'group-clusters') = 0
+                           AND jsonb_array_length(md->'in-conv') = 0
                            AND m.last_vote_timestamp = 0
-                           AND p.data->'ptptstats' = '{}'::jsonb))
+                           AND pd->'ptptstats' = '{}'::jsonb))
              ELSE false END
+        FROM (SELECT m.data::jsonb AS md, b.data::jsonb AS bd, p.data::jsonb AS pd OFFSET 0) AS payload
+        WHERE m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
+        AND m.math_tick >= 0 AND b.math_tick = m.math_tick
+        AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
+        AND m.last_vote_timestamp IS NOT NULL
     ), false) AS valid) v
 WHERE s.math_env = :'source'
   AND m.math_tick >= 0 AND m.math_tick = b.math_tick AND m.math_tick = p.math_tick

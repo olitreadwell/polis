@@ -1,5 +1,71 @@
 # Upgrade Guide
 
+## Migration runner transition
+
+Use [the migration runner](migrations.md) before replacing services. Existing
+databases need one catalog-checked `reconcile` before their first runner deploy;
+new databases initialize through the runner. Missing or changed history prevents
+API startup. Migrations 000019/23/24/27 now apply during deployment; the coordinator
+000021 remains explicitly held in this release. This installs schema only, not
+queue producers or workers. PostgreSQL 17+ is required.
+
+Read the [per-deployment upgrade paths and read-only report](migration-upgrade-notes.md)
+before the first transition. One explicit release manifest selects the files;
+M20/M21/M25/M26 are outside this forward release. Historical M4/M5/M7 never
+execute automatically: absence of their removal targets permits ADOPTED receipts,
+while retained targets stop for review without deletion. The
+[named legacy contract](migration-legacy-contract.md) preserves supported live
+variants, and the [release map](migration-release-map.md) distinguishes shipped
+source from actual execution and unassigned semantic versions.
+
+Install **release A** (safe hooks, no runner or startup check) successfully on
+EVERY deployment-group instance before this release B. CodeDeploy executes
+ApplicationStop from the previous successful revision. A's first transition may
+still interrupt service; B's migration refusal preserves A's running services.
+An instance that missed A must not receive B. Rolling back to pre-A hooks removes
+this protection; restore A before retrying B.
+
+AfterInstall builds the runner, invokes `polis-migrate deploy`, and only after
+success replaces the role's services. Under one database advisory lock, deploy
+reconciles the catalog through 000022 if history is absent/legacy on an existing
+database, applies the selected pending migrations, and checks readiness. A fresh
+database goes directly to apply; modern history is checked rather than adopted
+again. Any mismatch stops. No error is used as a signal to retry reconciliation.
+This release's production-shaped transition adopts 20 files and applies only
+M19/M23/M24/M27. Existing queue catalogs newer than the adoption bound still require
+their separately reviewed explicit reconciliation before this deploy.
+
+ValidateService checks the server's HTTP and database routes, plus container
+liveness; Delphi/worker checks prove container/process liveness only. Validation
+failure fails deployment, not an automatic container rollback or schema undo.
+Successful earlier migrations may remain after a later failure. Preserve backup
+and migration-specific recovery procedures. No automatic down migration runs.
+
+## Rollbacks and rolling deployments of a migration release
+
+Each box's AfterInstall checks out exactly the commit its deployment was built
+from (`scripts/deploy-revision.txt`, written into the bundle by the deploy
+workflow), and only if that commit is on `origin/stable`. A promotion merged
+while a deployment is mid-rollout therefore reaches no box, and its migrations
+are applied only by its own deployment. A bundle without the file, or with a
+commit not on stable, deploys nothing.
+
+A release tolerates applied migrations it does not list when they are declared
+additive ([forward compatibility](migrations.md#forward-compatibility)):
+
+- **Rollback.** Redeploying an earlier bundle, or a stable revert, starts the
+  earlier release beside newer additive migrations; its runner applies nothing
+  and logs each tolerated migration. A newer breaking migration still refuses
+  in AfterInstall, before any service is replaced; that needs a forward fix or
+  a reviewed down script. No automatic down migration runs.
+- **Rolling deployment.** Once box 1 applies an additive migration, a server
+  still on the previous release that restarts (crash, OOM, reboot) passes its
+  startup check and serves. After a breaking migration it refuses and Docker
+  keeps restarting it until that box's own AfterInstall runs.
+
+Both hold only for releases that contain the rule: the first release with it is
+the earliest rollback target that tolerates newer migrations.
+
 ## Configuration Changes (Q1 2023)
 
 `polis.config.template.js` and `polis.config.js` files are removed and no longer used.

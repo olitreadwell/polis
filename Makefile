@@ -19,10 +19,18 @@ endef
 # Default environment and settings (dev)
 export ENV_FILE = .env
 
+# Serialize configuration selectors and destructive operations, even with make -j.
+.NOTPARALLEL:
+export CONFIRM_DATA_LOSS DUMP
+
 # Lazy evaluation of expensive environment parsing - only when needed
 define get_env_vars
 	$(eval export TAG = $(call parse_env_value,TAG))
-	$(eval export GIT_HASH = $(shell git rev-parse --short HEAD))
+	$(eval export GIT_HASH = $(shell git rev-parse HEAD))
+	$(eval POLIS_BUILD_IDENTITY := $(shell python3 scripts/build_identity.py --format env))
+	$(eval export POLIS_BUILD_DISTANCE = $(patsubst distance=%,%,$(filter distance=%,$(POLIS_BUILD_IDENTITY))))
+	$(eval export POLIS_BUILD_SOURCE = $(patsubst source=%,%,$(filter source=%,$(POLIS_BUILD_IDENTITY))))
+	$(eval export POLIS_BUILD_TAG = $(if $(filter channel=stable,$(POLIS_BUILD_IDENTITY)),v$(patsubst version_base=%,%,$(filter version_base=%,$(POLIS_BUILD_IDENTITY))),))
 	$(eval POSTGRES_DOCKER_RAW = $(shell echo $(call parse_env_value,POSTGRES_DOCKER) | tr '[:upper:]' '[:lower:]'))
 	$(eval export POSTGRES_DOCKER = $(call parse_env_bool,$(POSTGRES_DOCKER_RAW)))
 	$(eval LOCAL_SERVICES_DOCKER_RAW = $(shell echo $(call parse_env_value,LOCAL_SERVICES_DOCKER) | tr '[:upper:]' '[:lower:]'))
@@ -30,11 +38,11 @@ define get_env_vars
 	$(eval USE_PRODCLONE_RAW = $(shell echo $(call parse_env_value,USE_PRODCLONE) | tr '[:upper:]' '[:lower:]'))
 	$(eval USE_PRODCLONE = $(call parse_env_bool,$(USE_PRODCLONE_RAW)))
 	$(eval export DB_INIT_MODE = $(if $(filter true,$(USE_PRODCLONE)),pdb,db))
-	$(eval export POSTGRES_VOLUME = $(if $(filter true,$(USE_PRODCLONE)),prodclone_data,postgres_data))
+	$(eval export POSTGRES_VOLUME = $(or $(POSTGRES_VOLUME),$(call parse_env_value,POSTGRES_VOLUME),$(if $(filter true,$(USE_PRODCLONE)),prodclone_data,postgres_data)))
 	# Only set COMPOSE_FILE_ARGS if not already set by environment-specific targets
-	$(eval COMPOSE_FILE_ARGS ?= -f docker-compose.yml -f docker-compose.dev.yml)
-	$(eval COMPOSE_FILE_ARGS += $(if $(POSTGRES_DOCKER),--profile postgres,))
-	$(eval COMPOSE_FILE_ARGS += $(if $(LOCAL_SERVICES_DOCKER),--profile local-services,))
+	$(eval COMPOSE_FILE_ARGS ?= -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.self-hosted.yml)
+	$(eval COMPOSE_FILE_ARGS += $(if $(filter true,$(POSTGRES_DOCKER)),--profile postgres,))
+	$(eval COMPOSE_FILE_ARGS += $(if $(filter true,$(LOCAL_SERVICES_DOCKER)),--profile local-services,))
 endef
 
 # Support for detached mode
@@ -54,10 +62,10 @@ define setup_env
 	$(eval USE_PRODCLONE_RAW = $(shell echo $(call parse_env_value,USE_PRODCLONE) | tr '[:upper:]' '[:lower:]'))
 	$(eval USE_PRODCLONE = $(call parse_env_bool,$(USE_PRODCLONE_RAW)))
 	$(eval DB_INIT_MODE = $(if $(filter true,$(USE_PRODCLONE)),pdb,db))
-	$(eval POSTGRES_VOLUME = $(if $(filter true,$(USE_PRODCLONE)),prodclone_data,postgres_data))
+	$(eval POSTGRES_VOLUME = $(or $(POSTGRES_VOLUME),$(call parse_env_value,POSTGRES_VOLUME),$(if $(filter true,$(USE_PRODCLONE)),prodclone_data,postgres_data)))
 	$(eval COMPOSE_FILE_ARGS = $(2))
-	$(eval COMPOSE_FILE_ARGS += $(if $(POSTGRES_DOCKER),--profile postgres,))
-	$(eval COMPOSE_FILE_ARGS += $(if $(LOCAL_SERVICES_DOCKER),--profile local-services,))
+	$(eval COMPOSE_FILE_ARGS += $(if $(filter true,$(POSTGRES_DOCKER)),--profile postgres,))
+	$(eval COMPOSE_FILE_ARGS += $(if $(filter true,$(LOCAL_SERVICES_DOCKER)),--profile local-services,))
 endef
 
 # Function to open psql shell
@@ -96,16 +104,20 @@ rm-containers: echo_vars ## Remove Docker containers where (polis_tag="${TAG}")
 	@echo 'removing filtered containers (polis_tag="${TAG}")'
 	@-docker rm -f $(shell docker ps -aq --filter "label=polis_tag=${TAG}")
 
-rm-volumes: echo_vars ## Remove Docker volumes where (polis_tag="${TAG}")
-	@echo 'removing filtered volumes (polis_tag="${TAG}")'
-	@-docker volume rm -f $(shell docker volume ls -q --filter "label=polis_tag=${TAG}")
+# The helper resolves the same Compose project/volume as the stack. It performs
+# inspection and backup before stopping/removing anything in these targets.
+SELFHOST_DB = bash scripts/selfhost-db.sh
+SELFHOST_COMPOSE = ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE}
+
+rm-volumes: echo_vars ## Remove this project's volumes after a database safety check; keep backups
+	@$(SELFHOST_DB) remove $(SELFHOST_COMPOSE)
 
 rm-images: echo_vars ## Remove Docker images where (polis_tag="${TAG}")
 	@echo 'removing filtered images (polis_tag="${TAG}")'
 	@-docker rmi -f $(shell docker images -q --filter "label=polis_tag=${TAG}")
 
-rm-ALL: rm-containers rm-volumes rm-images ## Remove Docker containers, volumes, and images (including db) where (polis_tag="${TAG}")
-	@echo Done.
+rm-ALL: echo_vars ## Remove this project's containers and data volumes after a database safety check
+	@$(SELFHOST_DB) remove-all $(SELFHOST_COMPOSE)
 
 hash: ## Show current short hash
 	@echo Git hash: ${GIT_HASH}
@@ -122,7 +134,7 @@ start-recreate: echo_vars ## Start all Docker containers with recreated environm
 start-rebuild: echo_vars ## Start all Docker containers, [re]building as needed
 	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} up ${DETACH_ARG} --build
 
-start-FULL-REBUILD: echo_vars stop rm-ALL ## Remove and restart all Docker containers, volumes, and images (including db), as with rm-ALL
+start-FULL-REBUILD: rm-ALL ## Back up and remove this project, then rebuild and start
 	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} build --no-cache
 	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} up ${DETACH_ARG}
 
@@ -157,15 +169,19 @@ regenerate-jwt-keys: ## Regenerate JWT keys (overwrites existing)
 	@node server/scripts/generate-jwt-keys.js
 
 # Database refresh helpers
-refresh-db: echo_vars ## Stop stack, drop current DB volume (${POSTGRES_VOLUME}), and restart (re-inits from migrations or prodclone.dump)
-	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} down --remove-orphans
-	@echo 'removing any containers still referencing volume ${POSTGRES_VOLUME}'
-	@-docker rm -f $$(docker ps -aq --filter "volume=${COMPOSE_PROJECT_NAME}_${POSTGRES_VOLUME}") >/dev/null 2>&1 || true
-	@echo 'removing database volume ${POSTGRES_VOLUME} (polis_tag=${TAG})'
-	@-docker volume rm -f $(shell docker volume ls -q --filter "label=polis_tag=${TAG}" --filter "name=${POSTGRES_VOLUME}")
-	@echo 'rebuilding postgres image using Dockerfile-${DB_INIT_MODE} (USE_PRODCLONE=${USE_PRODCLONE})'
+refresh-db: echo_vars ## Back up and replace the selected database volume, then restart
+	@$(SELFHOST_DB) refresh $(SELFHOST_COMPOSE)
 	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} build --no-cache postgres
 	docker compose ${COMPOSE_FILE_ARGS} --env-file ${ENV_FILE} up ${DETACH_ARG}
+
+db-dump: echo_vars ## Write a verified cluster dump to ./backups outside Docker
+	@$(SELFHOST_DB) dump $(SELFHOST_COMPOSE)
+
+db-restore: echo_vars ## Restore DUMP=file.sql.gz into an empty database volume
+	@$(SELFHOST_DB) restore $(SELFHOST_COMPOSE)
+
+db-backups: echo_vars ## List the nightly dumps retained in the backups volume
+	@$(SELFHOST_DB) list $(SELFHOST_COMPOSE)
 
 refresh-prodclone: ## Force prodclone mode, drop prodclone volume, and restart from prodclone.dump
 	$(MAKE) USE_PRODCLONE=true refresh-db
@@ -177,8 +193,7 @@ refresh-devdb: ## Force dev DB mode (migrations), drop postgres_data volume, and
 # P-022 §C — poller recovery matrix (R01-R12) on a REAL Postgres
 # ---------------------------------------------------------------------------- #
 # Reuses docker-compose.test.yml's postgres service (built from
-# server/Dockerfile-db, which bakes server/postgres/migrations/*.sql into
-# docker-entrypoint-initdb.d) with docker-compose.recovery.yml overriding the
+# server/Dockerfile-db, which runs polis-migrate during fresh initialization) with docker-compose.recovery.yml overriding the
 # host port and making the data directory a tmpfs, so every `up` re-runs initdb
 # with the real migrations and nothing survives teardown.
 #
@@ -230,8 +245,15 @@ test-recovery-races: ## Re-run the deterministic race schedules 20x (P-022 accep
 		done; \
 		echo "20/20 race iterations passed"
 
+vote-convention-gate: ## P-078: load the vote fixtures at both storage signs and compare every vote suite (PYTHON=, VOTE_GATE_STRICT=1)
+	ci/vote_convention/run.sh
+
+vote-sign-lint: ## P-078: fail on a new vote-sign literal outside the chokepoint modules
+	python3 ci/vote_convention/sign_lint.py
+
 e2e-install: e2e/node_modules ## Install Cypress E2E testing tools
-	$(E2E_RUN) npm install
+	$(E2E_RUN) npm ci --ignore-scripts
+	$(E2E_RUN) npm run install:browser
 
 e2e-run: ## Run E2E tests except those which require 3rd party services
 	$(E2E_RUN) npm run test
@@ -258,15 +280,16 @@ rbs: start-rebuild
 %:
 	@true
 
-.PHONY: help start stop \
+.PHONY: help start stop db-dump db-restore db-backups \
 	build-no-cache build-web-assets \
 	e2e-install e2e-run e2e-run-all e2e-run-interactive \
 	extract-web-assets generate-jwt-keys hash psql-shell pull \
-	rebuild-delphi rebuild-server rebuild-web 
+	rebuild-delphi rebuild-server rebuild-web \
 	refresh-db refresh-devdb refresh-prodclone regenerate-jwt-keys \
 	rm-ALL rm-containers rm-images rm-volumes \
 	start-FULL-REBUILD start-prodclone start-rebuild start-recreate \
-	test-recovery test-recovery-up test-recovery-down test-recovery-races
+	test-recovery test-recovery-up test-recovery-down test-recovery-races \
+	vote-convention-gate vote-sign-lint
 
 
 help: ## Show this help message

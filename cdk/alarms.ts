@@ -284,6 +284,8 @@ export interface OperationalAlarmsProps {
   codeDeployApplicationName: string;
   /** CodeDeploy deployment group to watch for FAILURE/STOP. */
   codeDeployDeploymentGroupName: string;
+  /** The worker tiers' deployment group, watched by the same rule when present. */
+  codeDeployWorkerDeploymentGroupName?: string;
   /**
    * Existing db.ts alarms whose notifications move onto the shared topic, with
    * the catalog id each one corresponds to. The topic is ADDED to their
@@ -414,7 +416,12 @@ const createOperationalAlarms = (self: Construct, props: OperationalAlarmsProps)
       comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
       evaluationPeriods: 3,
       datapointsToAlarm: 2,
-      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+      // Was BREACHING: missing data was the whole mechanism. The Clojure math
+      // engine is retired and AsgMathWorker is emptied (autoscaling.ts), so an
+      // absent metric is now the expected state and BREACHING would hold this
+      // alarm in ALARM. NOT_BREACHING with the unreachable <0% threshold makes
+      // it inert; it goes with the ASG construct in the later removal.
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     }),
   );
 
@@ -526,7 +533,10 @@ const createOperationalAlarms = (self: Construct, props: OperationalAlarmsProps)
       detailType: ['CodeDeploy Deployment State-change Notification'],
       detail: {
         application: [props.codeDeployApplicationName],
-        deploymentGroup: [props.codeDeployDeploymentGroupName],
+        deploymentGroup: [
+          props.codeDeployDeploymentGroupName,
+          ...(props.codeDeployWorkerDeploymentGroupName ? [props.codeDeployWorkerDeploymentGroupName] : []),
+        ],
         state: ['FAILURE', 'STOP'],
       },
     },

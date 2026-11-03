@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from "uuid";
 import { Request, Response } from "express";
 import logger from "../../utils/logger";
 import { getZidFromReport } from "../../utils/parameter";
+import { failJson } from "../../utils/fail";
 import Config from "../../config";
 import pg from "../../db/pg-query";
 import {
@@ -10,14 +11,26 @@ import {
   JOB_QUEUE_TABLE,
 } from "./jobGuard";
 
+// The job types delphi/scripts/job_poller.py runs (KNOWN_JOB_TYPES there).
+// Anything else is refused here; the poller used to send an unknown type to
+// run_delphi.py, which starts by deleting the conversation's results.
+export const DELPHI_JOB_TYPES: ReadonlySet<string> = new Set([
+  "FULL_PIPELINE",
+  "CREATE_NARRATIVE_BATCH",
+  "AWAITING_NARRATIVE_BATCH",
+]);
+
 // Handler for POST /api/v3/delphi/jobs - Create a new Delphi job
 export async function handle_POST_delphi_jobs(
   req: Request,
   res: Response
 ): Promise<void> {
   try {
+    // A refusal, not a fault: answered before the request is read, so no job
+    // is written. The catch below answers 500 for anything thrown.
     if (!req.p.delphiEnabled) {
-      throw new Error("Unauthorized");
+      failJson(res, 403, "polis_err_delphi_jobs_delphi_disabled");
+      return;
     }
     logger.info(
       `Creating Delphi job with parameters: ${JSON.stringify(req.body)}`
@@ -32,6 +45,16 @@ export async function handle_POST_delphi_jobs(
       include_moderation = false, // ignore comments that recieve a failing moderation score
       idempotency_key = null,
     } = req.body;
+
+    if (typeof job_type !== "string" || !DELPHI_JOB_TYPES.has(job_type)) {
+      res.status(400).json({
+        status: "error",
+        error: `Unknown job_type: expected one of ${[...DELPHI_JOB_TYPES].join(
+          ", "
+        )}`,
+      });
+      return;
+    }
 
     // Validate required parameters
     if (!report_id && !conversation_id) {

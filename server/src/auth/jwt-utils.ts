@@ -296,11 +296,21 @@ export function createExtractUserMiddleware(
       req.p = req.p || {};
       req.p.pid = payload.pid;
       req.p.conversation_id = payload.conversation_id;
+      // The conversation the token was issued for, kept apart from
+      // req.p.conversation_id (which a route's own parameter may overwrite):
+      // ensureParticipant decides the token's scope against the conversation
+      // the route resolves.
+      req.p.jwt_conversation_id = payload.conversation_id;
       req.p[`${participantType}_participant`] = true;
 
       // Add type-specific data
       if (participantType === "xid" && payload.xid) {
         req.p.xid = payload.xid;
+        // The xid the token is bound to, kept apart from req.p.xid (which a
+        // route's own xid parameter may overwrite): ensureParticipant treats
+        // a request that names another xid as that xid's identity, not the
+        // token's participant.
+        req.p.jwt_xid = payload.xid;
       } else if (participantType === "standard_user" && payload.oidc_sub) {
         req.p.oidc_sub = payload.oidc_sub;
       }

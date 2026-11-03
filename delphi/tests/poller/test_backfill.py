@@ -496,7 +496,7 @@ class TestMemoryBudget:
     def test_estimate_over_the_budget_is_refused_and_reported(self, tmp_path):
         db = FakeDb()
         db.add(1, 60_000, voters=60_000, comments=1_000, votes=3_300_000)
-        db.add(2, 30_000, voters=30_000, comments=1_000, votes=1_650_000)
+        db.add(2, 30_000, voters=20_000, comments=1_000, votes=1_100_000)
         state = str(tmp_path / "s.json")
         t = make(db, state_path=state)  # 6 GiB limit, 300 MiB base
         assert t.sched.step()[0] == bf.OVER_MEMORY_CEILING
@@ -523,7 +523,7 @@ class TestMemoryBudget:
 
     def test_no_room_beside_the_live_cache_is_deferred_not_excluded(self):
         db = FakeDb()
-        db.add(1, 30_000, voters=30_000, comments=1_000, votes=1_650_000)
+        db.add(1, 30_000, voters=20_000, comments=1_000, votes=1_100_000)
         t = make(db)
         t.admission.set_retained(999, 2_000 * MB)  # a cached live conversation
         assert t.sched.step()[0] == "admitted"
@@ -539,7 +539,7 @@ class TestMemoryBudget:
 
     def test_cold_cache_is_evicted_to_make_room(self):
         db = FakeDb()
-        db.add(1, 30_000, voters=30_000, comments=1_000, votes=1_650_000)
+        db.add(1, 30_000, voters=20_000, comments=1_000, votes=1_100_000)
         t = make(db)
         t.admission.set_retained(999, 2_000 * MB)
         t.admission.set_evictor(lambda shortfall, protect: t.admission.drop_retained(999))
@@ -557,7 +557,7 @@ class TestMemoryBudget:
         # Same dimensions, far more fetched rows: the reservation grows.
         db = FakeDb()
         db.add(1, 1_000, voters=1_000, comments=1_000, votes=55_000)
-        db.add(2, 999, voters=1_000, comments=1_000, votes=9_000_000)
+        db.add(2, 999, voters=1_000, comments=1_000, votes=4_000_000)
         t = make(db, concurrency=2, max_votes_per_min=100_000_000)
         assert t.sched.step()[0] == "admitted"
         sparse = t.sched._in_flight[1].need_bytes
@@ -565,7 +565,7 @@ class TestMemoryBudget:
         t.host.pending.discard(1)
         assert t.sched.step()[0] == "admitted"
         dense = t.sched._in_flight[2].need_bytes
-        assert dense - sparse == pytest.approx(1.15 * 413 * (9_000_000 - 55_000), rel=1e-6)
+        assert dense - sparse == pytest.approx(1.15 * 1000 * (4_000_000 - 55_000), rel=1e-6)
 
     def test_a_backfill_job_never_waits_beside_live_work_it_defers(self):
         db = FakeDb()
@@ -629,7 +629,7 @@ class TestExecution:
         assert t.host.computed == []
 
     def test_live_cached_conversation_needing_repair_is_repaired_not_deferred(self):
-        # Review [1447] E: a cached (live-owned) zid whose publication is
+        # Regression: a cached (live-owned) zid whose publication is
         # invalid is repaired through the serialized job, never deferred
         # forever as live_owned.
         db = FakeDb()
@@ -896,6 +896,129 @@ class TestGate:
             assert part in caplog.text
         t.sched.approve_gate()
         assert drain(t) == [3, 4, 5]
+
+    def test_gate_records_every_attempt_but_counts_publications(self, tmp_path, caplog):
+        # P-073 x.34: an attempt that ran and then failed its postcondition
+        # after a large increment must appear in the gate table.
+        db = FakeDb()
+        db.add(1, 900, voters=900, comments=50, votes=40_000)
+        db.add(2, 800)
+        db.add(3, 700)
+        db.add(4, 600)
+        t = make(db, gate_after_largest=2, max_votes=10_000_000,
+                 state_path=str(tmp_path / "s.json"))
+        orig = t.sched._store.coherent
+
+        def coherent(zid):
+            if zid == 1:
+                raise RuntimeError("connection lost")
+            return orig(zid)
+
+        t.sched._store.coherent = coherent
+
+        def spike(zid):
+            t.rss["v"] = (4_870 if zid == 1 else 520) * MB
+
+        t.host.during_compute = spike
+        caplog.set_level("WARNING")
+        statuses = []
+        for _ in range(20):
+            status, _ = t.sched.step()
+            statuses.append(status)
+            if status == "admitted":
+                zid = t.host.submitted[-1]
+                t.sched.run_job(zid)
+                t.host.pending.discard(zid)
+                t.rss["v"] = 500 * MB
+            elif status == "gate":
+                break
+        assert status == "gate"
+        st = t.sched._state
+        assert st.gate_published == 2
+        outcomes = [(r["zid"], r["outcome"]) for r in st.gate_records]
+        assert outcomes == [(1, bf.FAILED_POSTCONDITION), (2, bf.PUBLISHED), (3, bf.PUBLISHED)]
+        failed = st.gate_records[0]
+        assert failed["peak_rss_delta_mb"] == pytest.approx(4_370.0)
+        assert "GATE zid=1 outcome=failed_postcondition" in caplog.text
+        assert "observed_increment_mb=4370.0" in caplog.text
+        assert "3 attempts follow" in caplog.text
+        assert st.top_memory[0]["zid"] == 1
+        assert st.top_memory[0]["outcome"] == bf.FAILED_POSTCONDITION
+        assert {r["zid"] for r in st.top_seconds} == {1, 2, 3}
+
+    def test_gate_report_waits_for_jobs_admitted_before_the_threshold(self, caplog):
+        # Concurrency 2, gate after 1: job 2 was admitted before job 1's
+        # publication reached the threshold and finishes after it. It must
+        # be in the table and in the once-only report.
+        db = FakeDb()
+        db.add(1, 900)
+        db.add(2, 800)
+        db.add(3, 700)
+        t = make(db, concurrency=2, gate_after_largest=1)
+        assert t.sched.step()[0] == "admitted"
+        assert t.sched.step()[0] == "admitted"
+        assert sorted(t.sched._in_flight) == [1, 2]
+        t.sched.run_job(1)
+        t.host.pending.discard(1)
+        caplog.set_level("WARNING")
+        assert t.sched.step()[0] == "gate"  # draining: no new admission, no report yet
+        assert "math-backfill GATE run=" not in caplog.text
+        orig = t.sched._store.coherent
+
+        def coherent(zid):
+            if zid == 2:
+                raise RuntimeError("connection lost")
+            return orig(zid)
+
+        t.sched._store.coherent = coherent
+        t.host.during_compute = lambda zid: t.rss.__setitem__("v", 3_917 * MB)
+        t.sched.run_job(2)
+        t.host.pending.discard(2)
+        assert t.sched.step()[0] == "gate"
+        st = t.sched._state
+        assert [(r["zid"], r["outcome"]) for r in st.gate_records] == [
+            (1, bf.PUBLISHED), (2, bf.FAILED_POSTCONDITION)]
+        assert st.gate_published == 1
+        assert "2 attempts follow" in caplog.text
+        assert "GATE zid=2 outcome=failed_postcondition" in caplog.text
+        assert caplog.text.count("math-backfill GATE run=") == 1
+        assert t.sched.step()[0] == "gate"
+        assert caplog.text.count("math-backfill GATE run=") == 1
+        assert 3 not in t.host.submitted
+
+    def test_gate_table_cap_never_drops_publications_below_the_gate_size(self):
+        rows = []
+        for zid in range(1, 60):
+            rows = bf._gate_append(rows, bf.Record(zid, "missing", bf.PUBLISHED), 61)
+        assert len(rows) == 59
+
+    def test_gate_records_size_refusals(self, tmp_path):
+        db = FakeDb()
+        db.add(1, 900, votes=50)
+        db.add(2, 800, votes=5)
+        t = make(db, gate_after_largest=1, max_votes=10)
+        drain_until_gate = [t.sched.step()[0] for _ in range(2)]
+        assert drain_until_gate[0] == bf.REFUSED_INPUT_SIZE
+        assert [r["outcome"] for r in t.sched._state.gate_records] == [bf.REFUSED_INPUT_SIZE]
+        assert t.sched._state.gate_published == 0
+        assert t.sched._state.top_memory == []
+
+    def test_gate_table_is_bounded_and_keeps_the_largest_peaks(self):
+        rows = []
+        for zid in range(1, bf.GATE_RECORDS_MAX + 6):
+            rec = bf.Record(zid, "missing", bf.FAILED_WRITE if zid > 1 else bf.PUBLISHED,
+                            peak_rss_delta_mb=float(zid))
+            rows = bf._gate_append(rows, rec)
+        assert len(rows) == bf.GATE_RECORDS_MAX
+        zids = [r["zid"] for r in rows]
+        assert 1 in zids  # a publication is never dropped
+        assert min(z for z in zids if z != 1) == 7  # the smallest others made room
+
+    def test_top_lists_keep_a_zids_largest_attempt(self):
+        big = bf.Record(7, "missing", bf.FAILED_POSTCONDITION, peak_rss_delta_mb=5000.0)
+        small = bf.Record(7, "missing", bf.PUBLISHED, peak_rss_delta_mb=10.0)
+        rows = bf._top10(bf._top10([], big, "peak_rss_delta_mb"), small, "peak_rss_delta_mb")
+        assert [(r["zid"], r["outcome"]) for r in rows] == [(7, bf.FAILED_POSTCONDITION)]
 
     def test_gate_state_survives_a_same_configuration_restart(self, tmp_path):
         db = FakeDb()
@@ -1238,7 +1361,7 @@ class TestServiceWiring:
 
 
 # --------------------------------------------------------------------------- #
-# Review [1447] C: live lag is not catch-up; source-ahead needs a ruling
+# Regression: live lag is not catch-up; source-ahead needs a ruling
 # --------------------------------------------------------------------------- #
 class TestSourceAheadAndLag:
     @pytest.mark.parametrize("reason", [bf.SOURCE_AHEAD, bf.FAILED_COMPUTE, bf.EXHAUSTED])
@@ -1327,7 +1450,7 @@ class TestSourceAheadAndLag:
 
 
 # --------------------------------------------------------------------------- #
-# Review [1447] D: unbound approvals re-arm; nested state records are checked
+# Regression: unbound approvals re-arm; nested state records are checked
 # --------------------------------------------------------------------------- #
 GOOD_RECORD = {"zid": 1, "klass": "missing", "outcome": "published", "participants": 10,
                "voters": 10, "votes": 50, "comments": 5, "seconds": 1.5,
@@ -1383,7 +1506,7 @@ class TestStateUpgrade:
 
     @pytest.mark.parametrize("key", ["--1", "-", "", "+1", " 1", "1 ", "1\n", "\u0661", "1.0", "007", "-0"])
     def test_malformed_failure_key_starts_paused_and_reports(self, tmp_path, key):
-        """Review [1449] D: "--1" passed lstrip/isdigit, loaded unpaused and
+        """Regression: "--1" passed lstrip/isdigit, loaded unpaused and
         then raised in _finish_sweep's int() conversion."""
         p = tmp_path / "state.json"
         p.write_text(json.dumps({"source_env": "prod", "target_env": "python", "failures": {
@@ -1420,3 +1543,104 @@ class TestStateUpgrade:
         t = make(state_path=str(p))
         assert not t.sched._state.paused and t.sched._state.top_seconds == [GOOD_RECORD]
         t.sched._finish_sweep(NOW)
+
+
+# --------------------------------------------------------------------------- #
+# Error briefs in log lines
+# --------------------------------------------------------------------------- #
+class TestExcBrief:
+    STATEMENT = "SELECT zid, data FROM math_main WHERE math_env = %(env)s"
+    SECRET = "SECRET-VALUE-7731"
+
+    @staticmethod
+    def driver_error(pgcode, message):
+        """A psycopg2-shaped driver error: ``pgcode`` and ``diag.sqlstate``."""
+        orig = Exception(message)
+        orig.pgcode = pgcode
+        orig.diag = SimpleNamespace(sqlstate=pgcode)
+        return orig
+
+    def wrapped(self, pgcode, message):
+        from sqlalchemy.exc import DataError
+
+        return DataError(self.STATEMENT, {"env": self.SECRET},
+                         self.driver_error(pgcode, message))
+
+    def test_bound_value_in_driver_message_never_reaches_the_brief(self):
+        exc = self.wrapped("22P02", 'invalid input syntax for type integer: "'
+                           + self.SECRET + '"')
+        assert self.SECRET in str(exc)  # what the brief must keep out
+        brief = bf._exc_brief(exc)
+        assert brief == "sqlstate=22P02 invalid_text_representation"
+        assert self.SECRET not in brief and "SELECT" not in brief
+
+    def test_bound_value_never_reaches_the_formatted_log_record(self, caplog):
+        exc = self.wrapped("22P02", 'invalid input syntax for type integer: "'
+                           + self.SECRET + '"')
+        caplog.set_level("ERROR")
+        bf.logger.error("math-backfill zid=%s: state read failed (%s: %s)", 1,
+                        exc.__class__.__name__, bf._exc_brief(exc))
+        assert ("state read failed (DataError: sqlstate=22P02 "
+                "invalid_text_representation)") in caplog.text
+        assert all(self.SECRET not in r.getMessage() for r in caplog.records)
+        assert self.SECRET not in caplog.text and "SELECT" not in caplog.text
+
+    def test_statement_timeout_label(self):
+        from sqlalchemy.exc import OperationalError
+
+        exc = OperationalError(self.STATEMENT, {}, self.driver_error(
+            "57014", "canceling statement due to statement timeout"))
+        assert bf._exc_brief(exc) == "sqlstate=57014 statement_timeout"
+
+    def test_class_fallback_and_unknown_code(self):
+        assert bf._exc_brief(self.wrapped("08006", self.SECRET)) == \
+            "sqlstate=08006 connection_exception"
+        brief = bf._exc_brief(self.wrapped("P0001", "raised: " + self.SECRET))
+        assert brief == "sqlstate=P0001 other"
+
+    def test_malformed_code_is_not_trusted(self):
+        exc = self.wrapped("22P02 " + self.SECRET, self.SECRET)
+        exc.orig.diag = SimpleNamespace(sqlstate=None)
+        brief = bf._exc_brief(exc)
+        assert brief == "DataError" and self.SECRET not in brief
+
+    def test_statement_error_without_orig_keeps_the_statement_out(self):
+        from sqlalchemy.exc import StatementError
+
+        exc = StatementError("bad parameter " + self.SECRET, self.STATEMENT,
+                             {"env": self.SECRET}, None)
+        assert self.STATEMENT in str(exc) and self.SECRET in str(exc)
+        assert bf._exc_brief(exc) == "StatementError"
+
+    def test_plain_error_is_its_class_chain_only(self):
+        assert bf._exc_brief(RuntimeError(self.SECRET)) == "RuntimeError"
+        try:
+            try:
+                raise OSError(self.SECRET)
+            except OSError as inner:
+                raise ValueError(self.SECRET) from inner
+        except ValueError as exc:
+            assert bf._exc_brief(exc) == "ValueError/OSError"
+
+    def test_class_chain_stops_at_three(self):
+        a, b, c, d = KeyError(), OSError(), TypeError(), ValueError()
+        a.__cause__, b.__cause__, c.__cause__ = b, c, d
+        assert bf._exc_brief(a) == "KeyError/OSError/TypeError"
+
+    def test_scheduling_failure_logs_class_and_label(self, caplog):
+        t = make()
+        checks = iter([False, True])  # one pass through the loop
+        t.sched._stop = SimpleNamespace(is_set=lambda: next(checks), wait=lambda _w: None)
+
+        def step():
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("SELECT 1", {}, self.driver_error(
+                "57014", "canceling statement due to statement timeout"))
+
+        t.sched.step = step
+        caplog.set_level("ERROR")
+        t.sched._loop()
+        assert ("math-backfill: scheduling step failed (OperationalError: "
+                "sqlstate=57014 statement_timeout); retrying") in caplog.text
+        assert "SELECT 1" not in caplog.text and "canceling" not in caplog.text

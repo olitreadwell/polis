@@ -1,3 +1,5 @@
+const { buildIdentity, BuildInfoPlugin } = require('../scripts/build-identity.cjs');
+const buildInfo = buildIdentity();
 const path = require("path");
 const webpack = require("webpack");
 const CopyPlugin = require("copy-webpack-plugin");
@@ -7,12 +9,16 @@ const EventHooksPlugin = require("event-hooks-webpack-plugin");
 const lodashTemplate = require("lodash/template");
 const glob = require("glob");
 const fs = require("fs");
-const pkg = require("./package.json");
 const TerserPlugin = require("terser-webpack-plugin");
 const Dotenv = require("dotenv-webpack");
 const MiniCssExtractPlugin = require("mini-css-extract-plugin");
 
 const outputDirectory = "dist";
+
+// index.ejs reads window.jwt_decode before the main bundle loads. The browser
+// build is copied unchanged from the pinned npm package (the version the page
+// has been loading) and served from this build, never from a CDN.
+const jwtDecodeScript = `js/jwt-decode-${require("jwt-decode/package.json").version}.js`;
 
 /**
  * Generates .headersJson files alongside files served by the file-server. Reading these files instructs file-server
@@ -219,6 +225,11 @@ module.exports = (env, options) => {
           {
             from: "node_modules/font-awesome/fonts/**/*",
             to: "./fonts/[name][ext]"
+          },
+          {
+            from: "node_modules/jwt-decode/build/jwt-decode.js",
+            to: jwtDecodeScript,
+            info: { minimized: true }
           }
         ]
       }),
@@ -227,7 +238,8 @@ module.exports = (env, options) => {
         template: path.resolve(__dirname, "public/index.ejs"),
         filename: "index.html",
         templateParameters: {
-          versionString: pkg.version,
+          versionString: buildInfo.version_display,
+          jwtDecodeSrc: `/${jwtDecodeScript}`,
           gaTrackingId: gaTrackingId,
           oidcCacheKeyPrefix: oidcCacheKeyPrefix,
           oidcCacheKeyIdTokenSuffix: oidcCacheKeyIdTokenSuffix,
@@ -254,7 +266,9 @@ module.exports = (env, options) => {
         }
       }),
 
+      new BuildInfoPlugin(buildInfo, 'participation'),
       new webpack.DefinePlugin({
+        'process.env.POLIS_BUILD_INFO': JSON.stringify(buildInfo),
         "process.env.GA_TRACKING_ID": JSON.stringify(gaTrackingId),
         "process.env.OIDC_CACHE_KEY_PREFIX": JSON.stringify(oidcCacheKeyPrefix),
         "process.env.OIDC_CACHE_KEY_ID_TOKEN_SUFFIX": JSON.stringify(oidcCacheKeyIdTokenSuffix),

@@ -133,8 +133,8 @@ zero differences in the populated cross-writer witness (see evidence). This
 exercises the actual Node modules, including this branch's reader changes. The step-4 S2 slice adds a candidate coherent-read
 `loadBundle` witness (`tools/bundle_reader.cjs`) and makes the Node job
 unconditional (a missing `server/node_modules` now fails rather than skips),
-and the production Node reader is now implemented in this tree. BOARD[633]
-accepts its local1265/0/2 public replay proof. The two r19/r20 row-order
+and the production Node reader is now implemented in this tree.
+Its local1265/0/2 public replay proof is accepted. The two r19/r20 row-order
 residuals remain reported. Exact-inventory required CI now exists; combined
 full-app/private certification remains open.
 
@@ -423,10 +423,9 @@ plumbing does not silently rewrite or close those obligations.
   counts, stage reachability, byte-hash comparisons against the existing
   writer and the real Node reader, and the metric catalog. No production
   data or credentials are in these files.
-- `cost-reduction/04-plans/P-026-rust-coordinator-report.md` and
-  `P-022-G-coordinator-contract.md` — the accepted design notes this README
-  summarizes; they live outside this branch and are the authoritative
-  record of why each decision was made and who signed off.
+- The accepted design notes this README summarizes (the coordinator report
+  and the coordinator contract) live outside this repository; they are the
+  authoritative record of why each decision was made and who signed off.
 - Raw logs and per-run artifacts go to a git-ignored `artifacts/` directory,
   not checked in; only the sanitized `evidence/` summaries are.
 

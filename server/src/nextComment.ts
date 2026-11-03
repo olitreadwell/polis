@@ -1,16 +1,19 @@
 import _ from "underscore";
+import LruCache from "lru-cache";
+import { resultClient } from "./utils/delphiResults";
 import { DynamoDBClient, DynamoDBClientConfig } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
 import { GetCommentsParams } from "./d";
-import { getLatestExistingPca } from "./utils/pca";
+import { CommentPriorities, getLatestCommentPriorities } from "./utils/pca";
 import Config from "./config";
 import logger from "./utils/logger";
 import pg from "./db/pg-query";
 import {
-  CommentRow,
   CommentTranslationRow,
   getComments,
+  getNextCommentCandidates,
+  getNextCommentRow,
   getNumberOfCommentsRemaining,
   translateAndStoreComment,
 } from "./comment";
@@ -26,24 +29,20 @@ if (Config.dynamoDbEndpoint) {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - endpoint is allowed on the client config at runtime
   dynamoDBConfig.endpoint = Config.dynamoDbEndpoint;
-  dynamoDBConfig.credentials = {
-    accessKeyId: "DUMMYIDEXAMPLE",
-    secretAccessKey: "DUMMYEXAMPLEKEY",
-  };
-} else if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
+}
+if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
   dynamoDBConfig.credentials = {
     accessKeyId: Config.AWS_ACCESS_KEY_ID,
     secretAccessKey: Config.AWS_SECRET_ACCESS_KEY,
   };
 }
 
-const dynamoClient = new DynamoDBClient(dynamoDBConfig);
-const dynamoDocClient = DynamoDBDocumentClient.from(dynamoClient, {
+const dynamoDocClient = resultClient(() => DynamoDBDocumentClient.from(new DynamoDBClient(dynamoDBConfig), {
   marshallOptions: {
     convertEmptyValues: true,
     removeUndefinedValues: true,
   },
-});
+}));
 const DELPHI_TOPIC_NAMES_TABLE = "Delphi_CommentClustersLLMTopicNames";
 
 // This very much follows the outline of the random selection above, but factors out the probabilistic logic
@@ -67,57 +66,100 @@ async function getNextPrioritizedComment(
     withoutTids,
   });
 
-  const [comments, mathRaw, remainingRows] = (await Promise.all([
-    getComments(params as GetCommentsParams),
-    // The latest committed generation, NOT `getPca(zid, 0)`. A literal 0 asks
-    // for something strictly newer than generation 0, and generation 0 is a
-    // conversation's real first generation, so the old call silently threw away
-    // its `comment-priorities` and fell back to unprioritized routing for the
-    // whole first-generation window. `getLatestExistingPca` still returns
-    // undefined after a single query when there is no math row at all.
-    getLatestExistingPca(zid),
+  const [candidates, latestPriorities, remainingRows] = (await Promise.all([
+    // Every eligible unvoted comment enters the draw, not only the oldest
+    // 999 the plain comment list returns. Only their ids are read here.
+    getNextCommentCandidates(
+      params as Parameters<typeof getNextCommentCandidates>[0]
+    ),
+    // The latest committed generation's priorities, NOT `getPca(zid, 0)`. A
+    // literal 0 asks for something strictly newer than generation 0, and
+    // generation 0 is a conversation's real first generation, so the old call
+    // silently threw away its `comment-priorities` and fell back to
+    // unprioritized routing for the whole first-generation window.
+    //
+    // Only the map is read: never the whole math result, which a new
+    // generation would otherwise make this request read, normalize and
+    // compress. No math row still costs a single query and gives undefined.
+    getLatestCommentPriorities(zid),
     getNumberOfCommentsRemaining(zid, pid),
   ])) as [
-    CommentRow[],
-    { asPOJO?: Record<string, unknown> } | null,
+    NextCommentCandidate[],
+    CommentPriorities | undefined,
     Array<{ total: number; remaining: number }>
   ];
 
-  if (!comments || comments.length === 0) {
+  if (!candidates || candidates.length === 0) {
     return null;
   }
   if (!remainingRows || remainingRows.length === 0) {
     throw new Error(`polis_err_getNumberOfCommentsRemaining_${zid}_${pid}`);
   }
 
-  const math = mathRaw || { asPOJO: {} };
-  const commentPriorities =
-    (math.asPOJO &&
-      (math.asPOJO["comment-priorities"] as Record<string | number, number>)) ||
-    {};
+  const commentPriorities = latestPriorities || {};
 
   const totalCount = Number(remainingRows[0].total);
   const remainingCount = Number(remainingRows[0].remaining);
 
-  const selectedRow = selectProbabilistically(
-    comments,
-    commentPriorities
-  ) as unknown as GetCommentsParams;
+  const chosen = selectProbabilistically(candidates, commentPriorities);
+  // Only the chosen comment's row is read, with the plain list's columns.
+  const row = chosen && (await getNextCommentRow(zid, chosen.tid));
+  const selectedRow = (row && {
+    ...row,
+    randomN: chosen.randomN,
+  }) as unknown as GetCommentsParams;
   selectedRow.remaining = remainingCount;
   selectedRow.total = totalCount;
   return selectedRow;
 }
 
+// A preferred tid is never trusted for visibility or vote eligibility. A newer
+// math generation must not displace an eligible statement already being read.
+export async function checkInitialComment(
+  zid: number,
+  pid: number,
+  tid: number,
+  lang?: string
+) {
+  const voted =
+    pid >= 0
+      ? ((await pg.queryP(
+          "select 1 from votes_latest_unique where zid = ($1) and pid = ($2) and tid = ($3) limit 1;",
+          [zid, pid, tid]
+        )) as unknown[])
+      : [];
+  if (voted.length) {
+    return {
+      status: "voted" as const,
+      comment: await getNextComment(zid, pid, [], lang),
+    };
+  }
+  const rows = await getComments({ zid, tids: [tid], not_voted_by_pid: pid });
+  const row = rows.find((row) => row.tid === tid);
+  if (!row) return { status: "unavailable" as const, comment: null };
+  const counts = await getNumberOfCommentsRemaining(zid, pid);
+  if (!counts?.length) throw new Error("polis_err_initial_comment_counts");
+  const comment = {
+    ...row,
+    remaining: Number(counts[0].remaining),
+    total: Number(counts[0].total),
+  } as GetCommentsParams;
+  await ensureTranslations(zid, comment, lang);
+  return { status: "eligible" as const, comment };
+}
+
+type NextCommentCandidate = { tid: number; randomN?: number };
+
 function selectProbabilistically(
-  comments: CommentRow[],
+  comments: NextCommentCandidate[],
   priorities: Record<string | number, number>
-): CommentRow {
+): NextCommentCandidate {
   // Here we go through all of the comments we might select for the user and add their priority values
   const lookup = _.reduce(
     comments,
     (
-      o: { lastCount: number; lookup: Array<[number, CommentRow]> },
-      comment: CommentRow
+      o: { lastCount: number; lookup: Array<[number, NextCommentCandidate]> },
+      comment: NextCommentCandidate
     ) => {
       // If we like, we can use nTotal and nRemaining here to figure out how much we should emphasize the
       // priority, potentially. Maybe we end up with different classes of priorities lists for this purpose?
@@ -136,9 +178,9 @@ function selectProbabilistically(
   // simple to reason about all other things being equal.
   const result = _.find(
     lookup.lookup,
-    (x: [number, CommentRow]) => x[0] > randomN
+    (x: [number, NextCommentCandidate]) => x[0] > randomN
   );
-  const c = result?.[1] as CommentRow;
+  const c = result?.[1] as NextCommentCandidate;
   if (c) {
     c.randomN = randomN;
   }
@@ -324,6 +366,8 @@ export async function getNextTopicalComment(
       txt: r.txt,
     };
 
+    // Source language is internal metadata; preserve the topical response shape.
+    Object.defineProperty(comment, "lang", { value: r.lang });
     return comment;
   } catch (err) {
     logger.error("polis_err_next_topical_comment", err);
@@ -388,6 +432,44 @@ export async function getNextComment(
   return next;
 }
 
+// Best-effort translation must not hold either nextComment or participationInit.
+// These bounded, process-local caches coalesce concurrent requests and suppress
+// failures for ten minutes. Restart/eviction permits an earlier retry.
+const translationFailures = new LruCache<string, boolean>({
+  max: 10000,
+  maxAge: 10 * 60 * 1000,
+});
+const translationsInFlight = new LruCache<
+  string,
+  Promise<CommentTranslationRow | null>
+>({ max: 10000 });
+
+function translateForNextComment(
+  zid: number,
+  next: GetCommentsParams,
+  lang: string
+): Promise<CommentTranslationRow | null> {
+  const key = JSON.stringify([zid, next.tid, lang]);
+  if (translationFailures.get(key)) return Promise.resolve(null);
+  const pending = translationsInFlight.get(key);
+  if (pending) return pending;
+
+  const work = Promise.resolve()
+    .then(() => translateAndStoreComment(zid, next.tid!, next.txt, lang))
+    .catch(() => {
+      // Translation/storage is optional; do not log provider payloads or text.
+      logger.warn("polis_warn_next_comment_translation_failed");
+      return null;
+    })
+    .then((translation) => {
+      if (!translation) translationFailures.set(key, true);
+      translationsInFlight.del(key);
+      return translation;
+    });
+  translationsInFlight.set(key, work);
+  return work;
+}
+
 async function ensureTranslations(
   zid: number,
   next: GetCommentsParams & { translations?: CommentTranslationRow[] },
@@ -400,24 +482,38 @@ async function ensureTranslations(
     return;
   }
 
-  const firstTwo = lang.slice(0, 2);
-  const translations = await getCommentTranslations(zid, next.tid!);
-  next.translations = translations;
-  logger.debug("polis_debug_getCommentTranslations_results", {
-    lang,
-    translations,
+  const firstTwo = lang.slice(0, 2).toLowerCase();
+  let available: CommentTranslationRow[] = [];
+  const work = (async () => {
+    available = await getCommentTranslations(zid, next.tid!);
+    const sameLanguage =
+      (next as GetCommentsParams & { lang?: string }).lang
+        ?.slice(0, 2)
+        .toLowerCase() === firstTwo;
+    const hasMatch = available.some((t) =>
+      t.lang.toLowerCase().startsWith(firstTwo)
+    );
+    if (!sameLanguage && !hasMatch) {
+      const translation = await translateForNextComment(zid, next, lang);
+      if (translation) return [...available, translation];
+    }
+    return available;
+  })().catch(() => {
+    logger.warn("polis_warn_next_comment_translations_unavailable");
+    return available;
   });
 
-  const hasMatch = translations.some((t) => t.lang.startsWith(firstTwo));
-  if (!hasMatch) {
-    const translation = await translateAndStoreComment(
-      zid,
-      next.tid as number,
-      next.txt,
-      lang
-    );
-    if (translation) {
-      next.translations.push(translation);
-    }
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    next.translations = await Promise.race([
+      work,
+      new Promise<CommentTranslationRow[]>((resolve) => {
+        timer = setTimeout(() => resolve(available), 300);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
+  // work keeps running and stores successful translations for the next request.
+  // It never mutates the returned comment after this response budget expires.
 }

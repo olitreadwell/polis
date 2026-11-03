@@ -31,13 +31,21 @@ function moveToBody(req: Req, res: any, next: () => void) {
   next();
 }
 
-function need(name: any, parserWhichReturnsPromise: any, assigner: any) {
+type ParameterErrorHandler = (res: any, code: string, err?: any) => boolean;
+
+function need(
+  name: any,
+  parserWhichReturnsPromise: any,
+  assigner: any,
+  onError?: ParameterErrorHandler
+) {
   return _buildCallback({
     name: name,
     extractor: _extractFromBody,
     parserWhichReturnsPromise: parserWhichReturnsPromise,
     assigner: assigner,
     required: true,
+    onError,
   });
 }
 
@@ -97,6 +105,7 @@ function _buildCallback(config: {
   assigner: any;
   required: any;
   defaultVal?: any;
+  onError?: ParameterErrorHandler;
 }) {
   const name = config.name;
   const parserWhichReturnsPromise = config.parserWhichReturnsPromise;
@@ -128,6 +137,9 @@ function _buildCallback(config: {
           function (err: any) {
             const s = `polis_err_param_parse_failed_${name} (val='${val}', error=${err})`;
             logger.error(s, err);
+            if (config.onError?.(res, `polis_err_param_parse_failed_${name}`, err)) {
+              return;
+            }
             res.status(400);
             next(s);
             return;
@@ -145,6 +157,9 @@ function _buildCallback(config: {
     } else {
       const s = "polis_err_param_missing_" + name;
       logger.error(s);
+      if (config.onError?.(res, s)) {
+        return;
+      }
       res.status(400);
       next(s);
     }
@@ -198,6 +213,19 @@ function getStringLimitLength(min: number, max?: number) {
       resolve(s);
     });
   };
+}
+
+// Validate the exact embed identity destined for storage. Do not trim or
+// decode: that would change which conversation an existing URL identifies.
+function getEmbedId(s: unknown, name: "site_id" | "page_id"): Promise<string> {
+  if (
+    typeof s !== "string" ||
+    Array.from(s).length < 1 ||
+    Array.from(s).length > 2000
+  ) {
+    return Promise.reject(new Error(`polis_err_${name}_length_1_to_2000`));
+  }
+  return Promise.resolve(s);
 }
 
 function getUrlLimitLength(limit: any) {
@@ -508,6 +536,7 @@ export {
   getBool,
   getConversationIdFetchZid,
   getEmail,
+  getEmbedId,
   getInt,
   getIntInRange,
   getNumberInRange,

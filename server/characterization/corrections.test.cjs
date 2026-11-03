@@ -218,6 +218,10 @@ function pcaEnv(engineRow, { mutateBackfill = false } = {}) {
       ? { default: { info() {}, silly() {}, error() {}, debug() {} }, __esModule: true }
       : n === "./metered"
       ? { addInRamMetric() {} }
+      : n === "../db/participation-scope"
+      ? modules.participationScope.exports
+      : n === "./mathBundle"
+      ? modules.mathBundle.exports
       : n === "./pca"
       ? modules.pca.exports
       : require(n);
@@ -233,6 +237,8 @@ function pcaEnv(engineRow, { mutateBackfill = false } = {}) {
     vm.runInContext("(function(exports, require, module) {\n" + code + "\n})", context, { filename })(module.exports, context.require, module);
     return module.exports;
   };
+  build("../src/db/participation-scope.ts", "participationScope");
+  build("../src/utils/mathBundle.ts", "mathBundle");
   build("../src/utils/pca.ts", "pca");
   const presentation = build(
     "../src/utils/pcaPresentation.ts",
@@ -257,6 +263,7 @@ function pcaEnv(engineRow, { mutateBackfill = false } = {}) {
       // Only non-math collaborators are controlled. Both HTTP handlers and the
       // entire getPca -> presentPca -> Express response path execute real code.
       const collaborators = {
+        "../utils/mathBundle": modules.mathBundle.exports,
         "../utils/pca": modules.pca.exports,
         "../utils/pcaPresentation": presentation,
         "../utils/logger": baseRequire("./logger"),
@@ -407,7 +414,7 @@ function assertC7NamedPair(legacy, corrected) {
 }
 
 test("C7: engine-cutover key-order-only replacement for the two named empty shapes", async () => {
-  // BOARD [488] / DECISIONS.md: Colin approved a NARROW replacement for the
+  // The approved replacement is limited to the
   // empty-math engine cutover. Across the engine change the served body's ONLY
   // permitted difference is the position of the three empty top-level keys
   // `mod-in`, `mod-out`, `meta-tids`; their values stay `[]`, the complete key
@@ -538,8 +545,8 @@ function assertC7HttpBody(response, math) {
   if (math) {
     assert.equal(response.headers["content-encoding"], "gzip");
     const payload = JSON.parse(zlib.gunzipSync(response.body));
-    // This route's ETag is a generation tag, NOT a body digest.
-    assert.equal(response.headers.etag, '"' + payload.math_tick + '"');
+    // This route's ETag includes the configured math namespace and generation.
+    assert.equal(response.headers.etag, '"p027-' + payload.math_tick + '"');
     return {asPOJO: payload, asJSON: zlib.gunzipSync(response.body).toString(), asBufferOfGzippedJson: response.body};
   }
   assert.equal(response.headers["content-encoding"], undefined);

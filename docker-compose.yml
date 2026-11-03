@@ -60,13 +60,17 @@ services:
 
   client-participation-alpha:
     build:
-      context: ./client-participation-alpha
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: client-participation-alpha/Dockerfile
       args:
-        - PUBLIC_SERVICE_URL=${PUBLIC_SERVICE_URL}
-        - PUBLIC_AUTH_NAMESPACE=${AUTH_NAMESPACE}
-        - OIDC_CACHE_KEY_PREFIX=${OIDC_CACHE_KEY_PREFIX}
-        - OIDC_CACHE_KEY_ID_TOKEN_SUFFIX=${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
+        PUBLIC_SERVICE_URL: "${PUBLIC_SERVICE_URL}"
+        PUBLIC_AUTH_NAMESPACE: "${AUTH_NAMESPACE}"
+        OIDC_CACHE_KEY_PREFIX: "${OIDC_CACHE_KEY_PREFIX}"
+        OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: "${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}"
     container_name: client-participation-alpha
     restart: unless-stopped
     networks:
@@ -87,14 +91,27 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - DATABASE_SSL=${DATABASE_SSL}
       - AWS_LOG_GROUP_NAME=${AWS_LOG_GROUP_NAME}
+      # Operations pages (docs/configuration.md). Forwarded by name so the
+      # switch is visible in `docker compose config`; off unless set to true.
+      - OPS_ENABLED=${OPS_ENABLED:-false}
+      - OPS_EMAIL_DOMAINS=${OPS_EMAIL_DOMAINS:-}
+      - OPS_MIN_VOTERS_FOR_TEXT=${OPS_MIN_VOTERS_FOR_TEXT:-}
+      - SIMPLE_ANALYTICS_API_KEY=${SIMPLE_ANALYTICS_API_KEY:-}
+      - SIMPLE_ANALYTICS_HOSTNAME=${SIMPLE_ANALYTICS_HOSTNAME:-}
+      - OPS_DATA_SOURCE=${OPS_DATA_SOURCE:-}
+      - OPS_COST_EXPLORER=${OPS_COST_EXPLORER:-}
     env_file:
       - ${SERVER_ENV_FILE:-.env}
     image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/server:latest
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
       target: prod
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         NODE_ENV: production
     labels:
       polis_tag: ${TAG:-dev}
@@ -109,56 +126,65 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  math:
-    image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/math:latest
-    build:
-      context: ./math
-    labels:
-      polis_tag: ${TAG:-dev}
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - LOGGING_LEVEL=${MATH_LOG_LEVEL:-warn}
-      - MATH_ENV=${MATH_ENV:-prod}
-      - WEBSERVER_USERNAME=${WEBSERVER_USERNAME}
-      - WEBSERVER_PASS=${WEBSERVER_PASS}
-      # Database connection pool configuration for math service
-      - DATABASE_POOL_SIZE=${MATH_DATABASE_POOL_SIZE:-10}
-    networks:
-      - "polis-net"
-    restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
   delphi:
     image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
       context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
       target: final
     labels:
       polis_tag: ${TAG:-dev}
     environment:
       - DATABASE_URL=${DATABASE_URL}
+      - DELPHI_RESULT_BACKEND=${DELPHI_RESULT_BACKEND:-dynamodb}
+      - DELPHI_RESULT_ENV=${DELPHI_RESULT_ENV:-}
+      - DELPHI_RESULT_SCOPE=${DELPHI_RESULT_SCOPE:-}
+      - QUEUE_DATABASE_URL=${QUEUE_DATABASE_URL:-}
+      - QUEUE_ENV=${DELPHI_RESULT_ENV:-}
+      - POLIS_JOBS_TRANSPORT=${POLIS_JOBS_TRANSPORT:-tls}
+      - POLIS_JOBS_CA_FILE=${POLIS_JOBS_CA_FILE:-}
+      - POLIS_JOBS_HOST_ALLOWLIST=${POLIS_JOBS_HOST_ALLOWLIST:-}
+      - POLIS_JOBS_WORKER_CLASS=delphi
+      - POLIS_JOBS_STAGES=delphi_full_pipeline,delphi_narrative
+      - POLIS_JOBS_JOURNAL_DIR=/app/data/queue-journal
+      - POLIS_JOBS_WORK_DIR=/app/data/queue-work
       - LOG_LEVEL=${DELPHI_LOG_LEVEL:-INFO}
       - DELPHI_DEV_OR_PROD=${DELPHI_DEV_OR_PROD:-prod}
       # The report pipeline reads math_main/math_ptptstats scoped by math_env, so
-      # delphi must see the SAME env the `math` service writes under (line 88) —
-      # NOT ${MATH_PYTHON_ENV}, which is deliberately distinct so the shadow
-      # poller's rows stay invisible to the server and to reports.
+      # delphi must read the SAME label the server serves: the shared MATH_ENV
+      # (`python` = math-python's rows; `prod` = the rows the retired Clojure
+      # engine left behind, no longer updated). The writer does not follow it:
+      # math-python writes ${MATH_PYTHON_ENV}.
       - MATH_ENV=${MATH_ENV:-prod}
       # DynamoDB connection settings for local mode (will be overridden in prod)
       - DYNAMODB_ENDPOINT=${DYNAMODB_ENDPOINT}
       - POLL_INTERVAL=${POLL_INTERVAL:-2}
-      # Ollama connection
-      - OLLAMA_HOST=${OLLAMA_HOST}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
+      # LLM selection. The service has no env_file, so a key that is not listed
+      # here never reaches the container, whatever .env or the deployment env
+      # document sets. tests/test_compose_math_env.py checks every key the
+      # Delphi code reads for provider/model selection is forwarded.
+      # Topic-naming provider: anthropic (Batch API) or ollama.
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
+      # Topic-naming model; falls back to ANTHROPIC_MODEL, then a Haiku default.
+      - ANTHROPIC_TOPIC_MODEL=${ANTHROPIC_TOPIC_MODEL:-}
+      # Per-layer wait for an Anthropic topic-naming batch, in seconds.
+      - TOPIC_BATCH_MAX_WAIT_SECONDS=${TOPIC_BATCH_MAX_WAIT_SECONDS:-1800}
+      # Local embedding model for the UMAP narrative pipeline.
+      - SENTENCE_TRANSFORMER_MODEL=${SENTENCE_TRANSFORMER_MODEL:-all-MiniLM-L6-v2}
+      # Ollama connection (used only when LLM_PROVIDER=ollama)
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - OLLAMA_ENDPOINT=${OLLAMA_ENDPOINT:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-}
       # AWS credentials. Declared ONCE: this single pair is shared by every AWS
       # client in the delphi container (DynamoDB and the S3/MinIO clients), so a
       # second declaration would silently win and swap one service's identity for
       # the other's. Locally example.env sets the MinIO pair; in prod the real
-      # values come from the deployment env document.
+      # values come from the deployment env document. Bare pass-through entries
+      # omit missing keys so the SDK can resolve the instance role.
       - AWS_REGION=${AWS_REGION:-us-east-1}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-minioadmin}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
       # S3 storage for visualization files
       - AWS_S3_ENDPOINT=${AWS_S3_ENDPOINT}
       - AWS_S3_BUCKET_NAME=${AWS_S3_BUCKET_NAME:-polis-delphi}
@@ -174,6 +200,12 @@ services:
       - DATABASE_SSL_MODE=${DATABASE_SSL_MODE:-disable}
       - INSTANCE_SIZE=${INSTANCE_SIZE:-default}
       - AWS_LOG_GROUP_NAME=${AWS_LOG_GROUP_NAME}
+      # The image starts the job poller under ddtrace-run only when this is
+      # `true`. Off by default: with no Datadog agent listening, the tracer only
+      # logs failed sends. Set it (with an agent) to turn tracing back on.
+      - DD_TRACE_ENABLED=${DD_TRACE_ENABLED:-false}
+    volumes:
+      - delphi-queue-state:/app/data
     networks:
       - "polis-net"
     extra_hosts:
@@ -185,17 +217,19 @@ services:
           cpus: ${DELPHI_CONTAINER_CPUS:-2}
     restart: unless-stopped
 
-  # Python math poller — the eventual replacement for the Clojure `math`
-  # container.  Profile-gated so it only runs when explicitly requested
-  # (`--profile math-python`).  Reuses the delphi build target and overrides the
-  # command to run the poller CLI.  Defaults to SHADOW mode: writes under a
-  # DISTINCT math_env (`python`) so its rows are invisible to the prod server
-  # (UNIQUE(zid, math_env)) — zero production risk while parity is validated.
+  # Python math poller — the math engine (it replaced the retired Clojure
+  # `math` container).  Profile-gated so it only runs when explicitly requested
+  # (`--profile math-python`, or by naming it on the `up` line as the deploy
+  # hook does).  Reuses the delphi build target and overrides the command to
+  # run the poller CLI.  Writes under its own math_env (`python`), the label
+  # production's readers serve (MATH_ENV=python).
   # See delphi/docs/MATH_POLLER_DESIGN.md §4.
   math-python:
     image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
       context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
       target: final
     labels:
       polis_tag: ${TAG:-dev}
@@ -205,7 +239,8 @@ services:
       - DATABASE_SSL_MODE=${DATABASE_SSL_MODE:-disable}
       - POSTGRES_CONNECT_TIMEOUT=${POSTGRES_CONNECT_TIMEOUT:-30}
       - LOG_LEVEL=${DELPHI_LOG_LEVEL:-INFO}
-      # Shadow-mode math_env (distinct from the Clojure math service's MATH_ENV).
+      # The label math-python writes (`python`); independent of the readers'
+      # MATH_ENV.
       - MATH_ENV=${MATH_PYTHON_ENV:-python}
       # Startup refuses MATH_ENV=prod (the served namespace) unless this is 1.
       - MATH_POLLER_ALLOW_SERVED_ENV=${MATH_POLLER_ALLOW_SERVED_ENV:-}
@@ -213,6 +248,13 @@ services:
       - POLL_VOTE_INTERVAL_MS=${POLL_VOTE_INTERVAL_MS:-1000}
       - POLL_MOD_INTERVAL_MS=${POLL_MOD_INTERVAL_MS:-1000}
       - POLL_FROM_DAYS_AGO=${POLL_FROM_DAYS_AGO:-10}
+      # How far below its watermark each vote poll reads again (ms), so a vote
+      # that commits after a later-stamped vote was polled is still delivered.
+      - POLL_VOTE_OVERLAP_MS=${POLL_VOTE_OVERLAP_MS:-60000}
+      # The same for the moderation poll (comments.modified), so a moderation
+      # change that commits after a later-stamped change was polled is still
+      # delivered.
+      - POLL_MODERATION_OVERLAP_MS=${POLL_MODERATION_OVERLAP_MS:-60000}
       # Optional zid allow/block lists (comma-separated).
       - POLL_ALLOWLIST=${POLL_ALLOWLIST:-}
       - POLL_BLOCKLIST=${POLL_BLOCKLIST:-}
@@ -231,12 +273,16 @@ services:
       # deploy.resources limit below) minus this headroom fraction. The live
       # cache is bounded in retained bytes (MATH_CONV_CACHE_MB, default 30% of
       # the budget) as well as by count. The poller refuses to start when the
-      # limit is unknown. Model coefficients: MATH_POLLER_MEM_* (defaults are
-      # the local measurement).
+      # limit is unknown. Model coefficients: MATH_POLLER_MEM_* (the local
+      # measurement, with the per-cell and vote-row terms and the per-job
+      # floor recalibrated against every recorded production attempt, P-073
+      # §2.1; 116, 413 and 0 restore the previous model). Changing any of them re-arms the
+      # backfill gate (its calibration binding includes the model).
       - MATH_POLLER_MEMORY_HEADROOM=${MATH_POLLER_MEMORY_HEADROOM:-0.15}
       - MATH_CONV_CACHE_MB=${MATH_CONV_CACHE_MB:-}
-      - MATH_POLLER_MEM_PER_MCELL_MB=${MATH_POLLER_MEM_PER_MCELL_MB:-116}
-      - MATH_POLLER_MEM_PER_VOTE_ROW_BYTES=${MATH_POLLER_MEM_PER_VOTE_ROW_BYTES:-413}
+      - MATH_POLLER_MEM_PER_MCELL_MB=${MATH_POLLER_MEM_PER_MCELL_MB:-133}
+      - MATH_POLLER_MEM_PER_VOTE_ROW_BYTES=${MATH_POLLER_MEM_PER_VOTE_ROW_BYTES:-1000}
+      - MATH_POLLER_MEM_JOB_FLOOR_MB=${MATH_POLLER_MEM_JOB_FLOOR_MB:-64}
       - MATH_POLLER_MEM_SAFETY=${MATH_POLLER_MEM_SAFETY:-1.15}
       # Parked-zid reconciler cadence (ms): recover failed-then-quiet zids from
       # authoritative history without waiting for a new vote (P-019 M1).
@@ -258,9 +304,11 @@ services:
       # at a time and below live work, every conversation that has a
       # MATH_BACKFILL_SOURCE_ENV (prod) row but no coherent row under its own
       # label. SIGUSR1 approves the gate after the N largest; SIGUSR2 pauses or
-      # resumes. Every setting and its default: cost-reduction plan P-070 and
-      # BackfillConfig. Only the switches an operator is expected to touch are
-      # forwarded; the rest keep their code defaults.
+      # resumes. Every setting and its default: BackfillConfig
+      # in delphi/polismath/poller/backfill.py. Every setting is forwarded (except
+      # MATH_BACKFILL_STATE_PATH, fixed to the mounted
+      # /app/backfill-state/state.json), so a value set in the env file
+      # reaches the container.
       - MATH_BACKFILL=${MATH_BACKFILL:-0}
       - MATH_BACKFILL_SOURCE_ENV=${MATH_BACKFILL_SOURCE_ENV:-prod}
       - MATH_BACKFILL_CONCURRENCY=${MATH_BACKFILL_CONCURRENCY:-1}
@@ -273,11 +321,71 @@ services:
       - MATH_BACKFILL_DUTY_CYCLE=${MATH_BACKFILL_DUTY_CYCLE:-0.5}
       - MATH_BACKFILL_MAX_VOTES_PER_MIN=${MATH_BACKFILL_MAX_VOTES_PER_MIN:-2000000}
       - MATH_BACKFILL_PAUSE_POLL_MS=${MATH_BACKFILL_PAUSE_POLL_MS:-1000}
+      # These mirror BackfillConfig's env mapping (_ENV_NAMES); defaults match the code.
+      - MATH_BACKFILL_MAX_VOTES=${MATH_BACKFILL_MAX_VOTES:-10000000}
+      - MATH_BACKFILL_TELEMETRY_STALE_S=${MATH_BACKFILL_TELEMETRY_STALE_S:-60}
+      - MATH_BACKFILL_PAGE_SIZE=${MATH_BACKFILL_PAGE_SIZE:-50}
+      - MATH_BACKFILL_RESWEEP_S=${MATH_BACKFILL_RESWEEP_S:-300}
+      - MATH_BACKFILL_STALE_GRACE_S=${MATH_BACKFILL_STALE_GRACE_S:-3600}
+      - MATH_BACKFILL_REVALIDATE_S=${MATH_BACKFILL_REVALIDATE_S:-3600}
+      - MATH_BACKFILL_MAX_ATTEMPTS=${MATH_BACKFILL_MAX_ATTEMPTS:-5}
+      - MATH_BACKFILL_RETRY_BASE_S=${MATH_BACKFILL_RETRY_BASE_S:-60}
+      - MATH_BACKFILL_RETRY_CAP_S=${MATH_BACKFILL_RETRY_CAP_S:-21600}
+      - MATH_BACKFILL_REFUSAL_BACKOFF_S=${MATH_BACKFILL_REFUSAL_BACKOFF_S:-1800}
+      - MATH_BACKFILL_SUMMARY_EVERY=${MATH_BACKFILL_SUMMARY_EVERY:-25}
+      - MATH_BACKFILL_QUERY_TIMEOUT_MS=${MATH_BACKFILL_QUERY_TIMEOUT_MS:-30000}
       # How a source row that claims a later vote than the votes table holds
       # is treated: unresolved (excluded, counted, blocks COMPLETE) until a
       # ruling is encoded as accept_input.
       - MATH_BACKFILL_SOURCE_AHEAD_RULING=${MATH_BACKFILL_SOURCE_AHEAD_RULING:-unresolved}
       - MATH_BACKFILL_STATE_PATH=/app/backfill-state/state.json
+      # Readiness/liveness lines (P-072, polismath/poller/readiness.py): one
+      # `math_poller readiness/1` line per interval; the CDK log metric filters
+      # (cdk/mathPollerAlarms.ts) alarm on a missing holder heartbeat and on
+      # stale discovery. Identity for the collector's record: the deploy hook
+      # writes the source commit and the EC2 instance id into .env (only a
+      # digest of the instance id is logged). Without an instance id the
+      # poller refuses to start unless MATH_POLLER_ALLOW_HOSTNAME_IDENTITY=1
+      # (local runs only). The alert-test nonce is set only for a recorded
+      # alert test, then removed.
+      - MATH_POLLER_READINESS_INTERVAL_S=${MATH_POLLER_READINESS_INTERVAL_S:-60}
+      - MATH_POLLER_DISCOVERY_STALE_S=${MATH_POLLER_DISCOVERY_STALE_S:-600}
+      - MATH_POLLER_READINESS_ALERT_TEST=${MATH_POLLER_READINESS_ALERT_TEST:-}
+      - MATH_POLLER_READINESS_ALERT_TEST_SILENCE_S=${MATH_POLLER_READINESS_ALERT_TEST_SILENCE_S:-0}
+      - MATH_POLLER_SOURCE_COMMIT=${MATH_POLLER_SOURCE_COMMIT:-}
+      - MATH_POLLER_INSTANCE_ID=${MATH_POLLER_INSTANCE_ID:-}
+      - MATH_POLLER_ALLOW_HOSTNAME_IDENTITY=${MATH_POLLER_ALLOW_HOSTNAME_IDENTITY:-}
+      - MATH_POLLER_IMAGE_DIGEST=${MATH_POLLER_IMAGE_DIGEST:-}
+      # Large memory class (P-073, delphi/docs/MATH_POLLER_DESIGN.md §7-§8).
+      # Everything here is OFF by default: with MATH_CAPACITY_ROUTING unset the
+      # poller computes and publishes exactly as before. A key not listed here
+      # never reaches the container (the service has no env_file), so every
+      # MATH_CAPACITY_* setting the code reads is forwarded; the forwarding is
+      # pinned by tests/test_compose_math_env.py. This service is always the
+      # small class: the class is fixed here, not read from the env file (the
+      # large class runs only as a queue child on the large box, never as a
+      # resident poller).
+      - MATH_CAPACITY_CLASS=small
+      - MATH_CAPACITY_ROUTING=${MATH_CAPACITY_ROUTING:-0}
+      - MATH_CAPACITY_ROUTE_FRACTION=${MATH_CAPACITY_ROUTE_FRACTION:-0.9}
+      - MATH_CAPACITY_KEEP_FRACTION=${MATH_CAPACITY_KEEP_FRACTION:-0.7}
+      - MATH_CAPACITY_RESIZE_S=${MATH_CAPACITY_RESIZE_S:-3600}
+      - MATH_CAPACITY_STATE_PATH=${MATH_CAPACITY_STATE_PATH:-}
+      - MATH_CAPACITY_LARGE_BUDGET_MB=${MATH_CAPACITY_LARGE_BUDGET_MB:-}
+      - MATH_CAPACITY_PROMOTE=${MATH_CAPACITY_PROMOTE:-0}
+      - MATH_CAPACITY_RESTAGE=${MATH_CAPACITY_RESTAGE:-}
+      # The staged label, a literal: the label the small poller promotes from
+      # is always the one the queue child writes (its MATH_ENV on the large
+      # box), and no env document can point the hand-off at a served label.
+      - MATH_CAPACITY_STAGED_LABEL=python-large
+      # The Postgres job queue (P-073 r2): with routing on, an oversized
+      # conversation becomes one math_rebuild job of worker class large,
+      # inserted through the queue's SQL functions over this second DSN (a
+      # login that is a member of polis_queue_executor; never the broad
+      # DATABASE_URL login) in this queue env namespace. Unset: routed
+      # conversations are not enqueued (logged at start).
+      - MATH_CAPACITY_QUEUE_DSN=${MATH_CAPACITY_QUEUE_DSN:-}
+      - MATH_CAPACITY_QUEUE_ENV=${MATH_CAPACITY_QUEUE_ENV:-}
     volumes:
       # Backfill retry/gate/pause/report state across restarts on this host.
       # The database stays the progress record; losing this only re-arms the
@@ -307,6 +415,8 @@ services:
       # Dockerfile-db (default): migrations-based initialization
       # Dockerfile-pdb: production dump restoration (requires prodclone.dump)
       dockerfile: Dockerfile-${DB_INIT_MODE:-db}
+      additional_contexts:
+        queue-rs: ./queue-rs
     labels:
       polis_tag: ${TAG:-dev}
     environment:
@@ -332,6 +442,13 @@ services:
       polis_tag: ${TAG:-dev}
     environment:
       - API_SERVER_PORT=${API_SERVER_PORT:-5000}
+      - STATIC_FILES_PORT=${STATIC_FILES_PORT:-8080}
+      # Authoritative selection on every nginx startup, even with an existing
+      # routing volume. Use scripts/rust-api-switch.sh for live reloads.
+      - RUST_API_ROUTES=${RUST_API_ROUTES:-}
+      - RUST_API_UPSTREAM=${RUST_API_UPSTREAM:-polis-api:5100}
+    volumes:
+      - nginx-routing:/var/lib/polis-routing
     depends_on:
       - "client-participation-alpha"
       - "server"
@@ -341,12 +458,59 @@ services:
       - ${HTTP_PORT:-80}:80
       - ${HTTPS_PORT:-443}:443
 
+  # Rust process serving GET /api/v3/math/pca2 (queue-rs/polis-api/README.md).
+  # Off unless started with `--profile rust-api`; nginx-proxy sends it traffic
+  # only when RUST_API_ROUTES names the route. It reads the server's env file
+  # so MATH_ENV, DEV_MODE, NODE_ENV and the domain settings match Node's.
+  polis-api:
+    profiles: [rust-api]
+    image: polis/polis-api:local
+    build:
+      context: .
+      dockerfile: queue-rs/polis-api/Dockerfile
+      args:
+        # NODE_ENV reaches this process exactly as it reaches `server`: the
+        # image default (production, as the server's prod target), then the
+        # shared env file.
+        NODE_ENV: production
+    env_file:
+      - ${SERVER_ENV_FILE:-.env}
+    environment:
+      # Empty: READ_ONLY_DATABASE_URL, else DATABASE_URL, from the env file,
+      # which is how Node picks the database for this route.
+      - POLIS_API_DATABASE_URL=${POLIS_API_DATABASE_URL:-}
+      # Verify the database certificate and hostname. Local non-TLS stacks
+      # must explicitly select their development transport in an override.
+      - POLIS_API_DB_TRANSPORT=${POLIS_API_DB_TRANSPORT:-tls}
+      - POLIS_API_DB_CA_FILE=${POLIS_API_DB_CA_FILE:-/etc/polis/rds-global-bundle.pem}
+      - POLIS_API_DB_HOST_ALLOWLIST=${POLIS_API_DB_HOST_ALLOWLIST:-}
+      - POLIS_API_START=${POLIS_API_START:-0}
+      - POLIS_API_VERSION_READS=${POLIS_API_VERSION_READS:-0}
+      - RUST_API_ROUTES=${RUST_API_ROUTES:-}
+      - POLIS_API_DB_POOL=8
+      - POLIS_API_DB_ACQUIRE_TIMEOUT_MS=2000
+      - POLIS_API_DB_STATEMENT_TIMEOUT_MS=3000
+      - POLIS_API_DB_MAX_LIFETIME_MS=300000
+      - POLIS_API_LISTEN=0.0.0.0:5100
+    cpus: 0.5
+    mem_limit: 512m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      - "polis-net"
+    restart: unless-stopped
+
   file-server:
     image: docker.io/compdem/polis-file-server:${TAG:-dev}
     build:
       context: ./
       dockerfile: file-server/Dockerfile
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         ADMIN_UIDS: ${ADMIN_UIDS}
         AUTH_AUDIENCE: ${AUTH_AUDIENCE}
         AUTH_CLIENT_ID: ${AUTH_CLIENT_ID}
@@ -357,7 +521,6 @@ services:
         DD_SITE: ${DD_SITE}
         EMBED_SERVICE_HOSTNAME: ${EMBED_SERVICE_HOSTNAME}
         GA_TRACKING_ID: ${GA_TRACKING_ID}
-        GIT_HASH: "${GIT_HASH:-placeholder}"
         NODE_ENV: production
         OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: ${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
         OIDC_CACHE_KEY_PREFIX: ${OIDC_CACHE_KEY_PREFIX}
@@ -420,8 +583,8 @@ services:
     
   import-worker:
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
       target: dev
     image: polis-server:dev
     container_name: polis-import-worker
@@ -495,6 +658,10 @@ networks:
   polis-net:
 
 volumes:
+  nginx-routing:
+
+  delphi-queue-state:
+
   math-backfill-state:
     labels:
       polis_tag: ${TAG:-dev}

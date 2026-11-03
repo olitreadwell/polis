@@ -60,6 +60,63 @@
         "args": ["verify"],
         "image": "localhost/polis-shadow-verifier@sha256:f66c951eac0685c92396ad1bf2e7ddd5ba07400d013ddd1ebd87c0d27a38e782"
       }
+    },
+    "math-backfill-verify-v1": {
+      "kind": "backfill-verify",
+      "max_seconds": 7200,
+      "producer": {
+        "args": ["produce"],
+        "image": "localhost/polis-verify-producer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "reader": {
+        "args": ["read"],
+        "image": "localhost/polis-verify-reader@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "run_id": "00000000000000000000000000000000",
+      "run_spec": {
+        "cutoff_ms": 1500000000000,
+        "max_cutoff_age_seconds": 3600,
+        "max_discovery_gap_seconds": 120,
+        "max_readiness_age_seconds": 900,
+        "readiness": null,
+        "source_ahead_ruling": "unresolved",
+        "source_env": "prod",
+        "target_env": "python",
+        "verification_sql_sha256": "e2b0040036dda58e98b7a293917928be0e018dda0728898bdf40c8383d6e6216"
+      },
+      "schema": "polis-probe-job/2",
+      "verifier": {
+        "args": ["verify"],
+        "image": "localhost/polis-verify-verifier@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "vote-census-v1": {
+      "schema": "polis-probe-job/2",
+      "kind": "vote-census",
+      "run_id": "00000000000000000000000000000000",
+      "max_seconds": 2400,
+      "run_spec": {
+        "source_commit": "0000000000000000000000000000000000000000",
+        "sql_sha256": "b0080d7c7dcb2952e35f82547e192486041b12fbd34c1dea903e3b0b32d8c94e"
+      },
+      "reader": {
+        "image": "localhost/polis-vote-census-reader@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "read"
+        ]
+      },
+      "producer": {
+        "image": "localhost/polis-vote-census-producer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "produce"
+        ]
+      },
+      "verifier": {
+        "image": "localhost/polis-vote-census-verifier@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "verify"
+        ]
+      }
     }
   }
 }

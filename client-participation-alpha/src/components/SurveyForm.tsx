@@ -18,7 +18,7 @@ const submitPerspectiveAPI = async (text: string, conversation_id: string) => {
       txt: text.replace(/\n/g, ' '),
       conversation_id,
       pid: pid || -1,
-      vote: -1
+      vote: 'agree' // the author agrees with their own comment
     })
 
     // Dispatch event to notify visualization to update
@@ -81,7 +81,7 @@ export default function SurveyForm({
 
       if (errorText.includes('polis_err_conversation_is_closed')) {
         errorMessage = s.commentErrorConversationClosed
-      } else if (errorText.includes('polis_err_comment_duplicate')) {
+      } else if (errorText.includes('polis_err_post_comment_duplicate')) {
         errorMessage = s.commentErrorDuplicate
       } else if (errorText.includes('polis_err_xid_required')) {
         errorMessage = s.xidRequired

@@ -39,9 +39,16 @@ import createCodedeployConfig from '../codedeploy';
 import createALBAndDNS from '../dns';
 import createSecretsAndDependencies from '../secrets';
 import createOperationalAlarms, { alarmsEnabled, requireAlarmEmail } from '../alarms';
+import createMathPollerAlarms, { mathPollerAlarmsEnabled } from '../mathPollerAlarms';
+import createWorkerClasses, {
+  createWorkerRoles, largeClassEnabled, mathLargeRow, workerClassesSettings,
+} from '../workerClasses';
+import createOpsDashboardsAccess, { opsDashboardsEnabled } from '../opsDashboards';
 import { ImportWorkerService } from './import-worker-service';
 import { CertificationCiEc2 } from '../ciEc2';
-import { CoordinatorInactiveService } from '../coordinator';
+import { configureAlbIngress, originHeader } from '../originAccess';
+import { BuildBox } from '../buildBox';
+import { CoordinatorInactiveService, coordinatorInactiveEnabled } from '../coordinator';
 
 interface PolisStackProps extends cdk.StackProps {
   enableSSHAccess?: boolean; // Make optional, default to false
@@ -60,7 +67,6 @@ export class CdkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: PolisStackProps) {
     super(scope, id, props);
 
-    const defaultSSHRange = '0.0.0.0/0';
     // The Ollama GPU stack is temporarily retired to cut cost. Everything it
     // needs (ASG, GPU launch template, EFS, internal NLB, service-URL secret,
     // SG rules and outputs) is gated behind this flag (CDK_ENABLE_OLLAMA). The
@@ -73,10 +79,6 @@ export class CdkStack extends cdk.Stack {
 
     // Create VPC
     const vpc = createPolisVPC(this);
-    vpc.addInterfaceEndpoint('SqsEndpoint', {
-      service: ec2.InterfaceVpcEndpointAwsService.SQS,
-      subnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-    });
 
     const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
       displayName: 'Polis Application Alarms',
@@ -113,9 +115,15 @@ export class CdkStack extends cdk.Stack {
       );
     }
 
-    // Conditional SSH Access
+    // Conditional SSH Access. Off in production: the instances are reached
+    // through Systems Manager (the instance role carries
+    // AmazonSSMManagedInstanceCore), and CodeDeploy's agent only connects out.
+    // There is no default range: turning SSH on requires naming one.
     if (props.enableSSHAccess) {
-      const sshPeer = ec2.Peer.ipv4(props.sshAllowedIpRange || defaultSSHRange);
+      if (!props.sshAllowedIpRange) {
+        throw new Error('enableSSHAccess requires sshAllowedIpRange (CDK_SSH_ALLOWED_IP_RANGE)');
+      }
+      const sshPeer = ec2.Peer.ipv4(props.sshAllowedIpRange);
       webSecurityGroup.addIngressRule(sshPeer, ec2.Port.tcp(22), 'Allow SSH access');
       mathWorkerSecurityGroup.addIngressRule(sshPeer, ec2.Port.tcp(22), 'Allow SSH access');
       delphiSecurityGroup.addIngressRule(sshPeer, ec2.Port.tcp(22), 'Allow SSH access');
@@ -124,9 +132,12 @@ export class CdkStack extends cdk.Stack {
       }
     }
 
-    webSecurityGroup.addIngressRule(ec2.Peer.ipv4(props.sshAllowedIpRange || defaultSSHRange), ec2.Port.tcp(22), 'Allow SSH'); // Control SSH separately
-    webSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP from anywhere');
-    webSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Allow HTTPS from anywhere');
+    // The web instances take traffic only from the load balancer: the target
+    // group adds "port 80 from the load balancer's security group" below
+    // (createALBAndDNS). Nothing else reaches them from outside the VPC; they
+    // keep public addresses for outbound traffic only. (The group's
+    // description still mentions SSH; changing a description replaces the
+    // group, so it is left as is.)
 
 
     // --- Key Pairs
@@ -144,14 +155,24 @@ export class CdkStack extends cdk.Stack {
 
     const { instanceRole, codeDeployRole, dbBackupLambdaRole } = createRoles(this);
 
+    // --- Queue worker classes (one Auto Scaling group per class of the
+    // Postgres job queue; the math-large row is the P-073 large memory class).
+    // Off unless synthesized with `-c enableLargeClass=true` (see
+    // cdk/workerClasses.ts). Each class has its own instance role; the shared
+    // InstanceRole is untouched.
+    const workerClasses = largeClassEnabled(this) ? workerClassesSettings(this) : undefined;
+    const workerRoles = workerClasses ? createWorkerRoles(this, workerClasses, logGroup) : undefined;
+    const workerRoleList = workerRoles ? Object.values(workerRoles) : [];
+
     // ALB Security Group
     const lbSecurityGroup = new ec2.SecurityGroup(this, 'LBSecurityGroup', {
       vpc,
       description: 'Security group for the load balancer',
       allowAllOutbound: true,
     });
-    lbSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'Allow HTTP from anywhere');
-    lbSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'Allow HTTPS from anywhere');
+    // 80/443 from anywhere unless `-c restrictAlbIngress=true` names the CDN's
+    // ranges (cdk/originAccess.ts).
+    const albAccess = configureAlbIngress(this, lbSecurityGroup);
 
     // Create ECR repos
     const { ecrWebRepository, ecrDelphiRepository, ecrMathRepository, imageTagParameter } = createECRRepos(this, instanceRole);
@@ -210,7 +231,8 @@ export class CdkStack extends cdk.Stack {
       mathWorkerLaunchTemplate,
       delphiSmallLaunchTemplate,
       delphiLargeLaunchTemplate,
-      ollamaLaunchTemplate
+      ollamaLaunchTemplate,
+      workerLaunchTemplates
     } = configureLaunchTemplates(this,
       logGroup,
       ollamaNamespace,
@@ -236,7 +258,8 @@ export class CdkStack extends cdk.Stack {
       instanceTypeOllama,
       ollamaKeyPair,
       ollamaSecurityGroup,
-      enableOllama
+      enableOllama,
+      workerClasses && workerRoles ? { settings: workerClasses, roles: workerRoles } : undefined
     );
 
     // Auto Scaling Groups and alarms
@@ -246,6 +269,7 @@ export class CdkStack extends cdk.Stack {
       asgMathWorker,
       asgDelphiSmall,
       asgDelphiLarge,
+      workerGroups,
       commonAsgProps
     } = createAutoScalingAndAlarms(
       this,
@@ -260,14 +284,38 @@ export class CdkStack extends cdk.Stack {
       delphiLargeLaunchTemplate,
       ollamaNamespace,
       alarmTopic,
-      enableOllama
+      enableOllama,
+      workerClasses ? { settings: workerClasses, launchTemplates: workerLaunchTemplates } : undefined
+    );
+    // The worker groups besides asgDelphiLarge (which the stack already wires).
+    const extraWorkerGroups = workerClasses
+      ? Object.entries(workerGroups).filter(([name]) => name !== mathLargeRow(workerClasses).name).map(([, g]) => g)
+      : [];
+    const workerWiring = workerClasses ? { roles: workerRoleList, extraGroups: extraWorkerGroups } : undefined;
+
+    // Create the web target group before CodeDeploy so it can drain web boxes.
+    const {
+      lb,
+      webTargetGroup,
+      httpListener,
+      httpsListener,
+      webScalingPolicy
+    } = createALBAndDNS(
+      this,
+      vpc,
+      lbSecurityGroup,
+      asgWeb,
+      // `-c requireOriginHeader=true` answers 403 to requests without the
+      // CDN's origin header (cdk/originAccess.ts). Off by default.
+      { openListeners: albAccess.openListeners, originHeader: originHeader(this) }
     );
 
     // --- DEPLOY STUFF
     const {
       application,
       deploymentBucket,
-      deploymentGroup
+      deploymentGroup,
+      workersDeploymentGroup
     } = createCodedeployConfig(
       this,
       instanceRole,
@@ -275,8 +323,29 @@ export class CdkStack extends cdk.Stack {
       asgMathWorker,
       asgDelphiSmall,
       asgDelphiLarge,
-      codeDeployRole
+      codeDeployRole,
+      webTargetGroup,
+      workerWiring
     );
+
+    // --- Image build box (OFF unless `-c enableBuildBox=true`). The deploy
+    // workflow builds every image there; production boxes only pull by digest.
+    // See cdk/buildBox.ts.
+    if ([true, 'true'].includes(this.node.tryGetContext('enableBuildBox'))) {
+      new BuildBox(this, 'BuildBox', {
+        vpc,
+        deploymentBucket,
+        codeDeployApplicationName: application.applicationName,
+        codeDeployDeploymentGroupNames: [
+          deploymentGroup.deploymentGroupName,
+          workersDeploymentGroup.deploymentGroupName,
+        ],
+        githubRepo: (this.node.tryGetContext('buildBoxGithubRepo') as string | undefined) ?? 'compdemocracy/polis',
+        // Must equal the `environment:` and branch of the deploy workflow's jobs.
+        githubEnvironment: 'production',
+        githubRefs: ['refs/heads/stable'],
+      });
+    }
 
     // --- Ollama Network Load Balancer + service-URL secret (only when enabled)
     let ollamaNlb: elbv2.NetworkLoadBalancer | undefined;
@@ -327,6 +396,9 @@ export class CdkStack extends cdk.Stack {
     db.connections.allowFrom(asgMathWorker, ec2.Port.tcp(5432), 'Allow database access from math ASG');
     db.connections.allowFrom(asgDelphiSmall, ec2.Port.tcp(5432), 'Allow database access from Delphi small ASG');
     db.connections.allowFrom(asgDelphiLarge, ec2.Port.tcp(5432), 'Allow database access from Delphi large ASG');
+    for (const group of extraWorkerGroups) {
+      db.connections.allowFrom(group, ec2.Port.tcp(5432), 'Allow database access from a queue worker group');
+    }
 
     // S3 for DB backups
     const dbBackupBucket = new s3.Bucket(this, 'DBBackupBucket', {
@@ -376,20 +448,6 @@ export class CdkStack extends cdk.Stack {
 
     db.connections.allowFrom(lambda, ec2.Port.tcp(5432), 'Allow connection from backup Lambda');
 
-    // ALB & DNS
-    const {
-      lb,
-      webTargetGroup,
-      httpListener,
-      httpsListener,
-      webScalingPolicy
-    } = createALBAndDNS(
-      this,
-      vpc,
-      lbSecurityGroup,
-      asgWeb
-    );
-
     // --- Operational alarms (P-031 slice 1).
     // Off unless synthesized with `-c enableAlarms=true -c alarmEmail=...`.
     // Seven alarms on metrics that already exist, one SNS topic, and one
@@ -404,6 +462,7 @@ export class CdkStack extends cdk.Stack {
         webTargetGroupFullName: webTargetGroup.targetGroupFullName,
         codeDeployApplicationName: application.applicationName,
         codeDeployDeploymentGroupName: deploymentGroup.deploymentGroupName,
+        codeDeployWorkerDeploymentGroupName: workersDeploymentGroup.deploymentGroupName,
         // A06 is notBreaching and A07 is ignore, as deployed. The health-pair
         // check reads those settings off the synthesized alarms rather than
         // taking them on trust from here.
@@ -411,6 +470,34 @@ export class CdkStack extends cdk.Stack {
           { id: 'A06', alarm: highCpuAlarm },
           { id: 'A07', alarm: lowStorageAlarm },
         ],
+      });
+    }
+
+    // --- Python math poller readiness alarms (P-072). Off unless synthesized
+    // with `-c enableMathPollerAlarms=true`: two log metric filters on this
+    // log group and two alarms on the application alarm topic. No Lambda.
+    if (mathPollerAlarmsEnabled(this)) {
+      createMathPollerAlarms(this, { logGroup, alarmTopic });
+    }
+
+    // --- Queue worker classes: capacity-line metric filters, exact-capacity
+    // step scaling of each class's group, the P-086 alarm table on the
+    // application alarm topic. Demand is read from the queue's counts on the
+    // small poller's capacity line; no manifest, no Lambda.
+    if (workerClasses) {
+      createWorkerClasses(this, { groups: workerGroups, logGroup, alarmTopic, settings: workerClasses });
+    }
+
+    // --- Ops dashboards (P-074 PR3). Off unless synthesized with
+    // `-c enableOpsDashboards=true`: one read-only policy on InstanceRole
+    // (CloudWatch metrics/alarms, Auto Scaling, CodeDeploy, Cost Explorer)
+    // and IMDS hop limit 2 on the web launch template. No Lambda.
+    if (opsDashboardsEnabled(this)) {
+      createOpsDashboardsAccess(this, {
+        instanceRole,
+        webLaunchTemplate,
+        codeDeployApplicationName: application.applicationName,
+        codeDeployDeploymentGroupName: deploymentGroup.deploymentGroupName,
       });
     }
 
@@ -425,7 +512,8 @@ export class CdkStack extends cdk.Stack {
       asgDelphiSmall,
       asgDelphiLarge,
       asgOllama,
-      fileSystem
+      fileSystem,
+      workerWiring
     );
 
     // add ECS Fargate service for BYOPD import worker
@@ -435,8 +523,11 @@ export class CdkStack extends cdk.Stack {
       logGroup: logGroup,
     });
 
-    // Present but dormant. This task has no writer executable or migration path.
-    new CoordinatorInactiveService(this, 'CoordinatorInactive', { vpc, database: db });
+    // Off by default. Enabling this requires an image digest and login secret
+    // parameters. This task has no writer executable or migration path.
+    if (coordinatorInactiveEnabled(this)) {
+      new CoordinatorInactiveService(this, 'CoordinatorInactive', { vpc, database: db });
+    }
 
     // --- P-022 E: disposable certification CI worker (OFF by default).
     // Nothing below is synthesized unless `-c enableCiEc2=true` is passed, so a

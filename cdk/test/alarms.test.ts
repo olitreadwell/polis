@@ -133,8 +133,8 @@ describe(`${ALARMS_ENABLED_CONTEXT} context flag`, () => {
 
 describe('the gate adds nothing when it is off', () => {
   // The real proof that the deployed template is byte-identical with the flag
-  // off is a `cdk synth` diff of the whole CdkStack against edge, recorded in
-  // cost-reduction/04-plans/P-031-slice1-implementation-notes.md. This asserts
+  // off is a `cdk synth` diff of the whole CdkStack against edge, run by hand
+  // when the gate was added and not repeated here. This asserts
   // the mechanism the stack uses to reach that state: the construct is never
   // called, so nothing can be added.
   const baseline = () => {
@@ -309,13 +309,13 @@ describe('A17 math worker missing-metric alarm', () => {
     expect(props.Dimensions).toEqual([{ Name: 'AutoScalingGroupName', Value: MATH_ASG }]);
   });
 
-  test('is a presence alarm: unreachable threshold, breaching on missing data', () => {
+  test('is inert while the math ASG is emptied: unreachable threshold, not breaching on missing data', () => {
     const props = alarmByName(synth().template, MATH_WORKER_LIVENESS_ALARM_NAME);
-    // <0% cannot be met by a real CPU reading, so a quiet-but-alive worker
-    // never fires it. The missing-data setting is the entire mechanism.
+    // <0% cannot be met by a real CPU reading. With the Clojure engine retired
+    // the group has no instances, so missing data must not alarm.
     expect(props.Threshold).toBe(0);
     expect(props.ComparisonOperator).toBe('LessThanThreshold');
-    expect(props.TreatMissingData).toBe('breaching');
+    expect(props.TreatMissingData).toBe('notBreaching');
   });
 
   test('Minimum over 300s, 2 of 3 periods', () => {
@@ -642,7 +642,7 @@ describe('synth-enforced health pairs', () => {
   // Review r2. `addPropertyOverride` writes into the resource's raw overrides,
   // which are merged in at render time and leave the typed getters untouched.
   // A gate reading `cfn.alarmActions` therefore passes while the EMITTED alarm
-  // carries the harmful value. These are the second reviewer's three reproductions, inverted:
+  // carries the harmful value. These are the review's three reproductions, inverted:
   // each must now fail synth.
 
   test('A04 with ActionsEnabled overridden to false fails the real synth', () => {

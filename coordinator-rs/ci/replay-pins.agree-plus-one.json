@@ -1,0 +1,1027 @@
+{
+  "schema": "polis-replay-platform-pins/2",
+  "convention": {
+    "storage_agree_value": 1,
+    "generated_by": "coordinator-rs/ci/replay_pins_convention.py",
+    "generated_from": {
+      "replay-pins.json": "a31de68383b4a658c556aefcb7e897e05454bdbb1996f14c1283b14d2cbfc5b7"
+    },
+    "paired_with": "replay-pins.json (storage_agree_value -1, declared in replay-pins.sign.json)",
+    "about": "The replay pins at agree = +1, generated from the same semantic data as the -1 set: recorded +1 values swapped into place, convention-invariant values carried, per convention_provenance. Never edited by hand; regenerate with --write."
+  },
+  "pins": [
+    {
+      "id": "macos-arm64-v1",
+      "system": "Darwin",
+      "machine": "arm64",
+      "checkpoints": [
+        {
+          "cut": 1170,
+          "tick": 0,
+          "rust": "154d89e90169055464da0692401812250596d025c7592c2c2fb111e8686ddbde"
+        },
+        {
+          "cut": 2341,
+          "tick": 1,
+          "rust": "e8a88a190ce8cd83fd82aa9de024cfb5eed7a02d217c371eec8b90bd16a2a173"
+        },
+        {
+          "cut": 4683,
+          "tick": 2,
+          "rust": "5c320c5eea1d574071fc5e35272b968462d91acfc51f0bbc8a816e6747f424f5"
+        }
+      ],
+      "attribution": {
+        "source_head": "7439947105dfae18bea23c078f229d56e10264d7",
+        "github_run_id": null,
+        "run_attempt": null,
+        "platform": "macOS-15.7.4-arm64-arm-64bit",
+        "python": "3.12.11",
+        "packages": {
+          "numpy": "1.26.4",
+          "scipy": "1.17.1",
+          "scikit-learn": "1.9.0"
+        },
+        "receipt_sha256": "3b9c0e927c8d3373d40ab429f33911338a4f014550d9a85f75bdd659c4a01f9e",
+        "replay_sha256": "aa40c8ceb558dce8acd10bffdcf795d10d2831ca1ab6c27929eb9394ddf394a6",
+        "origin": "reviewed laptop evidence",
+        "blas": "not recorded in historical receipt"
+      },
+      "witnesses": {
+        "polarity-vw.json": {
+          "fixture": "vw",
+          "a": "24d251bda6a507cf2ab66bfe01e66bbeff9749627be2a6fc16940b8480985d27",
+          "b": "24d251bda6a507cf2ab66bfe01e66bbeff9749627be2a6fc16940b8480985d27",
+          "negative": "af9562e1dc45627e702dc8dbc9886b45d2b24bca6dcbb8c1b52c246ad24e3cc8",
+          "deltas": []
+        },
+        "polarity-biodiversity.json": {
+          "fixture": "biodiversity",
+          "a": "6d8a1c03f92bcafaf45b51dafc776c23f0fe4f1a4a6ebcf9e0cf8bf4feca4682",
+          "b": "6d8a1c03f92bcafaf45b51dafc776c23f0fe4f1a4a6ebcf9e0cf8bf4feca4682",
+          "negative": "f4ee9493fd186f7a2ff40756e058bc6ba76e90ccd944de13e999682e87d21b14",
+          "deltas": []
+        },
+        "polarity-rebuild-schedule.json": [
+          {
+            "step": 0,
+            "positive": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+            "paired": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+            "negative": "c6f4569922ba59a129f9829e7302affc217c6535936b7f982b8cbe6c84bbd1ea"
+          },
+          {
+            "step": 1,
+            "positive": "c60ffbbf383d8c28aa2b54dd08fa8f74a8d847783e83d65139cb7e88fbf02bb0",
+            "paired": "c60ffbbf383d8c28aa2b54dd08fa8f74a8d847783e83d65139cb7e88fbf02bb0",
+            "negative": "88cdf4a14a1ab28c28fec8e71604dfabf1f1c96ef232a87caa6cb808e49f6794"
+          },
+          {
+            "step": 2,
+            "positive": "dc964987e5f188f13b4676480457dcff90b3ece75a73097236bb14cda110e764",
+            "paired": "dc964987e5f188f13b4676480457dcff90b3ece75a73097236bb14cda110e764",
+            "negative": "659e22fd4abb89b8c8c99a4476c639c6171a34e7133256b2ab34e686eac971a6"
+          }
+        ],
+        "semantic-tie-key.json": {
+          "declared": {
+            "terms": [
+              {
+                "name": "tid",
+                "nulls": "default",
+                "source": "votes.tid"
+              },
+              {
+                "name": "pid",
+                "nulls": "default",
+                "source": "votes.pid"
+              },
+              {
+                "name": "created_ms",
+                "nulls": "default",
+                "source": "votes.created"
+              },
+              {
+                "name": "semantic_vote",
+                "nulls": "default",
+                "source": "raw_vote * storage_agree_value"
+              },
+              {
+                "name": "weight_x_32767",
+                "nulls": "first",
+                "source": "votes.weight_x_32767"
+              }
+            ],
+            "schema": "polis-order/1",
+            "profile": "live-tid-pid-created-semantic-value-weight/1",
+            "order_by": "tid,pid,created,(vote::bigint*$2::bigint),weight_x_32767 NULLS FIRST",
+            "parameter": "storage_agree_value",
+            "semantic_vote": "raw_vote * storage_agree_value",
+            "algorithm_digest": "3bd0700204ee8202074e31f6cfe2f57903bd9d9fc10c5149c0fcdfb7f5406685",
+            "equal_time_census": {
+              "key": [
+                "tid",
+                "pid",
+                "created_ms"
+              ],
+              "schema": "polis-census/1",
+              "tied_rows": 2,
+              "resolved_by": [
+                "semantic_vote",
+                "weight_x_32767"
+              ],
+              "tied_groups": 1
+            },
+            "storage_agree_value": 1
+          },
+          "mirrored_digest": "2dc3856741cc73ad45426230758b1557b97988720b3551df9282819c5978e7d1",
+          "a": "2d45cb02c54260efff69c864c577f9b29194d40176e28ea3baede0b6903d1fda",
+          "b": "2d45cb02c54260efff69c864c577f9b29194d40176e28ea3baede0b6903d1fda",
+          "negative": "39ace133279e05d8f695d7bfa10497e33f8a943649879853427bc12f8895123d",
+          "deltas": []
+        },
+        "d4-node-reader.json": {
+          "compared_fields": [
+            "asJSON_sha256",
+            "asJSON_bytes",
+            "gzip_sha256",
+            "gzip_bytes",
+            "keys_projection_sha256",
+            "tids",
+            "n",
+            "n_cmts",
+            "pca_center",
+            "comment_extremity",
+            "repness_keys",
+            "consensus_shape",
+            "mapping_sha256",
+            "bid_to_pid",
+            "pids_for_gid",
+            "mapping_is_error"
+          ],
+          "differences": {},
+          "math_tick": 1,
+          "profile": "real getPca + presentPca + participants.ts, in-process, one Node process",
+          "served": {
+            "python": {
+              "asJSON_bytes": 6476,
+              "asJSON_sha256": "8be0d0d8366017a6a432a5627bc4f12e8ed9067f0520c838e16d63810a1c529a",
+              "bid_to_pid": [
+                [
+                  0
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3
+                ]
+              ],
+              "comment_extremity": [
+                1.4280971859724134,
+                1.632993161855452,
+                1.4467439654036442,
+                1.4467439639839224
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 1756,
+              "gzip_sha256": "a7ef00bd57dbe30a9b4e1088e8caff27121f8825be47e3f60969b97d54732244",
+              "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+              "mapping_is_error": false,
+              "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+              "n": 6,
+              "n_cmts": 4,
+              "pca_center": [
+                0.3333333333333333,
+                0,
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": [
+                  0,
+                  2,
+                  3,
+                  5
+                ],
+                "1": [
+                  1,
+                  4
+                ]
+              },
+              "repness_keys": [
+                "0",
+                "1"
+              ],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            },
+            "rustproto": {
+              "asJSON_bytes": 6476,
+              "asJSON_sha256": "8be0d0d8366017a6a432a5627bc4f12e8ed9067f0520c838e16d63810a1c529a",
+              "bid_to_pid": [
+                [
+                  0
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3
+                ]
+              ],
+              "comment_extremity": [
+                1.4280971859724134,
+                1.632993161855452,
+                1.4467439654036442,
+                1.4467439639839224
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 1756,
+              "gzip_sha256": "a7ef00bd57dbe30a9b4e1088e8caff27121f8825be47e3f60969b97d54732244",
+              "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+              "mapping_is_error": false,
+              "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+              "n": 6,
+              "n_cmts": 4,
+              "pca_center": [
+                0.3333333333333333,
+                0,
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": [
+                  0,
+                  2,
+                  3,
+                  5
+                ],
+                "1": [
+                  1,
+                  4
+                ]
+              },
+              "repness_keys": [
+                "0",
+                "1"
+              ],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          },
+          "zid": 1
+        },
+        "d4-node-reader-empty.json": {
+          "differences": {},
+          "profile": "zero votes, four approved comments; both namespaces carry a published empty generation under the committed contract",
+          "reference_published": true,
+          "served": {
+            "python": {
+              "asJSON_bytes": 765,
+              "asJSON_sha256": "4738deb83b9468498ee32c49c5eecfd785d0bac64d5966814f089723286e5a75",
+              "bid_to_pid": [],
+              "comment_extremity": [
+                0,
+                0,
+                0,
+                0
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 352,
+              "gzip_sha256": "ce3c0c17c0fd3238eb1b2a9450c5c2105296ef6d19ae7e101a1fc1e0cb12b163",
+              "keys_projection_sha256": "bdfafdc98f5d9e7439255a1073827ca5509cc40621dbb02bd1e9e8f5d7668a31",
+              "last_vote_timestamp": 0,
+              "mapping_is_error": false,
+              "mapping_sha256": "a5558a1314571ed26f6afdea59f81a24ab0cc942ac84485892f8a36f7ac16315",
+              "math_env": "python",
+              "n": 0,
+              "n_cmts": 4,
+              "pca_center": [
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": []
+              },
+              "present": true,
+              "raw": {
+                "asJSON_sha256": "fa78e3c4a1cbacb495960da1fcb9b1a834ffc0d825361b968e9e2eadb2670050",
+                "gzip_sha256": "666e7e9f166083dfc4cf0489725d1be564b371049fc0a3779bdcf67db8cb76f9",
+                "n_cmts": 0,
+                "tids": [],
+                "unchanged_after_presentation": true
+              },
+              "repness_keys": [],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            },
+            "rustproto": {
+              "asJSON_bytes": 765,
+              "asJSON_sha256": "4738deb83b9468498ee32c49c5eecfd785d0bac64d5966814f089723286e5a75",
+              "bid_to_pid": [],
+              "comment_extremity": [
+                0,
+                0,
+                0,
+                0
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 352,
+              "gzip_sha256": "ce3c0c17c0fd3238eb1b2a9450c5c2105296ef6d19ae7e101a1fc1e0cb12b163",
+              "keys_projection_sha256": "bdfafdc98f5d9e7439255a1073827ca5509cc40621dbb02bd1e9e8f5d7668a31",
+              "last_vote_timestamp": 0,
+              "mapping_is_error": false,
+              "mapping_sha256": "a5558a1314571ed26f6afdea59f81a24ab0cc942ac84485892f8a36f7ac16315",
+              "math_env": "rustproto",
+              "n": 0,
+              "n_cmts": 4,
+              "pca_center": [
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": []
+              },
+              "present": true,
+              "raw": {
+                "asJSON_sha256": "fa78e3c4a1cbacb495960da1fcb9b1a834ffc0d825361b968e9e2eadb2670050",
+                "gzip_sha256": "666e7e9f166083dfc4cf0489725d1be564b371049fc0a3779bdcf67db8cb76f9",
+                "n_cmts": 0,
+                "tids": [],
+                "unchanged_after_presentation": true
+              },
+              "repness_keys": [],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          }
+        },
+        "polarity-public-fixture.json": {
+          "fixture": "public-fixture",
+          "a": "21922a704ddc4108c0d78d96b1453ee888f67bfc7729eb49c26fee9e4924e16a",
+          "b": "21922a704ddc4108c0d78d96b1453ee888f67bfc7729eb49c26fee9e4924e16a",
+          "negative": "00790c0413c4db565ec1f9dde2f206aac5a765189d1a13238b524f6f4754628b",
+          "deltas": []
+        }
+      },
+      "witness_sha256": {
+        "d4-node-reader-empty.json": "0a0ff5839a413fb4f4783c071212939284b8662aa6665ac5b4cf771237d4cfdc",
+        "d4-node-reader.json": "38c4822f897a7b109bd5ccb3a67195447f1dda0bca6da2f832a68a52e41a60c3",
+        "polarity-biodiversity.json": "fbce3eebf3ff26887667ce7168ae1f95bda69258dab306f203b04dba847fd9a6",
+        "polarity-public-fixture.json": "f736d70e5b8591430aecd77ec784cc2705f0694dcd744151f74e4e07cb9e45a8",
+        "polarity-rebuild-schedule.json": "82bbbd1a02f6ae4590f899ab8ce5830718881932683902e3f1f84f954c5f2a42",
+        "polarity-vw.json": "655635832b8373a06551e1dc1c5ad4e960ccfd5dda4daf456f2ac13cb3191e8f",
+        "semantic-tie-key.json": "0a00251c82952eaa05d6a0877a3587d1eec2060928c6c0c2d05d6cf701d8605e"
+      },
+      "forced_kernel": "not-forced",
+      "compressor": {
+        "arch": "arm64",
+        "executable_sha256": "e4b5a3af0e05c75de2eae013904145f40fe7fc2a6e6f17510128bf45cca4e79b",
+        "node": "v24.21.0",
+        "platform": "darwin",
+        "zlib": "1.3.2.1-motley-8002e91"
+      },
+      "convention_provenance": {
+        "recorded_at_plus_one": [
+          "witnesses/polarity-*.json a (the -1 registry's b), b (its a)",
+          "witnesses/polarity-rebuild-schedule.json positive (the -1 registry's paired), paired (its positive)",
+          "witnesses/semantic-tie-key.json declared.algorithm_digest (the -1 registry's mirrored_digest), a, b"
+        ],
+        "declared": [
+          "witnesses/semantic-tie-key.json declared.storage_agree_value = 1"
+        ],
+        "carried_assumed_symmetric_not_recorded": [
+          "witnesses/polarity-*.json, polarity-rebuild-schedule.json, semantic-tie-key.json negative: the -1 registry's negative is +1 rows read at -1; its +1 counterpart (-1 rows read at +1) was never recorded and is carried on the assumption that the two wrong-sign readings hash alike"
+        ],
+        "convention_invariant_recorded_at_minus_one_only": [
+          "checkpoints[*].rust (semantic math output of the live-equivalence cuts)",
+          "witnesses/d4-node-reader.json, witnesses/d4-node-reader-empty.json (served bytes)"
+        ]
+      }
+    },
+    {
+      "id": "linux-x86_64-haswell-v1",
+      "system": "Linux",
+      "machine": "x86_64",
+      "forced_kernel": "Haswell",
+      "checkpoints": [
+        {
+          "cut": 1170,
+          "tick": 0,
+          "rust": "e36e9abc8622e39d546673aff00d5291fbc51c488ed5f45b241bafba6c6c37a9"
+        },
+        {
+          "cut": 2341,
+          "tick": 1,
+          "rust": "d1c1743ed8e6c0ef4c71a61a01c8e52008a23c95972e84e70436e78386cafb4f"
+        },
+        {
+          "cut": 4683,
+          "tick": 2,
+          "rust": "109c7bac10d7d20ec476f7dfee9bee6e3b5ec943eadf68a62bbdfdebcbc444bc"
+        }
+      ],
+      "attribution": {
+        "source_head": "7db636a7d5924bfa2fe1b369241319ead9782fba",
+        "github_run_id": "34558935924",
+        "run_attempt": "1",
+        "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "python": "3.12.14",
+        "packages": {
+          "boto3": "1.43.89",
+          "botocore": "1.43.89",
+          "cloudpickle": "3.1.2",
+          "contourpy": "1.3.3",
+          "cycler": "0.12.1",
+          "fonttools": "4.64.0",
+          "iniconfig": "2.3.0",
+          "jmespath": "1.1.0",
+          "joblib": "1.6.0",
+          "kiwisolver": "1.5.1",
+          "matplotlib": "3.11.1",
+          "narwhals": "2.25.0",
+          "natsort": "8.4.0",
+          "numpy": "1.26.4",
+          "packaging": "26.3",
+          "pandas": "2.3.3",
+          "pillow": "12.3.0",
+          "pluggy": "1.6.0",
+          "psycopg2-binary": "2.9.12",
+          "pygments": "2.21.0",
+          "pyparsing": "3.3.2",
+          "pytest": "9.1.1",
+          "python-dateutil": "2.9.0.post0",
+          "python-dotenv": "1.2.3",
+          "pytz": "2026.3.post1",
+          "pyyaml": "6.0.3",
+          "s3transfer": "0.19.2",
+          "scikit-learn": "1.9.0",
+          "scipy": "1.17.1",
+          "six": "1.17.0",
+          "sqlalchemy": "2.0.52",
+          "threadpoolctl": "3.6.0",
+          "typing-extensions": "4.16.0",
+          "tzdata": "2026.3",
+          "urllib3": "2.7.0"
+        },
+        "requested_kernel": "Haswell",
+        "receipt_sha256": "80a1cb59f54d8dd9300571f09f378bc1141c32418fbc8553f25baa5b63a960b6",
+        "replay_sha256": "e4d8aeba8621dddf40ed68b6c1672ba04ab8fa8ee2fc970182af310b68ee7d76",
+        "runtime": {
+          "blas": [
+            {
+              "architecture": "Haswell",
+              "internal_api": "openblas",
+              "num_threads": 1,
+              "prefix": "libopenblas",
+              "threading_layer": "pthreads",
+              "user_api": "blas",
+              "version": "0.3.23.dev"
+            },
+            {
+              "architecture": "Haswell",
+              "internal_api": "openblas",
+              "num_threads": 1,
+              "prefix": "libscipy_openblas",
+              "threading_layer": "pthreads",
+              "user_api": "blas",
+              "version": "0.3.30"
+            }
+          ],
+          "blas_observed": true,
+          "forced_kernel": "Haswell",
+          "machine": "x86_64",
+          "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+          "python": "3.12.14",
+          "system": "Linux"
+        },
+        "witness_sha256": {
+          "d4-node-reader-empty.json": "4921d95cb5e7fa6c33e6ba307c096e004d24794ba1edf155fa4944632335e5f0",
+          "d4-node-reader.json": "ea69b373afcd2260592243c38e5a4878fffe8492b494dc03cf437050f3714d26",
+          "polarity-biodiversity.json": "a2d42af26139cdfdbe6f1e4627b48be2fc4df1f0f6210bbf21e1f1c12a2399d0",
+          "polarity-public-fixture.json": "2bf4b28e2263b5657e2f327b6e8f7b379ee8159f81592c34a082ffe8933ad2f5",
+          "polarity-rebuild-schedule.json": "631c020b2541a2926669d560aacf8a78aec7a192b95fbab44305faee2f821954",
+          "polarity-vw.json": "e787133ad3e3e3b1051b1d15f52709558890d750b0d71280503f0368f2442b15",
+          "semantic-tie-key.json": "85bf07c03ee1cfa7d3764da389329a65f27b4d79458a685347eeddc847efd413"
+        },
+        "origin": "Two retained hosted forced-Haswell artifacts; original campaigns remain FAIL",
+        "corroboration": {
+          "source_head": "d0f5dae8b4b57670616298d6f445446a4a842be7",
+          "github_run_id": "34560601079",
+          "run_attempt": "1",
+          "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+          "python": "3.12.14",
+          "packages": {
+            "boto3": "1.43.89",
+            "botocore": "1.43.89",
+            "cloudpickle": "3.1.2",
+            "contourpy": "1.3.3",
+            "cycler": "0.12.1",
+            "fonttools": "4.64.0",
+            "iniconfig": "2.3.0",
+            "jmespath": "1.1.0",
+            "joblib": "1.6.0",
+            "kiwisolver": "1.5.1",
+            "matplotlib": "3.11.1",
+            "narwhals": "2.25.0",
+            "natsort": "8.4.0",
+            "numpy": "1.26.4",
+            "packaging": "26.3",
+            "pandas": "2.3.3",
+            "pillow": "12.3.0",
+            "pluggy": "1.6.0",
+            "psycopg2-binary": "2.9.12",
+            "pygments": "2.21.0",
+            "pyparsing": "3.3.2",
+            "pytest": "9.1.1",
+            "python-dateutil": "2.9.0.post0",
+            "python-dotenv": "1.2.3",
+            "pytz": "2026.3.post1",
+            "pyyaml": "6.0.3",
+            "s3transfer": "0.19.2",
+            "scikit-learn": "1.9.0",
+            "scipy": "1.17.1",
+            "six": "1.17.0",
+            "sqlalchemy": "2.0.52",
+            "threadpoolctl": "3.6.0",
+            "typing-extensions": "4.16.0",
+            "tzdata": "2026.3",
+            "urllib3": "2.7.0"
+          },
+          "requested_kernel": "Haswell",
+          "receipt_sha256": "6c9e8664e753532469a7d41913eb12d2d746f314a3a3d2ebf55523190f731dad",
+          "replay_sha256": "e2eca42396cdcbee4b944077757009c6c9da376bb589c7a9f3ecaf5557d10fb2",
+          "runtime": {
+            "blas": [
+              {
+                "architecture": "Haswell",
+                "internal_api": "openblas",
+                "num_threads": 1,
+                "prefix": "libopenblas",
+                "threading_layer": "pthreads",
+                "user_api": "blas",
+                "version": "0.3.23.dev"
+              },
+              {
+                "architecture": "Haswell",
+                "internal_api": "openblas",
+                "num_threads": 1,
+                "prefix": "libscipy_openblas",
+                "threading_layer": "pthreads",
+                "user_api": "blas",
+                "version": "0.3.30"
+              }
+            ],
+            "blas_observed": true,
+            "forced_kernel": "Haswell",
+            "machine": "x86_64",
+            "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+            "python": "3.12.14",
+            "system": "Linux"
+          },
+          "witness_sha256": {
+            "d4-node-reader-empty.json": "7f15e466896214bb416628ecd94d140d26a0ec3a854505b10710498fa071b4b8",
+            "d4-node-reader.json": "ea69b373afcd2260592243c38e5a4878fffe8492b494dc03cf437050f3714d26",
+            "polarity-biodiversity.json": "a2d42af26139cdfdbe6f1e4627b48be2fc4df1f0f6210bbf21e1f1c12a2399d0",
+            "polarity-public-fixture.json": "2bf4b28e2263b5657e2f327b6e8f7b379ee8159f81592c34a082ffe8933ad2f5",
+            "polarity-rebuild-schedule.json": "631c020b2541a2926669d560aacf8a78aec7a192b95fbab44305faee2f821954",
+            "polarity-vw.json": "e787133ad3e3e3b1051b1d15f52709558890d750b0d71280503f0368f2442b15",
+            "semantic-tie-key.json": "85bf07c03ee1cfa7d3764da389329a65f27b4d79458a685347eeddc847efd413"
+          },
+          "six_witnesses_byte_identical": true,
+          "replay_checkpoints_identical": true,
+          "empty_existing_nine_path_validator": "PASS; published JSON and gzip stable; whole file not byte-identical"
+        },
+        "dependency_review_sha256": "1df931125c4d06483d4ffa24ad5b95a025daea3d288a7e4c8fe8a2e7a25d36cb"
+      },
+      "witnesses": {
+        "d4-node-reader-empty.json": {
+          "differences": {},
+          "profile": "zero votes, four approved comments; both namespaces carry a published empty generation under the committed contract",
+          "reference_published": true,
+          "served": {
+            "python": {
+              "asJSON_bytes": 765,
+              "asJSON_sha256": "4738deb83b9468498ee32c49c5eecfd785d0bac64d5966814f089723286e5a75",
+              "bid_to_pid": [],
+              "comment_extremity": [
+                0,
+                0,
+                0,
+                0
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 352,
+              "gzip_sha256": "8c7fd95c63b2fbff7603d0cc02196e0cb967fa107d972a865d44076c8f4d27f6",
+              "keys_projection_sha256": "bdfafdc98f5d9e7439255a1073827ca5509cc40621dbb02bd1e9e8f5d7668a31",
+              "last_vote_timestamp": 0,
+              "mapping_is_error": false,
+              "mapping_sha256": "a5558a1314571ed26f6afdea59f81a24ab0cc942ac84485892f8a36f7ac16315",
+              "math_env": "python",
+              "n": 0,
+              "n_cmts": 4,
+              "pca_center": [
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": []
+              },
+              "present": true,
+              "raw": {
+                "asJSON_sha256": "fa78e3c4a1cbacb495960da1fcb9b1a834ffc0d825361b968e9e2eadb2670050",
+                "gzip_sha256": "a06d839fb65f690863346a1fc93201de92a1271914436fadd75490a31920b313",
+                "n_cmts": 0,
+                "tids": [],
+                "unchanged_after_presentation": true
+              },
+              "repness_keys": [],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            },
+            "rustproto": {
+              "asJSON_bytes": 765,
+              "asJSON_sha256": "4738deb83b9468498ee32c49c5eecfd785d0bac64d5966814f089723286e5a75",
+              "bid_to_pid": [],
+              "comment_extremity": [
+                0,
+                0,
+                0,
+                0
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 352,
+              "gzip_sha256": "8c7fd95c63b2fbff7603d0cc02196e0cb967fa107d972a865d44076c8f4d27f6",
+              "keys_projection_sha256": "bdfafdc98f5d9e7439255a1073827ca5509cc40621dbb02bd1e9e8f5d7668a31",
+              "last_vote_timestamp": 0,
+              "mapping_is_error": false,
+              "mapping_sha256": "a5558a1314571ed26f6afdea59f81a24ab0cc942ac84485892f8a36f7ac16315",
+              "math_env": "rustproto",
+              "n": 0,
+              "n_cmts": 4,
+              "pca_center": [
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": []
+              },
+              "present": true,
+              "raw": {
+                "asJSON_sha256": "fa78e3c4a1cbacb495960da1fcb9b1a834ffc0d825361b968e9e2eadb2670050",
+                "gzip_sha256": "a06d839fb65f690863346a1fc93201de92a1271914436fadd75490a31920b313",
+                "n_cmts": 0,
+                "tids": [],
+                "unchanged_after_presentation": true
+              },
+              "repness_keys": [],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          }
+        },
+        "d4-node-reader.json": {
+          "compared_fields": [
+            "asJSON_sha256",
+            "asJSON_bytes",
+            "gzip_sha256",
+            "gzip_bytes",
+            "keys_projection_sha256",
+            "tids",
+            "n",
+            "n_cmts",
+            "pca_center",
+            "comment_extremity",
+            "repness_keys",
+            "consensus_shape",
+            "mapping_sha256",
+            "bid_to_pid",
+            "pids_for_gid",
+            "mapping_is_error"
+          ],
+          "differences": {},
+          "math_tick": 1,
+          "profile": "real getPca + presentPca + participants.ts, in-process, one Node process",
+          "served": {
+            "python": {
+              "asJSON_bytes": 6467,
+              "asJSON_sha256": "5a51b781e06b9aa47d73e92e727b90d70bf0f3b3c26105583fef4975db64b943",
+              "bid_to_pid": [
+                [
+                  0
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3
+                ]
+              ],
+              "comment_extremity": [
+                1.4280971859724136,
+                1.632993161855452,
+                1.4467439647405307,
+                1.4467439646470364
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 1751,
+              "gzip_sha256": "874ea767bb06c7f491fbac04ed9cdc585e06186585cb690de360cb23fd5e1b13",
+              "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+              "mapping_is_error": false,
+              "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+              "n": 6,
+              "n_cmts": 4,
+              "pca_center": [
+                0.3333333333333333,
+                0,
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": [
+                  0,
+                  2,
+                  3,
+                  5
+                ],
+                "1": [
+                  1,
+                  4
+                ]
+              },
+              "repness_keys": [
+                "0",
+                "1"
+              ],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            },
+            "rustproto": {
+              "asJSON_bytes": 6467,
+              "asJSON_sha256": "5a51b781e06b9aa47d73e92e727b90d70bf0f3b3c26105583fef4975db64b943",
+              "bid_to_pid": [
+                [
+                  0
+                ],
+                [
+                  1,
+                  4
+                ],
+                [
+                  2,
+                  5
+                ],
+                [
+                  3
+                ]
+              ],
+              "comment_extremity": [
+                1.4280971859724136,
+                1.632993161855452,
+                1.4467439647405307,
+                1.4467439646470364
+              ],
+              "consensus_shape": {
+                "agree": 0,
+                "disagree": 0
+              },
+              "etag_math_tick": 1,
+              "gzip_bytes": 1751,
+              "gzip_sha256": "874ea767bb06c7f491fbac04ed9cdc585e06186585cb690de360cb23fd5e1b13",
+              "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+              "mapping_is_error": false,
+              "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+              "n": 6,
+              "n_cmts": 4,
+              "pca_center": [
+                0.3333333333333333,
+                0,
+                0,
+                0
+              ],
+              "pids_for_gid": {
+                "0": [
+                  0,
+                  2,
+                  3,
+                  5
+                ],
+                "1": [
+                  1,
+                  4
+                ]
+              },
+              "repness_keys": [
+                "0",
+                "1"
+              ],
+              "tids": [
+                0,
+                1,
+                2,
+                3
+              ]
+            }
+          },
+          "zid": 1
+        },
+        "polarity-biodiversity.json": {
+          "fixture": "biodiversity",
+          "a": "52d4ce6aaa8841bd01d793e86badebfa7cdedc3a4b6daa8154c7a76f89896d72",
+          "b": "52d4ce6aaa8841bd01d793e86badebfa7cdedc3a4b6daa8154c7a76f89896d72",
+          "negative": "97e6ba9157747be5156367843c7c408e9e326ff0a60df24d8a2d7a49b78a274c",
+          "deltas": []
+        },
+        "polarity-public-fixture.json": {
+          "fixture": "public-fixture",
+          "a": "2086676a899c5cd6caab8f44e41c95d1bb31e5df7ca07e119a1eb77d548d6acc",
+          "b": "2086676a899c5cd6caab8f44e41c95d1bb31e5df7ca07e119a1eb77d548d6acc",
+          "negative": "9b737b0314f0f436affdb192838c1c1db0844fa25b4b15dc41c86595760af318",
+          "deltas": []
+        },
+        "polarity-rebuild-schedule.json": [
+          {
+            "step": 0,
+            "positive": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+            "paired": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+            "negative": "c6f4569922ba59a129f9829e7302affc217c6535936b7f982b8cbe6c84bbd1ea"
+          },
+          {
+            "step": 1,
+            "positive": "25b2e26a749e2e162815a377801343adced6ad29bbd9403402ce3d8358d1f9d2",
+            "paired": "25b2e26a749e2e162815a377801343adced6ad29bbd9403402ce3d8358d1f9d2",
+            "negative": "d076075c11a948876fa928ec39dc1bf0b3bf79f7091edb96d0aa452906ff5cf0"
+          },
+          {
+            "step": 2,
+            "positive": "a6b21f08f126540941ae1ec795bc08e99192e46e9829b78d81ebe2b2356216d5",
+            "paired": "a6b21f08f126540941ae1ec795bc08e99192e46e9829b78d81ebe2b2356216d5",
+            "negative": "aa0f9b4cc2c67f22867049d84dda34dce75db33fb1df682739399e769e92edf2"
+          }
+        ],
+        "polarity-vw.json": {
+          "fixture": "vw",
+          "a": "05bdf04faca236817e00bc235c4d219a2364dc478c9994e987168f0e93571bcb",
+          "b": "05bdf04faca236817e00bc235c4d219a2364dc478c9994e987168f0e93571bcb",
+          "negative": "791802486b365452b860696b4175f4e49dbad8ffdf3d53de98cf05b44bffd00b",
+          "deltas": []
+        },
+        "semantic-tie-key.json": {
+          "declared": {
+            "terms": [
+              {
+                "name": "tid",
+                "nulls": "default",
+                "source": "votes.tid"
+              },
+              {
+                "name": "pid",
+                "nulls": "default",
+                "source": "votes.pid"
+              },
+              {
+                "name": "created_ms",
+                "nulls": "default",
+                "source": "votes.created"
+              },
+              {
+                "name": "semantic_vote",
+                "nulls": "default",
+                "source": "raw_vote * storage_agree_value"
+              },
+              {
+                "name": "weight_x_32767",
+                "nulls": "first",
+                "source": "votes.weight_x_32767"
+              }
+            ],
+            "schema": "polis-order/1",
+            "profile": "live-tid-pid-created-semantic-value-weight/1",
+            "order_by": "tid,pid,created,(vote::bigint*$2::bigint),weight_x_32767 NULLS FIRST",
+            "parameter": "storage_agree_value",
+            "semantic_vote": "raw_vote * storage_agree_value",
+            "algorithm_digest": "3bd0700204ee8202074e31f6cfe2f57903bd9d9fc10c5149c0fcdfb7f5406685",
+            "equal_time_census": {
+              "key": [
+                "tid",
+                "pid",
+                "created_ms"
+              ],
+              "schema": "polis-census/1",
+              "tied_rows": 2,
+              "resolved_by": [
+                "semantic_vote",
+                "weight_x_32767"
+              ],
+              "tied_groups": 1
+            },
+            "storage_agree_value": 1
+          },
+          "mirrored_digest": "2dc3856741cc73ad45426230758b1557b97988720b3551df9282819c5978e7d1",
+          "a": "4f488fb4a92b759f04984c30080cd876e5a5fb249a006343464020e838e8beb7",
+          "b": "4f488fb4a92b759f04984c30080cd876e5a5fb249a006343464020e838e8beb7",
+          "negative": "46978d0f130d7b7b7b5ed8ff6833a090d0fee82e8d637757ce291ab250240512",
+          "deltas": []
+        }
+      },
+      "witness_sha256": {
+        "d4-node-reader-empty.json": "18de4bb4dd6ef86231b6d8ec27aa5615b012959162fb0e792cb1fccd251303b0",
+        "d4-node-reader.json": "8144dfec413d8434f2de297072311fea8f9fc7aafd0c5704df103771eed5301b",
+        "polarity-biodiversity.json": "9b5dca45df9f259f8ddff45eb81a4a588bbe729976e69e874f06242a0f1be851",
+        "polarity-public-fixture.json": "31d496cbe8470f5e8b9e59dcdafe4337a4d1c5f6cb25d5b2057852312ace0450",
+        "polarity-rebuild-schedule.json": "43a07b1328ea220d901896d01ec52a5d3e45d609d09cd36051ee222702674f79",
+        "polarity-vw.json": "41c93616399259f74409d145775cae437304206a774512135e4c6b9a16c82172",
+        "semantic-tie-key.json": "158352b16c4640c9e19aaaa44b89dd97646d982e7b55c058faeab6cb7cf61310"
+      },
+      "convention_provenance": {
+        "recorded_at_plus_one": [
+          "witnesses/polarity-*.json a (the -1 registry's b), b (its a)",
+          "witnesses/polarity-rebuild-schedule.json positive (the -1 registry's paired), paired (its positive)",
+          "witnesses/semantic-tie-key.json declared.algorithm_digest (the -1 registry's mirrored_digest), a, b"
+        ],
+        "declared": [
+          "witnesses/semantic-tie-key.json declared.storage_agree_value = 1"
+        ],
+        "carried_assumed_symmetric_not_recorded": [
+          "witnesses/polarity-*.json, polarity-rebuild-schedule.json, semantic-tie-key.json negative: the -1 registry's negative is +1 rows read at -1; its +1 counterpart (-1 rows read at +1) was never recorded and is carried on the assumption that the two wrong-sign readings hash alike"
+        ],
+        "convention_invariant_recorded_at_minus_one_only": [
+          "checkpoints[*].rust (semantic math output of the live-equivalence cuts)",
+          "witnesses/d4-node-reader.json, witnesses/d4-node-reader-empty.json (served bytes)"
+        ]
+      }
+    }
+  ],
+  "retired_pins": []
+}

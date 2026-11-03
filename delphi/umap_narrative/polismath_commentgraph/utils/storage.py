@@ -3,21 +3,7 @@ Storage utilities for the Polis comment graph microservice.
 """
 
 import boto3
-
-
-def _postgres_vote_to_delphi(pg_vote):
-    """
-    Convert PostgreSQL vote convention to Delphi convention.
-
-    PostgreSQL/Server/Client: AGREE=-1, DISAGREE=+1, PASS=0
-    Delphi internal:          AGREE=+1, DISAGREE=-1, PASS=0
-
-    Note: The canonical definition is in polismath.utils.general.postgres_vote_to_delphi()
-    This local copy exists because polismath_commentgraph is a separate package.
-    """
-    return pg_vote * -1
-
-
+from polismath.delphi_storage.resource import result_resource
 import os
 import json
 import logging
@@ -26,6 +12,7 @@ from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
 import numpy as np
 from decimal import Decimal
+from polismath.utils.vote_convention import load_semantic_votes
 from .converter import DataConverter
 from ..schemas.dynamo_models import (
     ConversationMeta,
@@ -310,15 +297,17 @@ class PostgresClient:
         """
         Get all votes in a conversation.
 
-        Vote signs are flipped at this PostgreSQL boundary:
-        - PostgreSQL stores: AGREE=-1, DISAGREE=+1
-        - Delphi expects:    AGREE=+1, DISAGREE=-1
+        Votes are converted from the raw storage sign to semantic votes
+        (+1 agree) at this PostgreSQL boundary by the one vote convention,
+        polismath.utils.vote_convention.load_semantic_votes, the single Delphi
+        vote loader; the sign is the installed ConventionSource's. A NULL vote
+        stays None, as before; group_data skips it.
 
         Args:
             zid: Conversation ID
 
         Returns:
-            List of votes with signs converted to Delphi convention
+            List of votes with semantic signs
         """
         sql = """
         SELECT 
@@ -333,11 +322,7 @@ class PostgresClient:
         """
 
         results = self.query(sql, {"zid": zid})
-        # Flip vote signs at PostgreSQL boundary
-        for r in results:
-            if r.get("vote") is not None:
-                r["vote"] = _postgres_vote_to_delphi(r["vote"])
-        return results
+        return load_semantic_votes(results, null_policy="keep")
 
     def get_participants_by_conversation(self, zid: int) -> List[Dict[str, Any]]:
         """
@@ -463,7 +448,7 @@ class DynamoDBStorage:
             kwargs['aws_secret_access_key'] = aws_secret_access_key
         
         # Create the DynamoDB resource
-        self.dynamodb = boto3.resource('dynamodb', **kwargs)
+        self.dynamodb = result_resource('dynamodb', **kwargs)
         
         # Define table names
         self.table_names = {
@@ -716,7 +701,63 @@ class DynamoDBStorage:
             'success': success_count,
             'failure': failure_count
         }
-    
+
+    # --- comment embeddings: per-row table path (migration 000038, flag on) ------
+    # The one model the migration seeds (model_id 1); the legacy bare name
+    # normalizes to it, matching the importer and queue-rs embedding::MODEL_MINILM.
+    _SEEDED_EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
+    _EMBEDDING_MODEL_ALIASES = {
+        'all-MiniLM-L6-v2': 'sentence-transformers/all-MiniLM-L6-v2',
+        'sentence-transformers/all-MiniLM-L6-v2': 'sentence-transformers/all-MiniLM-L6-v2',
+    }
+
+    def embeddings_table_enabled(self) -> bool:
+        """True when comment embeddings use the per-row table (migration 000038).
+
+        The daemon carries the switch in a Postgres writer's frame (which the
+        writer resource exposes) and in the environment for the single-process
+        pipeline's subprocesses; either turns it on. Off for a DynamoDB backend or
+        a flag-off run, when the codec-family path below is unchanged."""
+        if os.environ.get('DELPHI_EMBEDDINGS_TABLE') == '1':
+            return True
+        frame = getattr(self.dynamodb, 'frame', None)
+        return bool(frame and (frame.get('embeddings_table') or frame.get('config', {}).get('embeddings_table')))
+
+    def put_comment_embeddings_table(self, conversation_id, comment_ids, text_shas, vectors, model):
+        """Route a run's embeddings to the per-row table instead of the codec family.
+
+        Each comment's text SHA-256 (``text_shas`` aligned with ``comment_ids`` and
+        ``vectors``) is the row's provenance. The writer resource collects them and
+        the daemon stores them under the seeded model; the legacy model name maps to
+        the seeded one so a run that used either spelling lands on model_id 1."""
+        normalized = self._EMBEDDING_MODEL_ALIASES.get(model)
+        if normalized is None:
+            raise ValueError('unmapped embedding model %r' % (model,))
+        rows = [(int(tid), text_sha, [float(v) for v in vector])
+                for tid, text_sha, vector in zip(comment_ids, text_shas, vectors)]
+        dims = len(rows[0][2]) if rows else 1
+        self.dynamodb.put_comment_embeddings(rows, normalized, dims)
+        return {'success': len(rows), 'failure': 0}
+
+    def comment_embedding_ids(self, conversation_id) -> List[int]:
+        """The conversation's embedded comment ids in tid order, from the served
+        embedding set in the per-row table (flag on), via the fenced read functions
+        pd_embedding_served and pd_embedding_rows. Empty when nothing is served."""
+        env = os.environ.get('DELPHI_RESULT_ENV')
+        scope = os.environ.get('DELPHI_RESULT_SCOPE', 'delphi')
+        connect = getattr(self.dynamodb, '_connect', None)
+        if connect is None:
+            raise RuntimeError('the embeddings table read path requires the Postgres result backend')
+        with connect().cursor() as cursor:
+            cursor.execute('SELECT public.pd_embedding_served(%s,%s,%s,%s)',
+                           (env, int(conversation_id), scope, self._SEEDED_EMBEDDING_MODEL))
+            receipt = cursor.fetchone()[0]
+            if not receipt or not receipt.get('batch_id'):
+                return []
+            cursor.execute('SELECT tid FROM public.pd_embedding_rows(%s,%s,%s) ORDER BY tid',
+                           (env, receipt['batch_id'], receipt['model']))
+            return [row[0] for row in cursor.fetchall()]
+
     def create_comment_cluster(self, cluster: CommentCluster) -> bool:
         """
         Store a comment cluster assignment.

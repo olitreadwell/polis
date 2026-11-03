@@ -1,4 +1,9 @@
-# Local Rust queue adapter and shared acceptance cases
+# Local Rust queue adapter, shared acceptance cases, and the `polis-jobs` daemon
+
+This crate holds two binaries. `polis-queue-adapter` (below, "Local Rust queue
+adapter") is the one-shot `polis-queue/1` transport. `polis-jobs` (the last
+section) is a daemon that runs Delphi jobs on the `polis-queue/2` contract. It
+is off by default and nothing in compose, the deploy hooks or CI starts it.
 
 This independent crate exercises `polis-queue/1` without changing the coordinator
 or Python science package. It is a local, opt-in transport for the twelve public
@@ -74,3 +79,143 @@ count/byte admission, protected-reference retention/cleanup and eventual real
 math-stage admission require their separately reviewed schema/authority work.
 No queue finalize occurs in the math bridge, so a restart between math COMMIT
 and queue finalize cannot yet be a live queue integration witness.
+
+## `polis-jobs`: the Delphi job daemon (off by default)
+
+What it does, in plain terms: it takes one Delphi job at a time from the
+Postgres queue, holds a lease on it (120 s, renewed every 30 s), runs the
+unchanged Delphi script as a child process in its own process group, copies
+the child's output lines into `polis_queue_logs`, and records how the attempt
+ended. A job succeeds only when the child exits 0 *and* writes a valid output
+manifest; the manifest's exact bytes are stored as the attempt's `manifest` log
+row and its sha256 is what the queue records. If the job is cancelled, or the
+lease is lost, the daemon kills the child's whole process group, waits until
+the group is empty, and only then tells the database the process has exited.
+The database never treats an expired lease as proof that a process stopped: a
+job whose worker vanished stays parked until its exit is confirmed, either by
+the daemon's restart journal or by an operator (who reads the identity from
+`pd_job_view.last_attempt`).
+
+What it needs to run: a database with migration 000019 and the `polis-queue/2`
+migration 000023 applied (`polis_queue_install.contract_version` reads
+`polis-queue/2`; otherwise the daemon exits 3), and a login that is a plain
+member of `polis_queue_executor`. Neither is applied to any shared database by
+this crate. 000023 is `server/postgres/migrations/000023_create_delphi_foundation.sql`,
+sealed with its down script in `server/postgres/migrations/down/000023-files.sha256`;
+`tests/foundation_migration.rs` checks the seal and the stage list without a
+database, and a fresh container applies it at initdb like every migration.
+Applying it to an existing database, production included, is the operator's
+explicit step through `server/postgres/bin/apply-migration.sh`
+(`docs/queue-substrate.md`): 000019 and then 000023, each in its own idle or
+controlled writer window, because each creates foreign keys to
+`conversations` and so holds `ShareRowExclusiveLock` on that table until it
+commits, blocking every insert, update and delete of a conversation meanwhile.
+The wrapper refuses unless the file matches its seal, the server is
+PostgreSQL 17, the login has the rights, the queue tables are empty, no other
+transaction is older than 30 s and the operator-measured free disk is above
+5 GiB; it then sends `lock_timeout` 5 s, `statement_timeout` 60 s,
+`transaction_timeout` 120 s and `idle_in_transaction_session_timeout` 30 s.
+
+Two things the schema does not do: the per-scope guard row in
+`delphi_job_guards` is held until safe explicit release (`pd_release_scope`,
+which refuses while any job in the root's tree is unfinished, lacks exit proof
+or has an open provider request; no guard is released automatically); and the
+attempt logs this daemon writes to `polis_queue_logs` are direct `INSERT`s
+under the executor's table grant, limited by the database per row only (1 MiB
+a line; the per-attempt cap, `POLIS_JOBS_LOG_MAX_LINES` / `_BYTES`, is this
+daemon's own buffer, not a database rule), with no retention
+yet: nothing deletes or sweeps them.
+
+**The input bundle (`POLIS_JOBS_INPUT_BUNDLE`, off by default).** With the
+switch at exactly `1`, before a `delphi_full_pipeline` child starts the daemon
+reads the rows that child's stages read from Postgres (the conversation row,
+every comment, every report comment selection, the newest vote's `created`
+and the `math_main` tick pair), in one read-only REPEATABLE READ transaction
+with a 120 s statement timeout, on one connection opened with the child's own
+`DATABASE_URL` under this daemon's transport rules and closed afterwards. It
+writes them into `inputs/` of the attempt directory as the
+`delphi-input-bundle/1` files (`schemas/delphi-input-bundle*-v1.json`; the
+types are `polis-contracts/src/delphi_input_bundle.rs`, compiled into this
+crate as `jobs::inputs::contract`), and the frame names the manifest under
+`inputs.bundle` (path relative to the attempt directory, and its sha256). The
+child then reads those files instead of Postgres
+(`delphi/polismath/job_child/input_bundle.py`), and refuses the run if any
+digest disagrees. If the read fails, the attempt fails with
+`input_bundle_unavailable` (not permanent, so the queue may retry it) and no
+child runs. No vote row is read, and no
+pool the participation path uses is touched. With the switch off, nothing here
+runs and the frame is byte-identical to before. The switch needs
+`DATABASE_URL`, and the daemon refuses to start without it.
+
+**Worker classes.** `POLIS_JOBS_WORKER_CLASS` (default `delphi`) says which
+jobs this daemon claims; a worker sees only jobs of its class, by the SQL
+contract. `delphi` runs the two Delphi stages (`delphi_full_pipeline`,
+`delphi_narrative`, the scripts above) and starts on `polis-queue/2` or `/3`.
+`large` runs one stage, `math_rebuild` (an oversized conversation's cold
+rebuild on the large box, `delphi/scripts/math_poller.py --job` with the zid
+in the frame; design `P-073 r2`), and starts only on `polis-queue/3`
+(migration 000024, sealed in `down/000024-files.sha256`): on a `/2` database
+it exits 3 naming the contract it needs. `POLIS_JOBS_STAGES` must be a subset
+of the class's stages; a stage of another class is refused before any
+connection (exit 2). A rebuild's admission carries a typed math config
+(`staged_label`, `target_label`, `need_bytes`, `input_through_ms`, `binding`,
+`source_commit`; `schemas/job-frame-v1.json`), which the daemon checks whole
+before any child spawns (an admission without it is `math_config_invalid`,
+permanent, no child) and carries whole into the frame, so the child checks
+every key of it before it computes. A rebuild's output manifest lists no
+DynamoDB outputs: its staged bundle is in Postgres under the staged label and
+is named by the manifest's `inputs`. No deployment runs a large worker yet;
+the math poller's job entry is a later change.
+
+**Scope release.** `pd_enqueue` holds one guard per scope until an explicit,
+safe release; nothing released it, so the first terminal job occupied its
+conversation forever. The daemon now releases it: after a terminal reply
+(succeeded, dead, cancelled) for an attempt whose exit it proved, including
+the journal-recovery and reaper paths, it reads the scope from `pd_job_view`
+(`scope_key`, polis-queue/3) and calls `pd_release_scope`, which re-checks
+every condition (every job of the root's tree terminal, every exit proven, no
+open provider request) and refuses otherwise. One transition says what
+happened (`scope_released`, or `scope_held` with the reason; `scope_unknown`
+on a `/2` database), and the readiness line counts `released_total`. Terminal
+status alone releases nothing. The poison latch is the contract's: three dead
+jobs of one scope under one code image make the next admission `poisoned`.
+
+Configuration is by environment; `POLIS_JOBS_ENABLED` must be exactly `1` or
+the daemon exits 0 at once. Transports: `tls` (default; CA file and exact host
+allowlist required), `local` (Unix socket, must be chosen explicitly) and
+`loopback` (literal 127.0.0.1/::1 only). `POLIS_JOBS_JOURNAL_DIR` must be a
+writable directory that survives container re-creation (exit 2 otherwise).
+Exit codes: 0 disabled or clean shutdown, 2 configuration refused, 3 contract
+missing.
+
+The child sees `DELPHI_JOB_ID`, `DELPHI_RUN_ID`, `DELPHI_ATTEMPT_ID`,
+`DELPHI_LEASE_EPOCH`, `DELPHI_STAGE`, `DELPHI_PHASE`, `DELPHI_OUTPUT_MANIFEST`
+and `DELPHI_FRAME`, never the queue DSN. Before a provider batch is submitted
+the child writes `provider_intent.json`; the daemon records it with
+`pd_provider_intent`, and only after that commits writes `provider_intent.ack`
+(`{schema, request_id, intent_sha256}`). Schemas: `schemas/`.
+
+Lines on stderr: one bare-JSON `polis_jobs.transition/1` per state change, and
+every `POLIS_JOBS_READINESS_SECONDS` a readiness line
+`polis_jobs readiness/1 role=worker progress=<idle|running|draining|degraded> {json}`
+with claimed/finalized/failed/parked/fenced/poison/exit_unconfirmed totals.
+
+Tests: `cargo test` runs the unit tests. The integration tests need a
+throwaway PostgreSQL 17 on a loopback port and the feature flag:
+
+```sh
+COMPOSE_PROJECT_NAME=p077-jobs-example POLIS_RECOVERY_PG_PORT=56170 \
+  docker compose -f queue-rs/compose.yml up -d --wait
+POLIS_JOBS_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:56170/queue_acceptance \
+POLIS_JOBS_TEST_PYTHON=$(command -v python3) \
+  cargo test --manifest-path queue-rs/Cargo.toml --features jobs-integration -- --test-threads 4
+COMPOSE_PROJECT_NAME=p077-jobs-example POLIS_RECOVERY_PG_PORT=56170 \
+  docker compose -f queue-rs/compose.yml down -v
+```
+
+They apply the repository's 000000–000022 chain to one template database
+(`jobs_base`, the "contract missing" shape), the repository's 000023 on top
+of it to another (`jobs_v2`) and 000024 on top of that to a third (`jobs_v3`,
+the large class), then run real daemon processes against copies of them with
+a generated fixture child (`tests/fixtures/fake_delphi`) in place of the
+Delphi scripts and the math poller's job entry.

@@ -1,3 +1,4 @@
+import { resultClient } from "../utils/delphiResults";
 import { Request, Response } from "express";
 import logger from "../utils/logger";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -12,24 +13,20 @@ const dynamoDBConfig: any = {
 
 if (Config.dynamoDbEndpoint) {
   dynamoDBConfig.endpoint = Config.dynamoDbEndpoint;
-  dynamoDBConfig.credentials = {
-    accessKeyId: "DUMMYIDEXAMPLE",
-    secretAccessKey: "DUMMYEXAMPLEKEY",
-  };
-} else if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
+}
+if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
   dynamoDBConfig.credentials = {
     accessKeyId: Config.AWS_ACCESS_KEY_ID,
     secretAccessKey: Config.AWS_SECRET_ACCESS_KEY,
   };
 }
 
-const client = new DynamoDBClient(dynamoDBConfig);
-const docClient = DynamoDBDocumentClient.from(client, {
+const docClient = resultClient(() => DynamoDBDocumentClient.from(new DynamoDBClient(dynamoDBConfig), {
   marshallOptions: {
     convertEmptyValues: true,
     removeUndefinedValues: true,
   },
-});
+}));
 
 interface TopicMetrics {
   comment_count: number;

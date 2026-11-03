@@ -237,15 +237,24 @@ def load_comment_texts(zid):
     Returns:
         Dictionary mapping comment_id to text
     """
-    logger.info(f"Loading comments directly from PostgreSQL for conversation {zid}")
-    postgres_client = PostgresClient()
-    
+    from polismath.job_child import input_bundle
+
+    # The input bundle polis-jobs wrote, when the frame names one; else PostgreSQL.
+    bundle = input_bundle.load(zid)
+    postgres_client = None
+
     try:
-        # Initialize connection
-        postgres_client.initialize()
-        
-        # Get comments
-        comments = postgres_client.get_comments_by_conversation(int(zid))
+        if bundle is not None:
+            logger.info(f"Loading comments from the input bundle for conversation {zid}")
+            comments = bundle.comments()
+        else:
+            logger.info(f"Loading comments directly from PostgreSQL for conversation {zid}")
+            postgres_client = PostgresClient()
+            # Initialize connection
+            postgres_client.initialize()
+
+            # Get comments
+            comments = postgres_client.get_comments_by_conversation(int(zid))
         
         if not comments:
             logger.error(f"No comments found in PostgreSQL for conversation {zid}")
@@ -254,7 +263,7 @@ def load_comment_texts(zid):
         # Create a dictionary of comment_id to text
         comment_dict = {comment['tid']: comment['txt'] for comment in comments if comment.get('txt')}
         
-        logger.info(f"Loaded {len(comment_dict)} comments from PostgreSQL")
+        logger.info(f"Loaded {len(comment_dict)} comments from {'the input bundle' if bundle is not None else 'PostgreSQL'}")
         return comment_dict
         
     except Exception as e:
@@ -263,7 +272,8 @@ def load_comment_texts(zid):
         
     finally:
         # Clean up connection
-        postgres_client.shutdown()
+        if postgres_client is not None:
+            postgres_client.shutdown()
 
 def load_conversation_data_from_dynamo(zid, layer_id, dynamo_storage):
     """
@@ -305,30 +315,39 @@ def load_conversation_data_from_dynamo(zid, layer_id, dynamo_storage):
     
     # Load comment embeddings to get comment IDs in order
     try:
-        # Query CommentEmbeddings for this conversation
-        logger.info(f"Loading comment embeddings to get full comment list...")
-        table = dynamo_storage.dynamodb.Table(dynamo_storage.table_names['comment_embeddings'])
-        logger.debug(f"CommentEmbeddings table name: {dynamo_storage.table_names['comment_embeddings']}")
-        
-        response = table.query(
-            KeyConditionExpression=Key('conversation_id').eq(str(zid))
-        )
-        embeddings = response.get('Items', [])
-        
-        # Handle pagination if needed
-        while 'LastEvaluatedKey' in response:
-            logger.debug(f"Handling pagination for comment embeddings...")
+        # With the per-row embeddings table on (migration 000038), the comment ids
+        # come from the served embedding set in that table; off, from the codec
+        # family exactly as before.
+        if dynamo_storage.embeddings_table_enabled():
+            logger.info("Loading comment ids from the per-row embeddings table...")
+            comment_ids = dynamo_storage.comment_embedding_ids(zid)
+            data["comment_ids"] = comment_ids
+            logger.info(f"Loaded {len(comment_ids)} comment IDs from the embeddings table")
+        else:
+            # Query CommentEmbeddings for this conversation
+            logger.info(f"Loading comment embeddings to get full comment list...")
+            table = dynamo_storage.dynamodb.Table(dynamo_storage.table_names['comment_embeddings'])
+            logger.debug(f"CommentEmbeddings table name: {dynamo_storage.table_names['comment_embeddings']}")
+
             response = table.query(
-                KeyConditionExpression=Key('conversation_id').eq(str(zid)),
-                ExclusiveStartKey=response['LastEvaluatedKey']
+                KeyConditionExpression=Key('conversation_id').eq(str(zid))
             )
-            embeddings.extend(response.get('Items', []))
-        
-        # Extract comment IDs in order
-        comment_ids = [int(item['comment_id']) for item in embeddings]
-        data["comment_ids"] = comment_ids
-        logger.info(f"Loaded {len(comment_ids)} comment IDs from embeddings")
-        logger.debug(f"Sample comment IDs: {comment_ids[:5] if comment_ids else []}")
+            embeddings = response.get('Items', [])
+
+            # Handle pagination if needed
+            while 'LastEvaluatedKey' in response:
+                logger.debug(f"Handling pagination for comment embeddings...")
+                response = table.query(
+                    KeyConditionExpression=Key('conversation_id').eq(str(zid)),
+                    ExclusiveStartKey=response['LastEvaluatedKey']
+                )
+                embeddings.extend(response.get('Items', []))
+
+            # Extract comment IDs in order
+            comment_ids = [int(item['comment_id']) for item in embeddings]
+            data["comment_ids"] = comment_ids
+            logger.info(f"Loaded {len(comment_ids)} comment IDs from embeddings")
+            logger.debug(f"Sample comment IDs: {comment_ids[:5] if comment_ids else []}")
     except Exception as e:
         logger.error(f"Error retrieving comment embeddings: {e}")
         import traceback

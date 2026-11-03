@@ -16,8 +16,30 @@
  * available. Do not use these in any other suite.
  */
 export const RESERVED_POOLED_USER_INDEXES = {
+  /** server/__tests__/integration/xid-list-moderators-only.test.ts (conversation owner) */
+  xidListOwner: 38,
+  /** server/__tests__/integration/xid-list-moderators-only.test.ts (site moderator; its site_id is aligned to the owner's) */
+  xidListModerator: 39,
   /** server/__tests__/integration/domain-whitelist.test.ts */
   domainWhitelist: 40,
+  /** server/__tests__/integration/vote-path-recordings.test.ts */
+  votePathRecordings: 41,
+  /** server/__tests__/integration/invite-admin-auth.test.ts (conversation owner) */
+  inviteAdminAuthOwner: 42,
+  /** server/__tests__/integration/invite-admin-auth.test.ts (site moderator; its site_id is aligned to the owner's) */
+  inviteAdminAuthModerator: 43,
+  /** server/__tests__/integration/conversations-xid-suzinvite.test.ts (conversation owner) */
+  conversationsXidSuzinvite: 44,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (conversation owner A) */
+  xidIdentityOwnerA: 45,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (conversation owner B) */
+  xidIdentityOwnerB: 46,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (site moderator; its site_id is aligned to owner A's) */
+  xidIdentityModerator: 47,
+  /** server/__tests__/integration/comment-seed-owner-bearer.test.ts (conversation owner) */
+  seedOwnerBearerOwner: 48,
+  /** server/__tests__/integration/comment-seed-owner-bearer.test.ts (second signed-in account; the suite moves it between a site of its own and the owner's) */
+  seedOwnerBearerOther: 49,
 } as const;
 
 export function getPooledTestUser(index: number): {

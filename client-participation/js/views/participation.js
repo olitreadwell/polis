@@ -10,6 +10,7 @@ var ConversationTabsView = require("../views/conversationTabs");
 var ConversationView = require("../views/conversation");
 var DivisiveCommentsView = require("../views/DivisiveCommentsView");
 var display = require("../util/display");
+var VoteConvention = require("../util/voteConvention");
 var eb = require("../eventBus");
 var GroupSelectionView = require("../views/groupSelectionView");
 var { markdown } = require("markdown");
@@ -327,11 +328,12 @@ module.exports = ConversationView.extend({
 
       function onVoteClicked(o) {
         var dfd = $.Deferred().reject();
-        if (o.vote === window.polisTypes.reactions.pull) {
+        var clicked = VoteConvention.fromWire(o.vote);
+        if (clicked === VoteConvention.AGREE) {
           dfd = that.serverClient.agree(o.tid);
-        } else if (o.vote === window.polisTypes.reactions.push) {
+        } else if (clicked === VoteConvention.DISAGREE) {
           dfd = that.serverClient.disagree(o.tid);
-        } else if (o.vote === window.polisTypes.reactions.pass) {
+        } else if (clicked === VoteConvention.PASS) {
           dfd = that.serverClient.pass(o.tid);
         }
         dfd.then(
@@ -549,7 +551,7 @@ module.exports = ConversationView.extend({
     function onPersonUpdate(updatedNodes, newClusters, newParticipantCount) {
       that.firstMathPollResultDeferred.resolve();
       if (newParticipantCount >= MIN_PTPTS) {
-        if ($("#vis_section:hidden")) {
+        if ($("#vis_section:hidden").length) {
           $("#vis_section").fadeIn(1000, function () {
             that.initPcaVis();
           });
@@ -990,13 +992,6 @@ module.exports = ConversationView.extend({
         }
 
         // that.visModeModel.set("visMode", VIS_MODE_WAITING);
-
-        $("#getDataButton").on("click", function () {
-          $.get("/api/v3/dummyButton?button=getDataButton");
-          setTimeout(function () {
-            alert("coming soon!");
-          });
-        });
 
         $("#closeConversationButton").on("click", function () {
           $.post("/api/v3/conversation/close", {

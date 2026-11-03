@@ -17,8 +17,8 @@ const shouldUseTranslationAPI: boolean = isTrue(
 // router, which is the only position from which it can see errors handed to
 // `next(err)` by a route (Express 3 walks the app stack forward only).
 // Default OFF: turning it on changes served bytes on every error that reaches
-// finalhandler today (status, Content-Type and body all change) — see
-// cost-reduction/04-plans/P-038-global-error-handler-notes.md. The flag exists
+// finalhandler today (status, Content-Type and body all change; app.ts,
+// where the handler is mounted, lists which paths change). The flag exists
 // so the characterization harness can re-record the difference before anyone
 // decides to adopt it.
 const reachableErrorHandler: boolean = isTrue(
@@ -30,6 +30,12 @@ import("source-map-support").then((sourceMapSupport) => {
 });
 
 export default {
+  // Delphi readers remain on DynamoDB unless explicitly selected. Keep these
+  // reads at the shared configuration boundary, including test-time selection.
+  get delphiResultBackend(): string | undefined { return process.env.DELPHI_RESULT_BACKEND; },
+  get delphiResultEnv(): string | undefined { return process.env.DELPHI_RESULT_ENV; },
+  get delphiResultScope(): string | undefined { return process.env.DELPHI_RESULT_SCOPE; },
+  get delphiWriterCodeSha(): string | undefined { return process.env.DELPHI_WRITER_CODE_SHA; },
   domainOverride,
   isDevMode: devMode,
   reachableErrorHandler,
@@ -84,11 +90,9 @@ export default {
   },
 
   adminEmailDataExport: process.env.ADMIN_EMAIL_DATA_EXPORT as string,
-  adminEmailDataExportTest: process.env.ADMIN_EMAIL_DATA_EXPORT_TEST as string,
   adminEmailEmailTest: process.env.ADMIN_EMAIL_EMAIL_TEST as string,
   adminEmails: process.env.ADMIN_EMAILS || "[]",
   adminUIDs: process.env.ADMIN_UIDS || "[]",
-  akismetAntispamApiKey: process.env.AKISMET_ANTISPAM_API_KEY || null,
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
   applicationName: process.env.APPLICATION_NAME || null,
   authAudience: process.env.AUTH_AUDIENCE || null,
@@ -99,12 +103,9 @@ export default {
     process.env.AUTH_CLIENT_SECRET || process.env.AUTH0_CLIENT_SECRET || null,
   authIssuer: process.env.AUTH_ISSUER || null,
   authNamespace: process.env.AUTH_NAMESPACE || null,
-  awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID || ("local" as string),
+  awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
   awsRegion: process.env.AWS_REGION || ("local" as string),
-  awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ("local" as string),
-  backfillCommentLangDetection: isTrue(
-    process.env.BACKFILL_COMMENT_LANG_DETECTION
-  ),
+  awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   cacheMathResults: isTrueOrBlank(process.env.CACHE_MATH_RESULTS),
   databaseSSL: isTrue(process.env.DATABASE_SSL),
   databaseURL: process.env.DATABASE_URL as string,
@@ -119,8 +120,6 @@ export default {
     process.env.LOGIN_CODE_PEPPER ||
     process.env.ENCRYPTION_PASSWORD_00001 ||
     "polis_treevite_pepper",
-  mailgunApiKey: process.env.MAILGUN_API_KEY || null,
-  mailgunDomain: process.env.MAILGUN_DOMAIN || null,
   maxReportCacheDuration: parseInt(
     process.env.MAX_REPORT_CACHE_DURATION || "3600000",
     10
@@ -129,6 +128,26 @@ export default {
   nodeEnv: process.env.NODE_ENV as string,
   isTesting: isTrue(process.env.TESTING),
   openaiApiKey: process.env.OPENAI_API_KEY || null,
+  // Protected operations pages (/api/v3/ops/*, /ops in the admin console).
+  // Off unless OPS_ENABLED=true; see docs/configuration.md.
+  opsEnabled: isTrue(process.env.OPS_ENABLED),
+  opsEmailDomains: process.env.OPS_EMAIL_DOMAINS || "",
+  // Conversations need at least this many distinct voters in the window before
+  // the ops pages show their topic, Delphi topic names or statement text.
+  // Raw string; parsed (default 20) by src/ops/textThreshold.ts.
+  opsMinVotersForText: process.env.OPS_MIN_VOTERS_FOR_TEXT || "",
+  // "aws": the ops system pages read CloudWatch, Auto Scaling and CodeDeploy
+  // with the instance role. Anything else (the default): those panels are
+  // left out and nothing is requested from AWS.
+  opsDataSource: process.env.OPS_DATA_SOURCE || "",
+  // Cost Explorer for the ops cost page (each request is billed $0.01). Off
+  // unless set; read only when OPS_DATA_SOURCE=aws.
+  opsCostExplorer: isTrue(process.env.OPS_COST_EXPLORER),
+  // Ops "Where from" page: Simple Analytics Stats API key and the site name
+  // the three web apps report under. Key unset: the page says so and reads
+  // nothing.
+  simpleAnalyticsApiKey: process.env.SIMPLE_ANALYTICS_API_KEY || "",
+  simpleAnalyticsHostname: process.env.SIMPLE_ANALYTICS_HOSTNAME || "pol.is",
   polisFromAddress: process.env.POLIS_FROM_ADDRESS as string,
   polisJwtIssuer: process.env.POLIS_JWT_ISSUER || "https://pol.is/",
   polisJwtAudience: process.env.POLIS_JWT_AUDIENCE || "participants",
@@ -141,7 +160,42 @@ export default {
     isTrue(process.env.POLIS_QUEUE_SUBSTRATE_ENABLED),
   readOnlyDatabaseURL:
     process.env.READ_ONLY_DATABASE_URL || (process.env.DATABASE_URL as string),
-  runPeriodicExportTests: isTrue(process.env.RUN_PERIODIC_EXPORT_TESTS),
+  // The participation pools (db/pg-query.ts): votes, comments, the next
+  // statement and participationInit, and nothing else. See
+  // docs/configuration.md "Connection budget".
+  // Their sizes; unset, each is sized like the read-write and read pools.
+  participationPoolMax: poolSizeFromEnv("PARTICIPATION_POOL_MAX"),
+  participationReadPoolMax: poolSizeFromEnv("PARTICIPATION_READ_POOL_MAX"),
+  // How long a participation query waits for one of their connections (ms).
+  // Far beyond any wait that participation work alone can cause, so it never
+  // refuses a vote under load; it only surfaces a database that has stopped
+  // answering. 0 waits without limit.
+  participationAcquireTimeoutMs: millisecondsFromEnv(
+    "PARTICIPATION_ACQUIRE_TIMEOUT_MS",
+    60000
+  ),
+  // Reports, data exports and heavy admin reads run on a small dedicated pool
+  // (db/pg-query.ts) so they can never take the connections the participation
+  // path needs. See docs/configuration.md "Connection budget".
+  // One at a time by default: further exports wait for the acquire timeout.
+  reportExportPoolMax: parseInt(
+    process.env.REPORT_EXPORT_POOL_MAX || "1",
+    10
+  ),
+  // How long a report/export waits for one of those connections before it is
+  // rejected (ms). It degrades itself here rather than waiting on, or spilling
+  // into, the participation pools.
+  reportExportAcquireTimeoutMs: parseInt(
+    process.env.REPORT_EXPORT_ACQUIRE_TIMEOUT_MS || "30000",
+    10
+  ),
+  // Per-statement cap on that pool (ms). Generous by default so today's largest
+  // exports still succeed; streamed exports read their cursor in small batches,
+  // so this bounds a single runaway statement, not a long stream.
+  reportExportStatementTimeoutMs: parseInt(
+    process.env.REPORT_EXPORT_STATEMENT_TIMEOUT_MS || "300000",
+    10
+  ),
   shouldUseTranslationAPI: setGoogleApplicationCredentials(),
   staticFilesAdminPort: parseInt(
     process.env.STATIC_FILES_ADMIN_PORT ||
@@ -191,9 +245,35 @@ export default {
 
   // Deprecated
   encryptionPassword: process.env.ENCRYPTION_PASSWORD_00001 as string,
-  webserverPass: process.env.WEBSERVER_PASS as string,
-  webserverUsername: process.env.WEBSERVER_USERNAME as string,
 };
+
+// A whole number of milliseconds from the environment, or `fallback` when the
+// variable is unset or blank. Anything else stops the server at startup, so a
+// mistyped bound can never silently leave a pool unbounded.
+function millisecondsFromEnv(name: string, fallback: number): number {
+  const raw = (process.env[name] ?? "").trim();
+  if (raw === "") return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `${name} must be a whole number of milliseconds (0 turns it off); got '${raw}'`
+    );
+  }
+  return parseInt(raw, 10);
+}
+
+// A pool size from the environment, or undefined when the variable is unset or
+// blank, so the pool takes its default size. Anything but a whole number of at
+// least 1 stops the server at startup.
+function poolSizeFromEnv(name: string): number | undefined {
+  const raw = (process.env[name] ?? "").trim();
+  if (raw === "") return undefined;
+  if (!/^\d+$/.test(raw) || parseInt(raw, 10) < 1) {
+    throw new Error(
+      `${name} must be a whole number of at least 1; got '${raw}'`
+    );
+  }
+  return parseInt(raw, 10);
+}
 
 // Use this function when a value should default to true if not set.
 function isTrueOrBlank(val: string | boolean | undefined): boolean {

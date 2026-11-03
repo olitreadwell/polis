@@ -2,7 +2,7 @@
  * P-022 §E — disposable EC2 worker for the **public battery** recovery matrix and
  * the **public-fixture** replay battery.
  *
- * ## Scope, after the second reviewer's #2715 review (round 2)
+ * ## Scope, after the PR #2715 review (round 2)
  *
  * This is NOT private certification and must never be described as one. Round 1
  * attached the private fixture-bundle role to a box that GitHub could open a
@@ -19,8 +19,8 @@
  * Private certification (baked trusted AMI, cloud-init disabled, isolated
  * account/VPC, endpoint-only egress, autonomous worker publishing a signed
  * fixed-schema summary that GitHub reads but cannot influence) remains
- * UNIMPLEMENTED. See cost-reduction/04-plans/P-022-E-ci-spec.md and the round-2
- * section of P-022-E-implementation-notes.md.
+ * UNIMPLEMENTED; its design is kept outside this repository. docs/ci-ec2.md
+ * describes what this public stage does and does not do.
  *
  * ## Gate
  *
@@ -44,7 +44,7 @@
  *      and a hard deadline armed as the first user-data action.
  *   4. Operator reconciliation and termination for a dead boot or wedged kernel.
  *      The on-box timer cannot cover those failures; see docs/ci-ec2.md.
- *      No Lambda or scheduled sweeper is provisioned (BOARD [1007]).
+ *      No Lambda or scheduled sweeper is provisioned.
  */
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';

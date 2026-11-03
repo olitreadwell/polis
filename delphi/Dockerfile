@@ -1,5 +1,28 @@
+# ---- Stage 0: polis-jobs, the queue worker daemon (queue-rs) ----
+# Built from the named build context `queue-rs` (the repository's queue-rs/
+# directory): compose passes it as additional_contexts; a plain build passes
+#   docker build --build-context queue-rs=queue-rs delphi
+# Built on Debian 12 so the binary also runs on an older cached
+# python:3.12-slim (Debian 12); glibc is forward compatible to Debian 13.
+# The toolchain matches queue-rs/rust-toolchain.toml (1.98.1).
+FROM docker.io/library/rust:1.98.1-slim-bookworm AS polis-jobs
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates=20250419~deb12u2 \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY --from=queue-rs . .
+RUN --mount=type=cache,target=/src/target,id=delphi-polis-jobs-target \
+    cargo build --release --locked --bin polis-jobs \
+ && cp target/release/polis-jobs /polis-jobs \
+ && /polis-jobs --version
+
 # ---- Stage 1: Builder ----
-  FROM python:3.12-slim AS builder
+  FROM python:3.12-slim-trixie AS trust
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates=20250419+deb13u1 \
+ && rm -rf /var/lib/apt/lists/*
+
+  FROM trust AS builder
 
   # Define a build argument to signal if we should install CPU-specific torch
   ARG USE_CPU_TORCH=false
@@ -12,7 +35,7 @@
   # Install uv for faster package installation (~2x faster than pip)
   # Placed in /opt/uv (not /usr/local/bin) to avoid leaking into the final/prod image
   # via the blanket COPY --from=builder /usr/local/bin in Stage 2.
-  COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /opt/uv/uv
+  COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /opt/uv/uv
   ENV PATH="/opt/uv:$PATH"
 
   RUN apt-get update && \
@@ -72,7 +95,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       (ls -lhR /usr/local/lib/python3.12/site-packages/torch/lib/*cuda* || echo "No CUDA libs in torch/lib.")
 
 # ---- Stage 2: Final ----
-FROM python:3.12-slim AS final
+FROM trust AS final
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -84,11 +107,23 @@ RUN apt-get update && \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# The job daemon verifies the Postgres server with this pinned public RDS CA
+# (POLIS_JOBS_CA_FILE), the same bundle and checksum as the server image.
+RUN mkdir -p /etc/polis \
+ && curl --fail --location --proto '=https' --tlsv1.2 -o /etc/polis/rds-ca.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+ && echo '90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b  /etc/polis/rds-ca.pem' | sha256sum -c -
+
 WORKDIR /app
 
 # Copy installed packages from builder stage
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# The queue worker daemon. polis-jobs.service on a worker box runs this image
+# with the command `polis-jobs` (cdk/launchTemplates.ts); every other service
+# keeps the CMD below and never starts it. It exits 0 at once unless
+# POLIS_JOBS_ENABLED=1.
+COPY --from=polis-jobs /polis-jobs /usr/local/bin/polis-jobs
 
 # Copy source code from builder stage (already built into the package)
 COPY --from=builder /app/polismath/ ./polismath/
@@ -103,7 +138,17 @@ EXPOSE 8080
 # Make scripts executable
 RUN chmod +x run_delphi.py scripts/setup_ollama.sh
 
+# The un-flip rehearsal's one-shot rebuild of listed conversations under a
+# non-served label (P-078 PR-H): polismath/tools/engine_rebuild.py.
+RUN install -d /opt/polis-unflip && \
+    install -m 0755 scripts/engine-rebuild /opt/polis-unflip/engine-rebuild
+
+# The Datadog tracer (the ddtrace package stays installed) wraps the job poller
+# only when DD_TRACE_ENABLED=true. With no Datadog agent listening, ddtrace-run
+# logs a failed-send error and traceback for every flush, which buried the
+# poller's own output; tracing is therefore off unless explicitly enabled.
 CMD ["bash", "-c", "\
+  if [ \"${DELPHI_RESULT_BACKEND}\" = \"postgres\" ]; then export POLIS_JOBS_ENABLED=1; exec polis-jobs; fi; \
   echo 'Ensuring DynamoDB tables are set up (runs in all environments)...'; \
   python create_dynamodb_tables.py --region ${AWS_REGION} && \
   echo 'DynamoDB table setup script finished.'; \
@@ -116,11 +161,11 @@ CMD ["bash", "-c", "\
     python scripts/job_poller.py --interval=2; \
   else \
     echo 'DYNAMODB_ENDPOINT is not set, assuming production-like environment. Skipping local setup scripts.'; \
-    if [ \"${AWS_REGION}\" = \"us-east-1\" ]; then \
-      echo 'Starting job poller WITH ddtrace in us-east-1...' && \
+    if [ \"${DD_TRACE_ENABLED}\" = \"true\" ]; then \
+      echo 'DD_TRACE_ENABLED=true: starting job poller WITH ddtrace...' && \
       ddtrace-run python scripts/job_poller.py --interval=2 --region ${AWS_REGION}; \
     else \
-      echo 'Starting job poller WITHOUT ddtrace in other regions...' && \
+      echo 'Starting job poller WITHOUT ddtrace (set DD_TRACE_ENABLED=true to trace)...' && \
       python scripts/job_poller.py --interval=2 --region ${AWS_REGION}; \
     fi; \
   fi \

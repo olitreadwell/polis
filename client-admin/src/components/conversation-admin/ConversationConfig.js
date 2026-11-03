@@ -4,7 +4,7 @@ import { Heading, Box, Text } from 'theme-ui'
 import { useCallback, useRef } from 'react'
 import { useDispatch } from 'react-redux'
 import { useAuth } from 'react-oidc-context'
-import emoji from 'react-easy-emoji'
+import emoji from '../../util/emoji'
 
 import { CheckboxField } from './CheckboxField'
 import { useConversationData } from '../../util/conversation_data'
@@ -165,10 +165,10 @@ const ConversationConfig = () => {
         are managed in waves.
       </CheckboxField>
 
-      <CheckboxField field="importance_enabled" label="Importance Enabled">
-        [EXPERIMENTAL FEATURE] Participants can see the &quot;This comment is important&quot;
-        checkbox
-      </CheckboxField>
+      <Text sx={{ display: 'block', mb: [3] }}>
+        Participants always see the &quot;This comment is important&quot; checkbox; importance is
+        always collected.
+      </Text>
 
       {hasDelphiEnabled(authUser) && (
         <CheckboxField field="topics_enabled" label="Topics Enabled">

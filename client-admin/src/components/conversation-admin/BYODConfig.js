@@ -1,3 +1,4 @@
+import { importErrorMessage } from '../../util/importError'
 // Copyright (C) 2012-present, The Authors. This program is free software: you can redistribute it and/or  modify it under the terms of the GNU Affero General Public License, version 3, as published by the Free Software Foundation. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { Heading, Box, Text, Button } from 'theme-ui'
@@ -46,7 +47,7 @@ const BYODConfig = () => {
           setCsvText(undefined)
           setImportSuccessful(true)
         },
-        (err) => setVoteSubmissionError(err?.message)
+        (err) => setVoteSubmissionError(importErrorMessage(err))
       )
       .finally(() => setVoteSubmissionLoading(false))
   }
@@ -121,6 +122,14 @@ const BYODConfig = () => {
                   </code>
                 </pre>
                 vote_value MUST follow the pattern: 1 = agree, -1 = disagree, 0 = neutral/pass
+                <br />
+                Optionally, the file may declare this sign on a{' '}
+                <code># vote-convention:</code> first line before the header; a file that declares
+                any other sign is refused. See{' '}
+                <a href="https://github.com/compdemocracy/polis/blob/edge/docs/export-format.md">
+                  docs/export-format.md
+                </a>
+                .
                 <br />
               </>
               <Box sx={{ mt: 2, display: 'block' }}>

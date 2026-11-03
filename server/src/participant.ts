@@ -151,27 +151,64 @@ function tryToJoinConversation(
   });
 }
 
-async function addParticipant(zid: number, uid?: number): Promise<any> {
-  logger.debug("addParticipant starting", { zid, uid });
+// Before migration 000044, the pid_auto trigger took the conversation's
+// participant lock as a SESSION advisory lock, and pid_auto_unlock gave it back
+// only after an INSERT that succeeded (server/postgres/migrations). A
+// participants INSERT that failed after taking it (a lost pid race, an existing
+// (zid, uid), a lock timeout) left the lock on its connection, and ROLLBACK did
+// not release it. So a connection that saw any error here is closed instead of
+// being returned to the pool: the lock ends with its session, rather than
+// making every later joiner of the conversation wait on it. Since 000044 the
+// lock is held to COMMIT or ROLLBACK and never outlives the transaction;
+// closing the connection is kept for a database without 000044.
+//
+// Every lock wait in the transaction is bounded, so a lock held elsewhere (a
+// server still running code that leaks it, for example) answers the joiner
+// with an error instead of holding a read-write connection indefinitely.
+const PARTICIPANT_INSERT_LOCK_TIMEOUT = "5s";
+// SQLSTATE raised when lock_timeout expires.
+const LOCK_NOT_AVAILABLE = "55P03";
 
+// extendedRow: false creates the participants row alone, without the
+// participants_extended row a join through votes, comments or participationInit
+// creates: what an invite accept (src/invites/treevites.ts) has always created.
+type ParticipantInsertOptions = { extendedRow?: boolean };
+
+async function insertParticipant(
+  zid: number,
+  uid?: number,
+  { extendedRow = true }: ParticipantInsertOptions = {}
+): Promise<any> {
   // Use a dedicated client (not pool-level queries) so all statements in the
   // transaction run on the same connection. Without this, pg.query() grabs a
   // random connection from the pool for each call, breaking transaction
   // isolation under concurrent load. See: concurrent-same-participant.test.ts.
   const client = await pg.connect();
+  // Set when any statement on this connection failed; release(true) then
+  // closes the connection instead of pooling it.
+  let discard = false;
   try {
     await client.query("BEGIN");
-
-    // First insert into participants_extended (ignore duplicates)
     await client.query(
-      "INSERT INTO participants_extended (zid, uid) VALUES ($1, $2) ON CONFLICT (zid, uid) DO NOTHING;",
-      [zid, uid]
+      `SET LOCAL lock_timeout = '${PARTICIPANT_INSERT_LOCK_TIMEOUT}';`
     );
-    logger.debug("participants_extended insert/skip successful", { zid, uid });
+
+    if (extendedRow) {
+      // First insert into participants_extended (ignore duplicates)
+      await client.query(
+        "INSERT INTO participants_extended (zid, uid) VALUES ($1, $2) ON CONFLICT (zid, uid) DO NOTHING;",
+        [zid, uid]
+      );
+      logger.debug("participants_extended insert/skip successful", {
+        zid,
+        uid,
+      });
+    }
 
     // Second insert into participants table.
-    // The pid_auto trigger acquires an advisory lock and assigns pid = MAX(pid)+1.
-    // The pid_auto_unlock trigger releases the lock after insert.
+    // The pid_auto trigger acquires the conversation's participant lock and
+    // assigns pid = MAX(pid)+1; since migration 000044 the lock is held until
+    // this transaction commits or rolls back.
     try {
       const partResult = await client.query(
         "INSERT INTO participants (pid, zid, uid, created) VALUES (NULL, $1, $2, default) RETURNING *;",
@@ -185,15 +222,17 @@ async function addParticipant(zid: number, uid?: number): Promise<any> {
       });
       return partResult.rows;
     } catch (partErr: any) {
+      discard = true;
       await client.query("ROLLBACK");
       if (partErr.code === "23505") {
         // Duplicate key — participant was created by a concurrent request.
         // Fetch and return the existing record. This runs after ROLLBACK,
         // on the same client connection, so isolation is correct.
-        logger.debug(
-          "Participant already exists, fetching existing record",
-          { zid, uid, constraint: partErr.constraint }
-        );
+        logger.debug("Participant already exists, fetching existing record", {
+          zid,
+          uid,
+          constraint: partErr.constraint,
+        });
         const selectResult = await client.query(
           "SELECT * FROM participants WHERE zid = $1 AND uid = $2;",
           [zid, uid]
@@ -206,7 +245,7 @@ async function addParticipant(zid: number, uid?: number): Promise<any> {
           });
           return selectResult.rows;
         }
-        // Concurrent transaction may not have committed yet — let caller retry
+        // No row for this uid: another joiner was given the same pid.
         throw partErr;
       }
       logger.error("participants insert failed", {
@@ -219,6 +258,7 @@ async function addParticipant(zid: number, uid?: number): Promise<any> {
       throw partErr;
     }
   } catch (err) {
+    discard = true;
     // Ensure rollback on any unexpected error
     try {
       await client.query("ROLLBACK");
@@ -227,7 +267,33 @@ async function addParticipant(zid: number, uid?: number): Promise<any> {
     }
     throw err;
   } finally {
-    client.release();
+    client.release(discard);
+  }
+}
+
+async function addParticipant(
+  zid: number,
+  uid?: number,
+  options: ParticipantInsertOptions = {}
+): Promise<any> {
+  logger.debug("addParticipant starting", { zid, uid });
+  try {
+    return await insertParticipant(zid, uid, options);
+  } catch (err: any) {
+    if (err?.code !== "23505") {
+      throw err;
+    }
+    // Another joiner was given the same pid: before migration 000044, pid_auto
+    // could compute MAX(pid) + 1 before that joiner's row was committed. It is
+    // committed by the time this INSERT fails, so one more attempt, on a new
+    // connection, gets the next pid. With 000044 the lock is held to commit and
+    // this does not happen; the retry is kept for a database without it.
+    logger.info("participant pid collision; retrying once", {
+      zid,
+      uid,
+      constraint: err.constraint,
+    });
+    return insertParticipant(zid, uid, options);
   }
 }
 
@@ -241,6 +307,15 @@ function joinConversation(
     return tryToJoinConversation(zid, uid, info, pmaid_answers);
   }
 
+  function retryJoin(err: any) {
+    // A lock timeout means the conversation's participant lock is held
+    // elsewhere; another attempt would only wait out the same timeout again.
+    if (err?.code === LOCK_NOT_AVAILABLE) {
+      throw err;
+    }
+    return tryJoin();
+  }
+
   function doJoin() {
     // retry up to 10 times
     // NOTE: Shouldn't be needed, since we have an advisory lock in the insert trigger.
@@ -248,15 +323,15 @@ function joinConversation(
     //       Doing this retry in JS for now since it's quick and easy, rather than try to
     //       figure what's wrong with the postgres locks.
     const promise = tryJoin()
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin)
-      .catch(tryJoin);
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin)
+      .catch(retryJoin);
     return promise;
   }
 
@@ -268,6 +343,14 @@ function joinConversation(
       return doJoin();
     }
   }, doJoin);
+}
+
+// The referrer is the URL of the page that sent the request. For an embedded
+// conversation that is the iframe's own URL, whose query string carries the
+// participant's xid and whatever else the embedding page appended. Only the
+// origin and path are stored; the query string and fragment are dropped.
+function referrerWithoutQuery(referrer: string): string {
+  return referrer.split(/[?#]/, 1)[0];
 }
 
 function addParticipantAndMetadata(
@@ -285,7 +368,7 @@ function addParticipantAndMetadata(
     info.parent_url = parent_url;
   }
   if (referer) {
-    info.referrer = referer;
+    info.referrer = referrerWithoutQuery(referer);
   }
 
   // These fields only exist on the PolisWebServer deployment.
@@ -336,7 +419,7 @@ function getSocialParticipants(
 
   const q =
     "with " +
-    "p as (select uid, pid, mod from participants where zid = ($1) and vote_count >= 1), " +
+    "p as (select uid, pid, mod from participants p0 where zid = ($1) and EXISTS (SELECT 1 FROM votes v WHERE v.zid=p0.zid AND v.pid=p0.pid)), " +
     "xids_subset as (select * from xids where owner in (select org_id from conversations where zid = ($1)) and x_profile_image_url is not null), " +
     "xid_ptpts as (select p.uid, 100 as priority from p inner join xids_subset on xids_subset.uid = p.uid where p.mod >= ($4)), " +
     "self as (select CAST($2 as INTEGER) as uid, 1000 as priority), " +
@@ -383,42 +466,11 @@ function getSocialParticipants(
     });
 }
 
-async function getParticipantByPermanentCookie(
-  zid: number,
-  permanentCookie: string
-): Promise<{ uid: number; pid: number } | null> {
-  return new Promise((resolve) => {
-    pg.query(
-      `SELECT pe.uid, p.pid 
-       FROM participants_extended pe
-       INNER JOIN participants p ON pe.uid = p.uid AND pe.zid = p.zid
-       WHERE pe.zid = $1 AND pe.permanent_cookie = $2`,
-      [zid, permanentCookie],
-      (err: any, results: { rows: any[] }) => {
-        if (err) {
-          logger.error("Error looking up participant by permanent cookie", err);
-          resolve(null);
-          return;
-        }
-
-        if (results && results.rows && results.rows.length > 0) {
-          resolve({
-            uid: results.rows[0].uid,
-            pid: results.rows[0].pid,
-          });
-        } else {
-          resolve(null);
-        }
-      }
-    );
-  });
-}
-
 export {
   addExtendedParticipantInfo,
   addParticipant,
   addParticipantAndMetadata,
-  getParticipantByPermanentCookie,
   getSocialParticipants,
   joinConversation,
+  referrerWithoutQuery,
 };

@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 import boto3
+from polismath.delphi_storage.resource import result_resource
 import logging
 import traceback
 from decimal import Decimal
@@ -37,8 +38,8 @@ DB_CONFIG = {
 DYNAMODB_CONFIG = {
     'endpoint_url': os.environ.get('DYNAMODB_ENDPOINT'),
     'region': os.environ.get('AWS_REGION', 'us-east-1'),
-    'access_key': os.environ.get('AWS_ACCESS_KEY_ID', None),
-    'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY', None)
+    'access_key': os.environ.get('AWS_ACCESS_KEY_ID') or None,
+    'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY') or None
 }
 
 # Visualization settings - controls the extremity scale and color mapping
@@ -68,7 +69,7 @@ except ImportError:
             else:
                 self.endpoint_url = None
             self.region = DYNAMODB_CONFIG['region']
-            self.dynamodb = boto3.resource('dynamodb', 
+            self.dynamodb = result_resource('dynamodb', 
                                           endpoint_url=self.endpoint_url, 
                                           region_name=self.region,
                                           aws_access_key_id=DYNAMODB_CONFIG['access_key'],
@@ -108,11 +109,11 @@ def load_data_from_dynamodb(zid, layer_num=0):
     
     # Set up DynamoDB client
     endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
-    dynamodb = boto3.resource('dynamodb', 
+    dynamodb = result_resource('dynamodb', 
                              endpoint_url=endpoint_url,
                              region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-                             aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', 'fakeMyKeyId'),
-                             aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', 'fakeSecretAccessKey'))
+                             aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID') or None,
+                             aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY') or None)
     
     # Results dictionary
     data = {

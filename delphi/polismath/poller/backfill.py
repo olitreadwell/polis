@@ -50,7 +50,7 @@ estimate includes the vote-history rows, and a large job holds an exclusive
 reservation, so live work that arrives while it runs waits for it rather than
 computing beside it. Refusals never truncate input and never count as done.
 
-Operator controls (see cost-reduction/04-plans/P-070-math-backfill.md): the
+Operator controls: the
 MATH_BACKFILL_* environment (read at start), SIGUSR1 to approve the gate after
 the first N publications, SIGUSR2 to pause or resume. The gate approval is
 bound to the calibration settings (memory model, budget, size rules): a change
@@ -85,6 +85,63 @@ from polismath.poller.admission import (  # noqa: F401 - re-exported
 )
 
 logger = logging.getLogger(__name__)
+
+
+# SQLSTATE -> fixed label. A driver's message can echo bound values or SQL
+# (PostgreSQL 22P02 prints the rejected input), so a brief never carries
+# exception text: only a validated SQLSTATE and a label from these tables.
+_SQLSTATE_LABELS = {
+    "57014": "statement_timeout",
+    "42883": "undefined_function",
+    "22P02": "invalid_text_representation",
+    "22003": "numeric_value_out_of_range",
+    "22P05": "untranslatable_character",
+    "40P01": "deadlock_detected",
+    "40001": "serialization_failure",
+    "55P03": "lock_not_available",
+    "57P01": "admin_shutdown",
+    "42501": "insufficient_privilege",
+}
+_SQLSTATE_CLASS_LABELS = {
+    "08": "connection_exception",
+    "53": "insufficient_resources",
+}
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+
+
+def _sqlstate(exc: BaseException) -> Optional[str]:
+    """The validated SQLSTATE of ``exc`` or its wrapped driver error, if any."""
+    for source in (getattr(exc, "orig", None), exc):
+        if source is None:
+            continue
+        diag = getattr(source, "diag", None)
+        for code in (getattr(source, "pgcode", None), getattr(diag, "sqlstate", None)):
+            if isinstance(code, str) and _SQLSTATE_RE.fullmatch(code):
+                return code
+    return None
+
+
+def _exc_brief(exc: BaseException) -> str:
+    """A fixed, allowlisted label for a log line; never exception text.
+
+    With a SQLSTATE: ``sqlstate=<code> <label>`` (label ``other`` when the
+    code and its class are not listed). Without one: the class names of the
+    exception and its causes (``OperationalError/OSError``, at most three)."""
+    code = _sqlstate(exc)
+    if code is not None:
+        label = (_SQLSTATE_LABELS.get(code)
+                 or _SQLSTATE_CLASS_LABELS.get(code[:2])
+                 or "other")
+        return f"sqlstate={code} {label}"
+    names: List[str] = []
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen and len(names) < 3:
+        seen.add(id(current))
+        names.append(current.__class__.__name__)
+        current = current.__cause__ or current.__context__
+    return "/".join(names)
+
 
 _MB = 1024 * 1024
 
@@ -337,7 +394,7 @@ class PeakSampler:
 # bidToPid by that position); in-conv never exceeds n; and n = 0 only in
 # Python's named empty form (no base clusters, groups or in-conv members, a
 # zero timestamp and empty participant stats). Types and bindings only: no
-# numeric acceptance policy. Review [1447] B extended it to the nested shapes
+# numeric acceptance policy. The shape checks cover the nested structures
 # the readers index: every group-clusters entry an object with a numeric id and
 # a numeric members array (the server's processMathObject reads g.id); pca
 # center a numeric array and comps an array of numeric arrays; base-clusters
@@ -346,7 +403,7 @@ class PeakSampler:
 # either {} or columnar (pid and gid arrays, every column an array of the pid
 # column's length); and both companions' lastVoteTimestamp equal to main's
 # last_vote_timestamp column (the writer stamps all three from one value).
-# Review [1449] B completed it from the readers' side: the server's
+# Reader requirements also apply: the server's
 # processMathObject dereferences every group-votes and repness entry, and the
 # Python warm restore iterates each group-votes entry's votes, so group-votes
 # must be an object whose every entry is an object with numeric n-members and
@@ -356,71 +413,78 @@ class PeakSampler:
 # Every cast, array length and set-returning call is guarded, so a malformed
 # payload evaluates to false instead of raising. The shipped verification SQL
 # contains this exact text (a test holds them together).
+# Every payload reference is cast (m.data::jsonb): the migrations declare the
+# data columns jsonb, but production's math tables carry them as json, which
+# has no jsonb_typeof, jsonb_array_length, jsonb_each, ?& or = (the backfill's
+# first production step failed on exactly that). The cast is a no-op on jsonb.
+# Each payload is cast once per row, not once per reference: on json every
+# cast re-parses the text, and a page holding a 14.7 MB math_main payload ran
+# past the 120 s statement timeout. The scalar subquery binds md, bd and pd
+# once; OFFSET 0 keeps the planner from inlining the casts back into every
+# reference; and its WHERE holds the structural checks, so an incomplete or
+# uninitialized bundle is not parsed at all. Same truth table: a structural
+# failure yields no row, which COALESCE turns into false as before.
 VALID_BUNDLE_SQL = """COALESCE((
-    m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
-    AND m.math_tick >= 0 AND b.math_tick = m.math_tick
-    AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
-    AND m.last_vote_timestamp IS NOT NULL
-    AND jsonb_typeof(m.data) = 'object'
-    AND CASE WHEN jsonb_typeof(m.data->'zid') = 'number'
-             THEN (m.data->>'zid')::numeric = m.zid ELSE false END
-    AND CASE WHEN jsonb_typeof(m.data->'lastVoteTimestamp') = 'number'
-             THEN (m.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+    SELECT jsonb_typeof(md) = 'object'
+    AND CASE WHEN jsonb_typeof(md->'zid') = 'number'
+             THEN (md->>'zid')::numeric = m.zid ELSE false END
+    AND CASE WHEN jsonb_typeof(md->'lastVoteTimestamp') = 'number'
+             THEN (md->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
              ELSE false END
-    AND jsonb_typeof(m.data->'tids') = 'array'
-    AND jsonb_typeof(m.data->'pca') = 'object'
-    AND jsonb_typeof(m.data->'repness') = 'object'
-    AND jsonb_typeof(b.data) = 'object'
-    AND CASE WHEN jsonb_typeof(b.data->'zid') = 'number'
-             THEN (b.data->>'zid')::numeric = b.zid ELSE false END
-    AND CASE WHEN jsonb_typeof(b.data->'lastVoteTimestamp') = 'number'
-             THEN (b.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+    AND jsonb_typeof(md->'tids') = 'array'
+    AND jsonb_typeof(md->'pca') = 'object'
+    AND jsonb_typeof(md->'repness') = 'object'
+    AND jsonb_typeof(bd) = 'object'
+    AND CASE WHEN jsonb_typeof(bd->'zid') = 'number'
+             THEN (bd->>'zid')::numeric = b.zid ELSE false END
+    AND CASE WHEN jsonb_typeof(bd->'lastVoteTimestamp') = 'number'
+             THEN (bd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
              ELSE false END
-    AND jsonb_typeof(p.data) = 'object'
-    AND CASE WHEN jsonb_typeof(p.data->'zid') = 'number'
-             THEN (p.data->>'zid')::numeric = p.zid ELSE false END
-    AND CASE WHEN jsonb_typeof(p.data->'lastVoteTimestamp') = 'number'
-             THEN (p.data->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
+    AND jsonb_typeof(pd) = 'object'
+    AND CASE WHEN jsonb_typeof(pd->'zid') = 'number'
+             THEN (pd->>'zid')::numeric = p.zid ELSE false END
+    AND CASE WHEN jsonb_typeof(pd->'lastVoteTimestamp') = 'number'
+             THEN (pd->>'lastVoteTimestamp')::numeric = m.last_vote_timestamp
              ELSE false END
-    AND CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-         THEN p.data->'ptptstats' = '{}'::jsonb
-              OR (jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                  AND jsonb_typeof(p.data->'ptptstats'->'gid') = 'array'
+    AND CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+         THEN pd->'ptptstats' = '{}'::jsonb
+              OR (jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                  AND jsonb_typeof(pd->'ptptstats'->'gid') = 'array'
                   AND NOT EXISTS (
-                      SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(p.data->'ptptstats') = 'object'
-                                                    THEN p.data->'ptptstats' ELSE '{}'::jsonb END) e
+                      SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(pd->'ptptstats') = 'object'
+                                                    THEN pd->'ptptstats' ELSE '{}'::jsonb END) e
                       WHERE (CASE WHEN jsonb_typeof(e.value) = 'array'
                                   THEN jsonb_array_length(e.value) END)
                             IS DISTINCT FROM
-                            (CASE WHEN jsonb_typeof(p.data->'ptptstats'->'pid') = 'array'
-                                  THEN jsonb_array_length(p.data->'ptptstats'->'pid') END)))
+                            (CASE WHEN jsonb_typeof(pd->'ptptstats'->'pid') = 'array'
+                                  THEN jsonb_array_length(pd->'ptptstats'->'pid') END)))
          ELSE false END
-    AND jsonb_typeof(m.data->'pca'->'center') = 'array'
-    AND jsonb_typeof(m.data->'pca'->'comps') = 'array'
+    AND jsonb_typeof(md->'pca'->'center') = 'array'
+    AND jsonb_typeof(md->'pca'->'comps') = 'array'
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'center') = 'array'
-                                                THEN m.data->'pca'->'center' ELSE '[]'::jsonb END) x
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'center') = 'array'
+                                                THEN md->'pca'->'center' ELSE '[]'::jsonb END) x
         WHERE jsonb_typeof(x) <> 'number')
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'pca'->'comps') = 'array'
-                                                THEN m.data->'pca'->'comps' ELSE '[]'::jsonb END) c
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'pca'->'comps') = 'array'
+                                                THEN md->'pca'->'comps' ELSE '[]'::jsonb END) c
         WHERE jsonb_typeof(c) <> 'array'
            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                               THEN c ELSE '[]'::jsonb END) x
                       WHERE jsonb_typeof(x) <> 'number'))
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'group-clusters') = 'array'
-                                                THEN m.data->'group-clusters' ELSE '[]'::jsonb END) g
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'group-clusters') = 'array'
+                                                THEN md->'group-clusters' ELSE '[]'::jsonb END) g
         WHERE jsonb_typeof(g) <> 'object'
            OR jsonb_typeof(g->'id') IS DISTINCT FROM 'number'
            OR jsonb_typeof(g->'members') IS DISTINCT FROM 'array'
            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(g->'members') = 'array'
                                                               THEN g->'members' ELSE '[]'::jsonb END) x
                       WHERE jsonb_typeof(x) <> 'number'))
-    AND jsonb_typeof(m.data->'group-votes') = 'object'
+    AND jsonb_typeof(md->'group-votes') = 'object'
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'group-votes') = 'object'
-                                      THEN m.data->'group-votes' ELSE '{}'::jsonb END) g
+        SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'group-votes') = 'object'
+                                      THEN md->'group-votes' ELSE '{}'::jsonb END) g
         WHERE jsonb_typeof(g.value) IS DISTINCT FROM 'object'
            OR jsonb_typeof(g.value->'n-members') IS DISTINCT FROM 'number'
            OR jsonb_typeof(g.value->'votes') IS DISTINCT FROM 'object'
@@ -431,50 +495,55 @@ VALID_BUNDLE_SQL = """COALESCE((
                          OR jsonb_typeof(v.value->'D') IS DISTINCT FROM 'number'
                          OR jsonb_typeof(v.value->'S') IS DISTINCT FROM 'number'))
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(m.data->'repness') = 'object'
-                                      THEN m.data->'repness' ELSE '{}'::jsonb END) r
+        SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof(md->'repness') = 'object'
+                                      THEN md->'repness' ELSE '{}'::jsonb END) r
         WHERE jsonb_typeof(r.value) IS DISTINCT FROM 'array'
            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(r.value) = 'array'
                                                               THEN r.value ELSE '[]'::jsonb END) x
                       WHERE jsonb_typeof(x) IS DISTINCT FROM 'object'))
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-                                                THEN m.data->'base-clusters'->'id' ELSE '[]'::jsonb END) x
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'id') = 'array'
+                                                THEN md->'base-clusters'->'id' ELSE '[]'::jsonb END) x
         WHERE jsonb_typeof(x) <> 'number')
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-                                                THEN m.data->'base-clusters'->'members' ELSE '[]'::jsonb END) c
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(md->'base-clusters'->'members') = 'array'
+                                                THEN md->'base-clusters'->'members' ELSE '[]'::jsonb END) c
         WHERE jsonb_typeof(c) <> 'array'
            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                               THEN c ELSE '[]'::jsonb END) x
                       WHERE jsonb_typeof(x) <> 'number'))
     AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(b.data->'bidToPid') = 'array'
-                                                THEN b.data->'bidToPid' ELSE '[]'::jsonb END) c
+        SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(bd->'bidToPid') = 'array'
+                                                THEN bd->'bidToPid' ELSE '[]'::jsonb END) c
         WHERE jsonb_typeof(c) <> 'array'
            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(c) = 'array'
                                                               THEN c ELSE '[]'::jsonb END) x
                       WHERE jsonb_typeof(x) <> 'number'))
-    AND CASE WHEN jsonb_typeof(m.data->'n') = 'number'
-              AND jsonb_typeof(m.data->'base-clusters') = 'object'
-              AND jsonb_typeof(m.data->'base-clusters'->'id') = 'array'
-              AND jsonb_typeof(m.data->'base-clusters'->'members') = 'array'
-              AND jsonb_typeof(m.data->'group-clusters') = 'array'
-              AND jsonb_typeof(m.data->'in-conv') = 'array'
-              AND jsonb_typeof(b.data->'bidToPid') = 'array'
-         THEN (m.data->>'n')::numeric >= 0
-              AND jsonb_array_length(m.data->'base-clusters'->'members')
-                  = jsonb_array_length(m.data->'base-clusters'->'id')
-              AND jsonb_array_length(b.data->'bidToPid')
-                  = jsonb_array_length(m.data->'base-clusters'->'id')
-              AND jsonb_array_length(m.data->'in-conv') <= (m.data->>'n')::numeric
-              AND ((m.data->>'n')::numeric > 0
-                   OR (jsonb_array_length(m.data->'base-clusters'->'id') = 0
-                       AND jsonb_array_length(m.data->'group-clusters') = 0
-                       AND jsonb_array_length(m.data->'in-conv') = 0
+    AND CASE WHEN jsonb_typeof(md->'n') = 'number'
+              AND jsonb_typeof(md->'base-clusters') = 'object'
+              AND jsonb_typeof(md->'base-clusters'->'id') = 'array'
+              AND jsonb_typeof(md->'base-clusters'->'members') = 'array'
+              AND jsonb_typeof(md->'group-clusters') = 'array'
+              AND jsonb_typeof(md->'in-conv') = 'array'
+              AND jsonb_typeof(bd->'bidToPid') = 'array'
+         THEN (md->>'n')::numeric >= 0
+              AND jsonb_array_length(md->'base-clusters'->'members')
+                  = jsonb_array_length(md->'base-clusters'->'id')
+              AND jsonb_array_length(bd->'bidToPid')
+                  = jsonb_array_length(md->'base-clusters'->'id')
+              AND jsonb_array_length(md->'in-conv') <= (md->>'n')::numeric
+              AND ((md->>'n')::numeric > 0
+                   OR (jsonb_array_length(md->'base-clusters'->'id') = 0
+                       AND jsonb_array_length(md->'group-clusters') = 0
+                       AND jsonb_array_length(md->'in-conv') = 0
                        AND m.last_vote_timestamp = 0
-                       AND p.data->'ptptstats' = '{}'::jsonb))
+                       AND pd->'ptptstats' = '{}'::jsonb))
          ELSE false END
+    FROM (SELECT m.data::jsonb AS md, b.data::jsonb AS bd, p.data::jsonb AS pd OFFSET 0) AS payload
+    WHERE m.zid IS NOT NULL AND b.zid IS NOT NULL AND p.zid IS NOT NULL AND k.zid IS NOT NULL
+    AND m.math_tick >= 0 AND b.math_tick = m.math_tick
+    AND p.math_tick = m.math_tick AND k.math_tick = m.math_tick
+    AND m.last_vote_timestamp IS NOT NULL
 ), false)"""
 
 
@@ -860,7 +929,7 @@ def _check_state(raw: Any) -> None:
         if key not in ALL_OUTCOMES or isinstance(value, bool) or not isinstance(value, int):
             raise StateError("totals holds a malformed entry")
     for key, value in raw.get("failures", {}).items():
-        # One explicit integer-key contract (review [1449] D): "--1", "+1",
+        # One explicit integer-key contract: "--1", "+1",
         # " 1", "1\n" or non-ASCII digits would pass isdigit-style checks
         # and then raise in int() during reconciliation and sweep reporting.
         if not (isinstance(key, str) and _ZID_KEY.fullmatch(key) and isinstance(value, dict)):
@@ -891,8 +960,8 @@ def _num_ok(value: Any) -> bool:
             and math.isfinite(value) and value >= 0)
 
 
-# Record fields the sweep, gate and summary lines read without a default
-# (review [1447] D); the rest are type-checked when present.
+# Record fields the sweep, gate and summary lines read without a default.
+# The rest are type-checked when present.
 _RECORD_REQUIRED = ("participants", "voters", "votes", "comments", "seconds",
                     "peak_rss_delta_mb", "est_mb")
 _RECORD_INTS = ("participants", "voters", "votes", "comments", "result_bytes")
@@ -957,7 +1026,7 @@ class BackfillState:
             return fresh
         except (OSError, ValueError, TypeError) as exc:
             # TypeError: a schema gap must still take the paused/fresh path
-            # rather than stop the scheduler (review [1449] D).
+            # rather than stop the scheduler.
             logger.error(
                 "math-backfill: state file untrusted (%s: %s); starting PAUSED with fresh "
                 "state (resume with SIGUSR2 after review)", exc.__class__.__name__,
@@ -987,9 +1056,40 @@ class BackfillState:
 
 
 def _top10(rows: List[Dict[str, Any]], rec: Record, key: str) -> List[Dict[str, Any]]:
-    rows = [r for r in rows if r.get("zid") != rec.zid] + [asdict(rec)]
+    """The ten largest by ``key``, one row per zid: the zid's largest
+    attempt, whatever its outcome (a later smaller attempt never hides an
+    earlier dangerous one)."""
+    new = asdict(rec)
+    prior = [r for r in rows if r.get("zid") == rec.zid]
+    if prior and float(prior[0].get(key, 0.0)) > float(new.get(key, 0.0)):
+        new = prior[0]
+    rows = [r for r in rows if r.get("zid") != rec.zid] + [new]
     rows.sort(key=lambda r: (-float(r.get(key, 0.0)), int(r["zid"])))
     return rows[:10]
+
+
+# Bound on the gate table: every attempt during the gate window is kept
+# (publications always), and past this many the smallest observed increment
+# among the other attempts makes room, so the largest peaks always stay. The
+# effective cap is never below gate_after_largest + concurrency, so the
+# publications (including any that finish while the gate drains) always fit.
+GATE_RECORDS_MAX = 50
+# Refusals recorded in the gate table although nothing ran: each is once per
+# zid (never retried automatically), and it is the size evidence for the
+# window.
+_GATE_REFUSALS = frozenset({OVER_MEMORY_CEILING, REFUSED_INPUT_SIZE})
+
+
+def _gate_append(rows: List[Dict[str, Any]], rec: Record,
+                 cap: int = GATE_RECORDS_MAX) -> List[Dict[str, Any]]:
+    rows = rows + [asdict(rec)]
+    while len(rows) > cap:
+        others = [i for i, r in enumerate(rows) if r.get("outcome", PUBLISHED) != PUBLISHED]
+        if not others:
+            break
+        drop = min(others, key=lambda i: float(rows[i].get("peak_rss_delta_mb", 0.0)))
+        rows = rows[:drop] + rows[drop + 1:]
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,6 +1129,7 @@ class BackfillScheduler:
         clock: Callable[[], float] = time.time,
         rss_fn: Callable[[], int] = read_rss_bytes,
         release_fn: Callable[[], None] = release_memory,
+        run_id: Optional[str] = None,
     ) -> None:
         self._host = host
         self._store = store
@@ -1049,7 +1150,11 @@ class BackfillScheduler:
                 f"MATH_BACKFILL_MEMORY_CEILING_MB={config.memory_ceiling_mb:g} is not "
                 f"below the container limit ({self._admission.limit_bytes / _MB:.0f} MiB)"
             )
-        self.run_id = uuid.uuid4().hex[:12]
+        # The poller passes its process run id (P-072) so the readiness lines
+        # and these report lines bind to one run; standalone, a fresh one.
+        if run_id is not None and not re.fullmatch(r"[0-9a-f]{12}", run_id):
+            raise ConfigError("run_id must be 12 lowercase hex characters")
+        self.run_id = run_id or uuid.uuid4().hex[:12]
         self.binding = self._calibration_binding()
         self._lock = threading.RLock()
         self._state = BackfillState.load(config.state_path, config.source_env, host.target_env)
@@ -1071,6 +1176,10 @@ class BackfillScheduler:
         self._pressure_paused: Optional[str] = None
         self._gate_logged = False
         self._drained_logged = False
+        # Readiness evidence (P-072): the last finished sweep's summary and
+        # when DRAINED was logged (None while not drained).
+        self._last_sweep: Optional[Dict[str, Any]] = None
+        self._drained_ms: Optional[int] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -1093,7 +1202,7 @@ class BackfillScheduler:
     def _bind_calibration(self) -> None:
         """Keep a gate approval (and its counters) only under a matching,
         recognized binding. A state file with no binding (the prior schema)
-        or a different one re-arms the gate (review [1447] D): a missing
+        or a different one re-arms the gate: a missing
         digest is not proof of a same-configuration approval."""
         st = self._state
         if st.binding != self.binding and (
@@ -1164,8 +1273,8 @@ class BackfillScheduler:
             try:
                 _, wait = self.step()
             except Exception as exc:  # noqa: BLE001 - never take the poller down
-                logger.error("math-backfill: scheduling step failed (%s); retrying",
-                             exc.__class__.__name__)
+                logger.error("math-backfill: scheduling step failed (%s: %s); retrying",
+                             exc.__class__.__name__, _exc_brief(exc))
                 wait = 30.0
             self._stop.wait(max(0.05, wait))
 
@@ -1189,11 +1298,18 @@ class BackfillScheduler:
                 # knows nothing is in flight.
                 if not self._in_flight and not self._drained_logged:
                     self._drained_logged = True
+                    self._drained_ms = int(now * 1000)
                     logger.warning("math-backfill DRAINED run=%s: paused by operator, nothing "
                                    "in flight", self.run_id)
                 return "paused_operator", 5.0
             self._drained_logged = False
+            self._drained_ms = None
             if self.gate_pending:
+                # Admission stops at the publication threshold, but jobs
+                # admitted before it are still running: wait for them, so
+                # the once-only report carries every attempt of the window.
+                if self._in_flight:
+                    return "gate", 0.5
                 self._log_gate_once()
                 return "gate", 5.0
             pressure = self._pressure(now)
@@ -1238,6 +1354,7 @@ class BackfillScheduler:
                 # for a reviewed larger-budget run; never truncate.
                 rec.outcome = OVER_MEMORY_CEILING
                 self._record(rec, large=large, need=need, est=est)
+                self._note_capacity(target.zid, (votes, voters, comments))
                 return OVER_MEMORY_CEILING, 0.0
             window = self._window_votes(now)
             if window and window + votes > self.config.max_votes_per_min:
@@ -1255,6 +1372,17 @@ class BackfillScheduler:
             self._sweep_admitted += 1
             self._next_admit_at = now + self.config.min_interval_s
             return "admitted", 0.0
+
+    def _note_capacity(self, zid: int, sizes: Tuple[int, int, int]) -> None:
+        """P-073: an over-ceiling refusal joins the poller's capacity
+        dispositions (a host without them, as in most tests, skips this)."""
+        note = getattr(self._host, "capacity_refused", None)
+        if note is None:
+            return
+        try:
+            note(zid, sizes)
+        except Exception as exc:  # noqa: BLE001 - the record never stops the scheduler
+            logger.error("math-backfill: capacity record failed (%s)", exc.__class__.__name__)
 
     def _pressure(self, now: float) -> Optional[str]:
         mean_ms, since_ok = self._host.live_poll_health()
@@ -1332,7 +1460,7 @@ class BackfillScheduler:
         its source row; SOURCE_AHEAD (or SOURCE_AHEAD_ACCEPTED under the accept
         ruling) when it reflects every vote in the table but the source claims
         a later one; otherwise LIVE_OWNED (live ingestion owns the tail).
-        Review [1447] C: "no eligible background repair" is not "caught up"."""
+        "No eligible background repair" is not "caught up"."""
         row = target.as_row()
         if caught_up(row):
             return ALREADY_COMPLETE
@@ -1345,9 +1473,9 @@ class BackfillScheduler:
         caught up with its source row (repaired by live ingestion or anything
         else), whose source row is gone, or which the encoded source-ahead
         ruling accepts. A valid target that is only in live lag, or
-        source-ahead with the ruling unresolved, keeps its failure (review
-        [1447] C). Reads the same state and validity as selection, fresh, in
-        bounded chunks. Returns {reason: cleared}."""
+        source-ahead with the ruling unresolved, keeps its failure.
+        Reads the same state and validity as selection, fresh, in bounded chunks.
+        Returns {reason: cleared}."""
         cleared: Dict[str, int] = {}
         keys = [k for k in self._state.failures if int(k) not in self._in_flight]
         cutoff = self._stale_cutoff_ms(now)
@@ -1401,8 +1529,10 @@ class BackfillScheduler:
             json.dumps(counts, sort_keys=True),
             json.dumps(self._admission.snapshot(), sort_keys=True),
             json.dumps(self._state.totals, sort_keys=True),
-            [(r["zid"], round(r["seconds"], 1)) for r in self._state.top_seconds],
-            [(r["zid"], round(r["peak_rss_delta_mb"], 1)) for r in self._state.top_memory],
+            [(r["zid"], round(r["seconds"], 1), r.get("outcome", PUBLISHED))
+             for r in self._state.top_seconds],
+            [(r["zid"], round(r["peak_rss_delta_mb"], 1), r.get("outcome", PUBLISHED))
+             for r in self._state.top_memory],
         )
         refused = sorted(
             (int(z), f.get("est_mb"), f["reason"]) for z, f in self._state.failures.items()
@@ -1414,7 +1544,13 @@ class BackfillScheduler:
                 self._sweep_no, refused[:50],
                 f" (+{len(refused) - 50} more)" if len(refused) > 50 else "",
             )
-        self._log_completion(unresolved, reconciled, counts, parked)
+        status = self._log_completion(unresolved, reconciled, counts, parked)
+        self._last_sweep = {
+            "sweep_no": self._sweep_no, "finished_ms": int(now * 1000), "run": self.run_id,
+            "config": self.config.digest(), "status": status,
+            "unresolved": sum(int(v) for v in unresolved.values()),
+            "parked_live": int(parked), "in_flight": len(self._in_flight),
+        }
         self._cursor = None
         self._sweep_end = False
         self._buffer.clear()
@@ -1424,22 +1560,23 @@ class BackfillScheduler:
         self._next_sweep_at = now + self.config.resweep_s
 
     def _log_completion(self, unresolved: Dict[str, int], reconciled: Any,
-                        counts: Dict[str, Any], parked: int) -> None:
+                        counts: Dict[str, Any], parked: int) -> str:
         """COMPLETE means the backfill's own queue is empty on fresh evidence;
         it is not cutover readiness (that is the verification SQL at a fixed
-        cutoff, run by the reviewed probe job)."""
+        cutoff, run by the reviewed probe job). Returns the sweep's status for
+        the readiness evidence: COMPLETE, NOT_COMPLETE or UNKNOWN."""
         if self._sweep_seen or self._in_flight or any(unresolved.values()):
-            return
+            return "NOT_COMPLETE"
         blockers = []
         if "error" in counts or (isinstance(reconciled, dict) and "error" in reconciled):
             logger.warning(
                 "math-backfill sweep=%d status=UNKNOWN: the fresh aggregate could not be read "
                 "(%s); not COMPLETE", self._sweep_no,
                 counts.get("error") or reconciled.get("error"))
-            return
+            return "UNKNOWN"
         blocking = ["missing", "incomplete", "stale"]
         if not self.config.accept_source_ahead:
-            # Review [1447] C: unresolved source-ahead blocks COMPLETE even
+            # Unresolved source-ahead blocks COMPLETE even
             # when no saved failure records it (a fresh state file, say).
             blocking.append("source_ahead")
         for key in blocking:
@@ -1451,7 +1588,7 @@ class BackfillScheduler:
             logger.warning("math-backfill sweep=%d status=NOT_COMPLETE: the sweep found no "
                            "eligible target but the fresh aggregate shows %s",
                            self._sweep_no, " ".join(blockers))
-            return
+            return "NOT_COMPLETE"
         logger.warning(
             "math-backfill COMPLETE run=%s sweep=%d: the backfill queue is empty (no missing, "
             "incomplete, invalid or stale %s target of a %s conversation; nothing unresolved, "
@@ -1461,6 +1598,17 @@ class BackfillScheduler:
             int(counts.get("live_lag", 0)), int(counts.get("source_ahead", 0)),
             self.config.source_ahead_ruling,
         )
+        return "COMPLETE"
+
+    def readiness(self) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """(the last finished sweep's summary or None, the drain state) for
+        the readiness line (P-072). Counts, clocks, digests and closed labels
+        only. Lock-free on purpose: the scheduler holds its lock across
+        database reads, and the heartbeat must not wait on them. Each field
+        is replaced whole, never mutated, so a read sees one consistent value."""
+        last = self._last_sweep
+        return (dict(last) if last is not None else None,
+                {"run": self.run_id, "drained_ms": self._drained_ms})
 
     def _unresolved(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -1494,8 +1642,8 @@ class BackfillScheduler:
             reservation = self._admission.reserve(
                 zid, job.need_bytes, kind="backfill", exclusive=job.large, wait=False)
         except Exception as exc:  # noqa: BLE001 - OverBudget: the budget shrank
-            logger.error("math-backfill zid=%s: reservation refused (%s)", zid,
-                         exc.__class__.__name__)
+            logger.error("math-backfill zid=%s: reservation refused (%s: %s)", zid,
+                         exc.__class__.__name__, _exc_brief(exc))
         if reservation is None:
             with self._lock:
                 self._in_flight.pop(zid, None)
@@ -1519,7 +1667,7 @@ class BackfillScheduler:
         rec.result_bytes = int(report.get("payload_bytes", 0))
         with self._lock:
             self._in_flight.pop(zid, None)
-            self._record(rec, large=job.large, compute_s=seconds)
+            self._record(rec, large=job.large, compute_s=seconds, ran=True)
         self._release()
 
     def _execute(self, zid: int, job: _Job, report: Dict[str, Any]) -> str:
@@ -1527,8 +1675,8 @@ class BackfillScheduler:
         try:
             state = self._store.state(zid, self._stale_cutoff_ms(now))
         except Exception as exc:  # noqa: BLE001
-            logger.error("math-backfill zid=%s: state read failed (%s)", zid,
-                         exc.__class__.__name__)
+            logger.error("math-backfill zid=%s: state read failed (%s: %s)", zid,
+                         exc.__class__.__name__, _exc_brief(exc))
             return FAILED_COMPUTE
         if state is None:
             return ALREADY_COMPLETE  # the source row is gone
@@ -1536,7 +1684,7 @@ class BackfillScheduler:
         if klass is None:
             return self._caught_up_outcome(current)
         if self._host.is_cached(zid):
-            # Review [1447] E: live ingestion holds this zid but its
+            # Live ingestion holds this zid but its
             # publication needs repair. This job runs on the zid's serialized
             # pool worker, so no live computation for it is running: drop the
             # cached conversation (lossless: the next live touch reloads the
@@ -1549,8 +1697,8 @@ class BackfillScheduler:
             # validation (STALE); anything else rebuilds cold.
             conv = self._host.load_full_history(zid, restore=current.klass == STALE)
         except Exception as exc:  # noqa: BLE001
-            logger.error("math-backfill zid=%s: compute failed (%s)", zid,
-                         exc.__class__.__name__)
+            logger.error("math-backfill zid=%s: compute failed (%s: %s)", zid,
+                         exc.__class__.__name__, _exc_brief(exc))
             return FAILED_COMPUTE
 
         def before_publish(connection: Any, _math_tick: int) -> None:
@@ -1564,16 +1712,16 @@ class BackfillScheduler:
         except _Superseded:
             return SUPERSEDED_LIVE
         except Exception as exc:  # noqa: BLE001
-            logger.error("math-backfill zid=%s: publication failed (%s)", zid,
-                         exc.__class__.__name__)
+            logger.error("math-backfill zid=%s: publication failed (%s: %s)", zid,
+                         exc.__class__.__name__, _exc_brief(exc))
             return FAILED_WRITE
         finally:
             del conv
         try:
             ok, _tick, target_lvt = self._store.coherent(zid)
         except Exception as exc:  # noqa: BLE001
-            logger.error("math-backfill zid=%s: postcondition read failed (%s)", zid,
-                         exc.__class__.__name__)
+            logger.error("math-backfill zid=%s: postcondition read failed (%s: %s)", zid,
+                         exc.__class__.__name__, _exc_brief(exc))
             return FAILED_POSTCONDITION
         # Backfill never grows the live cache: the rebuilt conversation was
         # never remembered, and anything cached for it is dropped (per-zid
@@ -1588,8 +1736,8 @@ class BackfillScheduler:
             try:
                 input_lvt = self._store.input_lvt(zid)
             except Exception as exc:  # noqa: BLE001
-                logger.error("math-backfill zid=%s: input read failed (%s)", zid,
-                             exc.__class__.__name__)
+                logger.error("math-backfill zid=%s: input read failed (%s: %s)", zid,
+                             exc.__class__.__name__, _exc_brief(exc))
                 return FAILED_POSTCONDITION
             return self._caught_up_outcome(Target(
                 zid, current.participants, current.klass, current.source_lvt, None,
@@ -1609,7 +1757,9 @@ class BackfillScheduler:
 
     # -- bookkeeping -------------------------------------------------------- #
     def _record(self, rec: Record, *, large: bool, compute_s: float = 0.0,
-                need: int = 0, est: int = 0) -> None:
+                need: int = 0, est: int = 0, ran: bool = False) -> None:
+        """``ran``: the job held a reservation and executed, so its sampled
+        RSS is evidence whatever the outcome (P-073 x.34)."""
         cfg, st, now = self.config, self._state, self._clock()
         assert rec.outcome in ALL_OUTCOMES, rec.outcome
         logger.info(
@@ -1649,13 +1799,25 @@ class BackfillScheduler:
                 st.failures[key]["est_bytes"] = int(est)
             elif rec.outcome == REFUSED_INPUT_SIZE:
                 st.failures[key]["bound"] = cfg.max_votes
-        if rec.outcome == PUBLISHED:
+        # Every attempt is evidence (P-073 x.34): a job that ran is in the
+        # top lists and the gate table whatever its outcome, and a size
+        # refusal is in the gate table, so a dangerous peak is never omitted
+        # because its job did not publish. The gate still counts
+        # publications only.
+        if ran or rec.outcome == PUBLISHED:
             st.top_seconds = _top10(st.top_seconds, rec, "seconds")
             st.top_memory = _top10(st.top_memory, rec, "peak_rss_delta_mb")
-            if cfg.gate_after_largest and not st.gate_approved and not cfg.gate_approved:
-                if st.gate_published < cfg.gate_after_largest:
-                    st.gate_published += 1
-                    st.gate_records.append(asdict(rec))
+        # Collected until the GATE report is emitted: after the publication
+        # threshold no new job is admitted, but jobs already in flight drain
+        # into the table first (step() waits for them).
+        if (cfg.gate_after_largest and not st.gate_approved and not cfg.gate_approved
+                and not self._gate_logged
+                and (ran or rec.outcome == PUBLISHED or rec.outcome in _GATE_REFUSALS)):
+            if rec.outcome == PUBLISHED and st.gate_published < cfg.gate_after_largest:
+                st.gate_published += 1
+            st.gate_records = _gate_append(
+                st.gate_records, rec,
+                max(GATE_RECORDS_MAX, cfg.gate_after_largest + cfg.concurrency))
         if compute_s or rec.outcome in (LIVE_OWNED, PARKED_LIVE, LOST, MEMORY_HEADROOM):
             rest = cfg.min_interval_s
             if compute_s:
@@ -1684,18 +1846,22 @@ class BackfillScheduler:
         logger.warning(
             "math-backfill GATE run=%s binding=%s: the first %d publications (in participant "
             "order, not by estimated memory) are done; admission is PAUSED until approval "
-            "(SIGUSR1 to the poller, or MATH_BACKFILL_GATE_APPROVED=1). Memory figures are "
+            "(SIGUSR1 to the poller, or MATH_BACKFILL_GATE_APPROVED=1). %d attempts follow, "
+            "every outcome (failures and size refusals too). Memory figures are "
             "sampled RSS every 0.2 s: an unobserved transient is not ruled out",
             self.run_id, self.binding, self.config.gate_after_largest,
+            len(self._state.gate_records),
         )
         for r in self._state.gate_records:
             reserved = r.get("reserved_mb", 0.0)
             ratio = (r["peak_rss_delta_mb"] / reserved) if reserved else 0.0
             logger.warning(
-                "math-backfill GATE zid=%d participants=%d voters=%d votes=%d comments=%d "
-                "seconds=%.2f start_rss_mb=%.1f peak_rss_mb=%.1f observed_increment_mb=%.1f "
-                "reserved_increment_mb=%.1f est_peak_mb=%.1f observed_over_reserved=%.2f",
-                r["zid"], r["participants"], r["voters"], r["votes"], r["comments"],
+                "math-backfill GATE zid=%d outcome=%s participants=%d voters=%d votes=%d "
+                "comments=%d seconds=%.2f start_rss_mb=%.1f peak_rss_mb=%.1f "
+                "observed_increment_mb=%.1f reserved_increment_mb=%.1f est_peak_mb=%.1f "
+                "observed_over_reserved=%.2f",
+                r["zid"], r.get("outcome", PUBLISHED), r["participants"], r["voters"],
+                r["votes"], r["comments"],
                 r["seconds"], r.get("start_rss_mb", 0.0), r.get("peak_rss_mb", 0.0),
                 r["peak_rss_delta_mb"], reserved, r["est_mb"], ratio,
             )

@@ -1,0 +1,18 @@
+[package]
+name = "polis-contracts"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.88"
+publish = false
+# A member of the polis-cli workspace (one lockfile, polis-cli/Cargo.lock), not
+# of the queue-rs workspace that shares this directory.
+workspace = "../../polis-cli"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# raw_value: a JSON number is written exactly as JavaScript writes it;
+# float_roundtrip: a number is read as JavaScript reads it, correctly rounded
+# (the default parser can land one bit off). Both in wire.rs.
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
+# The run record's inputs digest (delphi_run.rs).
+sha2 = "0.10"

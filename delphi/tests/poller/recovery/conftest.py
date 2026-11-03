@@ -34,8 +34,9 @@ an absent prerequisite.
 Nothing here hides the matrix from that job by policy — the skip is a statement
 about the image's contents, and it is one step away from being satisfied::
 
-    docker compose ... cp server/postgres/migrations delphi:/app/migrations
-    ... exec -e POLIS_MIGRATIONS_DIR=/app/migrations delphi ...
+    docker compose ... cp server/postgres delphi:/app/postgres
+    ... exec -e POLIS_MIGRATIONS_DIR=/app/postgres/migrations \
+        -e POLIS_MIGRATE_BIN=/usr/local/bin/polis-migrate delphi ...
 
 which makes the whole matrix run there (verified: 122 passed, 1 skipped — R11's
 docker-compose.yml assertion, still outside the image — and 12 xfailed).
@@ -44,6 +45,9 @@ P-022 §C's separate "required recovery job" decision, not this file's.
 
 Schema freshness
 ----------------
+The packaged invocation also needs a polis-migrate binary built for the container
+installed at POLIS_MIGRATE_BIN. In a source checkout the helper builds it with Cargo.
+
 The migrations are applied ONCE per session into a template database; each test
 then gets its own database created with ``CREATE DATABASE ... TEMPLATE``.  That
 is a genuinely fresh migrated schema per test (no cross-test residue in
@@ -75,6 +79,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pytest
 import sqlalchemy as sa
+
+from tests.vote_fixtures import AGREE, DISAGREE, seed_vote
 
 # Every module in this package is part of the required recovery job.
 pytestmark = pytest.mark.recovery
@@ -283,11 +289,13 @@ def migrated_template(recovery_migrations_dir: str,
     conn = psycopg2.connect(tmpl_url, connect_timeout=5)
     conn.autocommit = True
     try:
+        import runpy
+        from pathlib import Path
+        apply_migration = runpy.run_path(str(
+            Path(recovery_migrations_dir).parents[1] / "bin" / "apply-test-migration.py"
+        ))["apply_migration"]
         for name in files:
-            with open(os.path.join(recovery_migrations_dir, name), "r") as fh:
-                sql = fh.read()
-            with conn.cursor() as cur:
-                cur.execute(sql)
+            apply_migration(conn, Path(recovery_migrations_dir) / name)
     finally:
         conn.close()
 
@@ -364,16 +372,18 @@ def seed_conversation(
 ) -> SeededConversation:
     """Seed one conversation: conversations/participants/comments/votes rows.
 
-    Raw DB vote signs (AGREE=-1, DISAGREE=+1) are written directly, so the
-    poller's ingress conversion is genuinely exercised.  Two opposing camps by
-    participant parity gives a non-degenerate PCA.
+    Stored (raw) vote values are written directly, so the poller's ingress
+    conversion is genuinely exercised. ``vote_pattern`` returns the STORED value;
+    the default names its votes by meaning and takes the stored number from
+    ``tests.vote_fixtures``. Two opposing camps by participant parity gives a
+    non-degenerate PCA.
     """
     now = int(time.time() * 1000)
     base_created = now - 60_000 if base_created is None else base_created
     long_ago = now - 2 * 24 * 60 * 60 * 1000
     if vote_pattern is None:
         def vote_pattern(pid: int, tid: int) -> int:  # noqa: ARG001
-            return -1 if pid % 2 == 0 else 1
+            return seed_vote(AGREE if pid % 2 == 0 else DISAGREE)
 
     seeded = SeededConversation(zid=zid)
     with engine.begin() as conn:
@@ -420,7 +430,9 @@ def seed_conversation(
 
 def commit_vote(engine_or_conn, zid: int, pid: int, tid: int, raw_vote: int,
                 created: int) -> Dict[str, Any]:
-    """Commit ONE vote row (raw storage sign) and return the fold event."""
+    """Commit ONE vote row (``raw_vote`` is the stored value: take it from
+    ``tests.vote_fixtures.seed_vote`` or this suite's declared ``fold.RAW_*``)
+    and return the fold event."""
     stmt = sa.text("INSERT INTO votes (zid, pid, tid, vote, created) "
                    "VALUES (:zid, :pid, :tid, :vote, :created)")
     params = {"zid": zid, "pid": pid, "tid": tid, "vote": raw_vote,

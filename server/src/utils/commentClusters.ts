@@ -1,3 +1,4 @@
+import { resultClient } from "./delphiResults";
 import pg from "../db/pg-query";
 import logger from "./logger";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -78,24 +79,20 @@ function createDynamoDBClient(): DynamoDBDocumentClient {
 
   if (Config.dynamoDbEndpoint) {
     dynamoDBConfig.endpoint = Config.dynamoDbEndpoint;
-    dynamoDBConfig.credentials = {
-      accessKeyId: "DUMMYIDEXAMPLE",
-      secretAccessKey: "DUMMYEXAMPLEKEY",
-    };
-  } else if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
+  }
+if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
     dynamoDBConfig.credentials = {
       accessKeyId: Config.AWS_ACCESS_KEY_ID,
       secretAccessKey: Config.AWS_SECRET_ACCESS_KEY,
     };
   }
 
-  const client = new DynamoDBClient(dynamoDBConfig);
-  return DynamoDBDocumentClient.from(client, {
+  return resultClient(() => DynamoDBDocumentClient.from(new DynamoDBClient(dynamoDBConfig), {
     marshallOptions: {
       convertEmptyValues: true,
       removeUndefinedValues: true,
     },
-  });
+  }));
 }
 
 /**
@@ -276,7 +273,7 @@ export async function getCommentsWithClusters(
   logger.info(`Fetching comments with clusters for conversation ${zid}`);
 
   // Step 1: Get all comments from PostgreSQL
-  const comments = (await pg.queryP_readOnly(
+  const comments = (await pg.queryP_reportExport(
     "SELECT tid, txt, pid, created, mod, active FROM comments WHERE zid = ($1) ORDER BY tid",
     [zid]
   )) as Array<{

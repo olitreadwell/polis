@@ -9,6 +9,7 @@ EVōC for clustering, and generates interactive visualizations with topic labeli
 import json
 import logging
 import os
+import sys
 import time
 import traceback
 import uuid  # For generating job_id
@@ -23,6 +24,7 @@ from polismath_commentgraph.utils.converter import DataConverter
 
 # Import from local modules
 from polismath_commentgraph.utils.storage import DynamoDBStorage, PostgresClient
+from polismath.utils.cli_flags import parse_bool_flag
 from sentence_transformers import SentenceTransformer
 from umap_narrative.topic_naming import (
     generate_cluster_topic_labels,
@@ -31,6 +33,7 @@ from umap_narrative.topic_naming import (
 )
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
 from umap import UMAP
+from umap_narrative.numerical_stages import characterize_comment_clusters
 
 # Configure logging
 logging.basicConfig(
@@ -90,21 +93,32 @@ def fetch_conversation_data(zid):
         comments: List of comment dictionaries
         metadata: Dictionary with conversation metadata
     """
-    logger.info(f"Fetching conversation {zid} from PostgreSQL...")
-    postgres_client = PostgresClient()
+    from polismath.job_child import input_bundle
+
+    # The input bundle polis-jobs wrote, when the frame names one: the same rows,
+    # read in one snapshot before the child started. Otherwise PostgreSQL.
+    bundle = input_bundle.load(zid)
+    postgres_client = None
 
     try:
-        # Initialize connection
-        postgres_client.initialize()
+        if bundle is not None:
+            logger.info(f"Reading conversation {zid} from the input bundle...")
+            conversation = bundle.conversation()
+            comments = bundle.comments()
+        else:
+            logger.info(f"Fetching conversation {zid} from PostgreSQL...")
+            postgres_client = PostgresClient()
+            # Initialize connection
+            postgres_client.initialize()
 
-        # Get conversation metadata
-        conversation = postgres_client.get_conversation_by_id(zid)
-        if not conversation:
-            logger.error(f"Conversation {zid} not found in database.")
-            return None, None
+            # Get conversation metadata
+            conversation = postgres_client.get_conversation_by_id(zid)
+            if not conversation:
+                logger.error(f"Conversation {zid} not found in database.")
+                return None, None
 
-        # Get comments - include all comments, regardless of active status
-        comments = postgres_client.get_comments_by_conversation(zid)
+            # Get comments - include all comments, regardless of active status
+            comments = postgres_client.get_comments_by_conversation(zid)
         logger.info(f"Retrieved {len(comments)} comments from conversation {zid}")
 
         # Count active and inactive for logging purposes only
@@ -139,7 +153,8 @@ def fetch_conversation_data(zid):
 
     finally:
         # Clean up connection
-        postgres_client.shutdown()
+        if postgres_client is not None:
+            postgres_client.shutdown()
 
 
 def process_comments(comments, conversation_id):
@@ -177,108 +192,11 @@ def process_comments(comments, conversation_id):
     embedding_model = SentenceTransformer(model_name)
     document_vectors = embedding_model.encode(comment_texts, show_progress_bar=True)
 
-    # Generate 2D projection with UMAP
-    logger.info("Generating 2D projection with UMAP...")
-    document_map = UMAP(n_components=2, metric="cosine", random_state=42).fit_transform(
-        document_vectors
-    )
-
-    # Cluster with EVōC
-    logger.info("Clustering with EVōC...")
-    try:
-        clusterer = evoc.EVoC(min_samples=5)  # Set min_samples to avoid empty clusters
-        cluster_labels = clusterer.fit_predict(document_vectors)
-        cluster_layers = clusterer.cluster_layers_
-
-        logger.info(
-            f"Found {len(np.unique(cluster_labels))} clusters at the finest level"
-        )
-        for i, layer in enumerate(cluster_layers):
-            unique_clusters = np.unique(layer[layer >= 0])
-            logger.info(f"Layer {i}: {len(unique_clusters)} clusters")
-
-    except Exception as e:
-        logger.error(f"Error during EVōC clustering: {e}")
-        logger.error(traceback.format_exc())
-        # Fallback to simple clustering
-        from sklearn.cluster import KMeans
-
-        logger.info("Falling back to KMeans clustering...")
-        kmeans = KMeans(n_clusters=5, random_state=42)
-        cluster_labels = kmeans.fit_predict(document_vectors)
-
-        # Create a simple layered clustering for demonstration
-        from sklearn.cluster import AgglomerativeClustering
-
-        layer1 = AgglomerativeClustering(n_clusters=3).fit_predict(document_vectors)
-        layer2 = AgglomerativeClustering(n_clusters=2).fit_predict(document_vectors)
-
-        cluster_layers = [cluster_labels, layer1, layer2]
-        logger.info(
-            f"Created {len(cluster_layers)} cluster layers with fallback clustering"
-        )
+    from umap_narrative.numerical_stages import project_and_cluster
+    document_map, cluster_layers = project_and_cluster(document_vectors)
 
     return document_map, document_vectors, cluster_layers, comment_texts, comment_ids
 
-
-def characterize_comment_clusters(cluster_layer, comment_texts):
-    """
-    Characterize comment clusters by common themes and keywords.
-
-    Args:
-        cluster_layer: Cluster assignments for a specific layer
-        comment_texts: List of comment text strings
-
-    Returns:
-        cluster_characteristics: Dictionary with cluster characterizations
-    """
-    # Create a dictionary to store cluster characteristics
-    cluster_characteristics = {}
-
-    # Get unique clusters
-    unique_clusters = np.unique(cluster_layer)
-    unique_clusters = unique_clusters[unique_clusters >= 0]  # Remove noise points (-1)
-
-    # Create TF-IDF vectorizer
-    vectorizer = CountVectorizer(max_features=1000, stop_words="english")
-    transformer = TfidfTransformer()
-
-    # Fit and transform the entire corpus
-    X = vectorizer.fit_transform(comment_texts)
-    X_tfidf = transformer.fit_transform(X)
-
-    # Get feature names
-    feature_names = vectorizer.get_feature_names_out()
-
-    for cluster_id in unique_clusters:
-        # Get cluster members
-        cluster_members = np.where(cluster_layer == cluster_id)[0]
-
-        if len(cluster_members) == 0:
-            continue
-
-        # Get comment texts for this cluster
-        cluster_comments = [comment_texts[i] for i in cluster_members]
-
-        # Find top words for this cluster by TF-IDF
-        cluster_tfidf = X_tfidf[cluster_members].toarray().mean(axis=0)
-        top_indices = np.argsort(cluster_tfidf)[-10:][::-1]  # Top 10 words
-        top_words = [feature_names[i] for i in top_indices]
-
-        # Get sample comments (shortest 3 for readability)
-        comment_lengths = [len(comment) for comment in cluster_comments]
-        shortest_indices = np.argsort(comment_lengths)[:3]  # 3 shortest comments
-        sample_comments = [cluster_comments[i] for i in shortest_indices]
-
-        # Add to cluster characteristics
-        cluster_characteristics[int(cluster_id)] = {
-            "size": len(cluster_members),
-            "top_words": top_words,
-            "top_tfidf_scores": [float(cluster_tfidf[i]) for i in top_indices],
-            "sample_comments": sample_comments,
-        }
-
-    return cluster_characteristics
 
 
 def create_comment_hover_info(cluster_layer, cluster_characteristics, comment_texts):
@@ -1135,10 +1053,16 @@ def process_conversation(
 
     if exclude_comment_selections:
         logger.info(f"exclude_comment_selections is enabled, fetching report comment selections for zid {zid}")
-        postgres_client = PostgresClient()
+        from polismath.job_child import input_bundle
+
+        bundle = input_bundle.load(zid)
+        postgres_client = None if bundle is not None else PostgresClient()
         try:
-            postgres_client.initialize()
-            selections = postgres_client.get_report_comment_selections(zid)
+            if bundle is not None:
+                selections = bundle.report_comment_selections()
+            else:
+                postgres_client.initialize()
+                selections = postgres_client.get_report_comment_selections(zid)
             # Build a set of tids that should be excluded (selection == -1 in any report)
             excluded_tids = {
                 sel["tid"] for sel in selections if sel.get("selection") == -1
@@ -1150,7 +1074,8 @@ def process_conversation(
             else:
                 logger.info("No excluded comment selections found for this conversation")
         finally:
-            postgres_client.shutdown()
+            if postgres_client is not None:
+                postgres_client.shutdown()
 
     # Generate a job_id for this pipeline run
     # If DELPHI_JOB_ID is set (e.g., by a calling script like run_delphi.py), use that.
@@ -1188,12 +1113,22 @@ def process_conversation(
         )
         dynamo_storage.create_conversation_meta(conversation_meta)
 
-        # Store embeddings
+        # Store embeddings. With the per-row table on (migration 000038), the run's
+        # embeddings go to that table with each comment's text SHA-256 as provenance,
+        # not the codec family; off, the codec-family path is unchanged.
         logger.info("Storing comment embeddings...")
-        embedding_models = DataConverter.batch_convert_embeddings(
-            conversation_id, document_vectors, comment_ids
-        )
-        result = dynamo_storage.batch_create_comment_embeddings(embedding_models)
+        if dynamo_storage.embeddings_table_enabled():
+            import hashlib
+            model_name = os.environ.get("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
+            text_shas = [hashlib.sha256(text.encode("utf-8")).digest() for text in comment_texts]
+            result = dynamo_storage.put_comment_embeddings_table(
+                conversation_id, comment_ids, text_shas, document_vectors, model_name
+            )
+        else:
+            embedding_models = DataConverter.batch_convert_embeddings(
+                conversation_id, document_vectors, comment_ids
+            )
+            result = dynamo_storage.batch_create_comment_embeddings(embedding_models)
         logger.info(
             f"Stored {result['success']} embeddings with {result['failure']} failures"
         )
@@ -1299,13 +1234,13 @@ def main():
     )
     parser.add_argument(
         "--include_moderation",
-        type=bool,
+        type=parse_bool_flag,
         default=False,
         help="Whether or not to include moderated comments in reports. If false, moderated comments will appear.",
     )
     parser.add_argument(
         "--exclude_comment_selections",
-        type=bool,
+        type=parse_bool_flag,
         default=True,
         help="Whether to exclude comments with selection=-1 in report_comment_selections table.",
     )
@@ -1386,14 +1321,19 @@ def main():
             name_topics=name_topics,
         )
     else:
-        # Process with real data from PostgreSQL
-        process_conversation(
+        # Process with real data from PostgreSQL. process_conversation returns
+        # False when it could not fetch the conversation; that is a failed
+        # stage, and the exit code must say so (run_delphi.py reads it).
+        ok = process_conversation(
             args.zid,
             export_dynamo=not args.no_dynamo,
             name_topics=name_topics,
             include_moderation=args.include_moderation,
             exclude_comment_selections=args.exclude_comment_selections,
         )
+        if not ok:
+            logger.error(f"Processing conversation {args.zid} failed.")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

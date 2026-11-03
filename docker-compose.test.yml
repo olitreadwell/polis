@@ -40,12 +40,16 @@ services:
 
   client-participation-alpha:
     build:
-      context: ./client-participation-alpha
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: client-participation-alpha/Dockerfile
       args:
-        - OIDC_CACHE_KEY_ID_TOKEN_SUFFIX=${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
-        - OIDC_CACHE_KEY_PREFIX=${OIDC_CACHE_KEY_PREFIX}
-        - PUBLIC_SERVICE_URL=${PUBLIC_SERVICE_URL}
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
+        OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: "${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}"
+        OIDC_CACHE_KEY_PREFIX: "${OIDC_CACHE_KEY_PREFIX}"
+        PUBLIC_SERVICE_URL: "${PUBLIC_SERVICE_URL}"
     depends_on:
       - "server"
     environment:
@@ -68,10 +72,14 @@ services:
     env_file:
       - test.env
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
       target: prod
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         NODE_ENV: production
     labels:
       polis_tag: test
@@ -82,29 +90,51 @@ services:
       - ${AUTH_CERTS_PATH:-~/.simulacrum/certs}:/root/.simulacrum/certs:ro
     restart: unless-stopped
     depends_on:
-      - oidc-simulator
-      - postgres
-      - dynamodb-init
+      oidc-simulator:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dynamodb-init:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  math:
+  # The math engine: the Python poller, run from the same image as the `delphi`
+  # service below and writing the label the test server reads.
+  math-python:
+    image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
-      context: ./math
+      context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
+      target: test
+      args:
+        USE_CPU_TORCH: "true"
+    command: ["python", "scripts/math_poller.py"]
     labels:
       polis_tag: test
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - DD_ENABLED=false
-      - LOGGING_LEVEL=${MATH_LOG_LEVEL:-warn}
+      - DATABASE_SSL_MODE=disable
+      - LOG_LEVEL=${DELPHI_LOG_LEVEL:-INFO}
       - MATH_ENV=${MATH_ENV:-dev}
-      - WEBSERVER_USERNAME=${WEBSERVER_USERNAME}
-      - WEBSERVER_PASS=${WEBSERVER_PASS}
+      # No EC2 instance id here; name the poller by its container hostname.
+      - MATH_POLLER_ALLOW_HOSTNAME_IDENTITY=1
     networks:
       - polis-test
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # The poller sizes its memory admission from the cgroup limit and refuses
+    # to start without one. Same limit and default as docker-compose.yml, which
+    # the dev overlay inherits.
+    deploy:
+      resources:
+        limits:
+          memory: ${DELPHI_POLLER_CONTAINER_MEMORY:-16g}
 
   ses-local:
     image: dasprid/aws-ses-v2-local:latest
@@ -142,6 +172,8 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile-db
+      additional_contexts:
+        queue-rs: ./queue-rs
       labels:
         polis_tag: test
     environment:
@@ -149,7 +181,8 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_USER=${POSTGRES_USER}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # The init server is socket-only; TCP refuses until migrations finish.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -157,7 +190,7 @@ services:
     networks:
       - polis-test
     ports:
-      - 5432:5432
+      - "${POLIS_RECOVERY_PG_PORT:-5432}:5432"
     restart: unless-stopped
     # PostgreSQL configuration for development/testing
     command: >
@@ -198,13 +231,16 @@ services:
       context: ./
       dockerfile: file-server/Dockerfile
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         ADMIN_UIDS: ${ADMIN_UIDS}
         AUTH_AUDIENCE: users
         AUTH_CLIENT_ID: dev-client-id
         AUTH_ISSUER: https://localhost:3000/
         AUTH_NAMESPACE: https://pol.is/
         EMBED_SERVICE_HOSTNAME: localhost
-        GIT_HASH: test
         NODE_ENV: production
         OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: ${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
         OIDC_CACHE_KEY_PREFIX: ${OIDC_CACHE_KEY_PREFIX}
@@ -219,6 +255,8 @@ services:
     image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
       context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
       target: test
       args:
         USE_CPU_TORCH: "true"
@@ -236,14 +274,16 @@ services:
       - AWS_SECRET_ACCESS_KEY=minioadmin
       - AWS_S3_BUCKET_NAME=polis-delphi
       - LOG_LEVEL=DEBUG
-      # Must match the `math` service's MATH_ENV (line 67): the report pipeline
-      # reads math rows scoped by math_env, and the test stack's math writes dev.
+      # Must match the `math-python` service's MATH_ENV: the report pipeline
+      # reads math rows scoped by math_env, and the test stack's poller writes dev.
       - MATH_ENV=${MATH_ENV:-dev}
     networks:
       - "polis-test"
     depends_on:
-      - postgres
-      - dynamodb-init
+      postgres:
+        condition: service_healthy
+      dynamodb-init:
+        condition: service_completed_successfully
     command: tail -f /dev/null
     restart: unless-stopped
 

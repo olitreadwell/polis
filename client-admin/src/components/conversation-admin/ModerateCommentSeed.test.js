@@ -2,10 +2,13 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { ThemeUIProvider } from 'theme-ui'
+import { axe, toHaveNoViolations } from 'jest-axe'
 
 import ModerateCommentsSeed from './ModerateCommentSeed'
 import * as actions from '../../actions'
 import theme from '../../theme'
+
+expect.extend(toHaveNoViolations)
 
 // Mock actions
 jest.mock('../../actions', () => ({
@@ -386,6 +389,23 @@ describe('ModerateCommentsSeed', () => {
         </ThemeUIProvider>
       )
       expect(screen.getAllByText('Success!').length).toBeGreaterThan(0)
+    })
+  })
+
+  describe('Accessibility', () => {
+    it('has no axe violations', async () => {
+      const { container } = renderWithProviders(<ModerateCommentsSeed {...defaultProps} />)
+      expect(await axe(container)).toHaveNoViolations()
+    })
+
+    it('labels the seed comment textarea', () => {
+      renderWithProviders(<ModerateCommentsSeed {...defaultProps} />)
+      expect(screen.getByRole('textbox')).toHaveAccessibleName('Seed comment text')
+    })
+
+    it('labels the CSV upload input', () => {
+      renderWithProviders(<ModerateCommentsSeed {...defaultProps} />)
+      expect(screen.getByLabelText('Upload seed comments from a CSV file')).toBeInTheDocument()
     })
   })
 })
