@@ -1,0 +1,122 @@
+{
+  "schema": "polis-probe-registry/1",
+  "jobs": {
+    "sampled-paired-battery-v1": {
+      "schema": "polis-probe-job/1",
+      "run_id": "00000000000000000000000000000000",
+      "reader": {
+        "image": "localhost/polis-probe-producer@sha256:e39fd42c892cfbe8d0c083224fd3fb262d3c8da7cb5112073a2b676bcb93d7ae",
+        "args": ["extract"]
+      },
+      "producer": {
+        "image": "localhost/polis-probe-producer@sha256:e39fd42c892cfbe8d0c083224fd3fb262d3c8da7cb5112073a2b676bcb93d7ae",
+        "args": ["produce"]
+      },
+      "verifier": {
+        "image": "localhost/polis-probe-verifier@sha256:0d85c8b7fb3b74a0527431b02a9bb52d4aa04eac6e948377f6258e5d69557770",
+        "args": ["verify"]
+      },
+      "max_seconds": 43200
+    },
+    "roles-census-v1": {
+      "kind": "roles-census",
+      "max_seconds": 900,
+      "producer": {
+        "args": ["produce"],
+        "image": "localhost/polis-roles-producer@sha256:4961595bf001151fe80517e5cd1989beb1e2e470e403b89ad355be026c4656f1"
+      },
+      "reader": {
+        "args": ["read"],
+        "image": "localhost/polis-roles-reader@sha256:d345ec92b0839fa54a8c6b5906e7072513411022e6ff6bb99768a78bd9d7e201"
+      },
+      "run_id": "00000000000000000000000000000000",
+      "schema": "polis-probe-job/2",
+      "verifier": {
+        "args": ["verify"],
+        "image": "localhost/polis-roles-verifier@sha256:8478ba5cb98603c027743ab65a116c481f6590a2a0d417815b0da79d919c3ae2"
+      }
+    },
+    "light-shadow-compare-v1": {
+      "kind": "light-shadow-compare",
+      "max_seconds": 3600,
+      "producer": {
+        "args": ["produce"],
+        "image": "localhost/polis-shadow-producer@sha256:dfd6e42433a9e355dec81568b0b67e83c10f5c878bbdbe198354984f1302c0be"
+      },
+      "reader": {
+        "args": ["read"],
+        "image": "localhost/polis-shadow-reader@sha256:5d1560ce1e4ee6642791d7c60a50e85d6d4eaf5de6006b59cdde93f927d2e00b"
+      },
+      "run_id": "00000000000000000000000000000000",
+      "run_spec": {
+        "engine_commit": "0000000000000000000000000000000000000000",
+        "engine_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "shadow_env": "python",
+        "shadow_started_ms": 1500000000000,
+        "window_seconds": 86400
+      },
+      "schema": "polis-probe-job/2",
+      "verifier": {
+        "args": ["verify"],
+        "image": "localhost/polis-shadow-verifier@sha256:f66c951eac0685c92396ad1bf2e7ddd5ba07400d013ddd1ebd87c0d27a38e782"
+      }
+    },
+    "math-backfill-verify-v1": {
+      "kind": "backfill-verify",
+      "max_seconds": 7200,
+      "producer": {
+        "args": ["produce"],
+        "image": "localhost/polis-verify-producer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "reader": {
+        "args": ["read"],
+        "image": "localhost/polis-verify-reader@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "run_id": "00000000000000000000000000000000",
+      "run_spec": {
+        "cutoff_ms": 1500000000000,
+        "max_cutoff_age_seconds": 3600,
+        "max_discovery_gap_seconds": 120,
+        "max_readiness_age_seconds": 900,
+        "readiness": null,
+        "source_ahead_ruling": "unresolved",
+        "source_env": "prod",
+        "target_env": "python",
+        "verification_sql_sha256": "e2b0040036dda58e98b7a293917928be0e018dda0728898bdf40c8383d6e6216"
+      },
+      "schema": "polis-probe-job/2",
+      "verifier": {
+        "args": ["verify"],
+        "image": "localhost/polis-verify-verifier@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "vote-census-v1": {
+      "schema": "polis-probe-job/2",
+      "kind": "vote-census",
+      "run_id": "00000000000000000000000000000000",
+      "max_seconds": 2400,
+      "run_spec": {
+        "source_commit": "0000000000000000000000000000000000000000",
+        "sql_sha256": "b0080d7c7dcb2952e35f82547e192486041b12fbd34c1dea903e3b0b32d8c94e"
+      },
+      "reader": {
+        "image": "localhost/polis-vote-census-reader@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "read"
+        ]
+      },
+      "producer": {
+        "image": "localhost/polis-vote-census-producer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "produce"
+        ]
+      },
+      "verifier": {
+        "image": "localhost/polis-vote-census-verifier@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "args": [
+          "verify"
+        ]
+      }
+    }
+  }
+}

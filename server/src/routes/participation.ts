@@ -1,26 +1,32 @@
 import _ from "underscore";
 
-import { addExtendedParticipantInfo, joinConversation } from "../participant";
 import { failJson } from "../utils/fail";
-import { getConversationInfo } from "../conversation";
 import { getNextComment } from "../nextComment";
 import { getPca } from "../utils/pca";
+import { presentPca } from "../utils/pcaPresentation";
 import { getPid, getUser } from "../user";
 import { getVotesForSingleParticipant } from "./votes";
 import { getXidRecord } from "../xids";
 import { getXids } from "./xids";
-import { isConversationOwner, isOwner } from "../utils/common";
+import { isConversationOwner } from "../utils/common";
+import { getConversationInfo } from "../conversation";
+import {
+  assignToPCustom,
+  getConversationIdFetchZid,
+  need,
+} from "../utils/parameter";
 import { MPromise } from "../utils/metered";
-import { ParticipantFields, ParticipantInfo, ExpressResponse } from "../d";
+import { ParticipantFields, ExpressResponse } from "../d";
 import { sql_participants_extended } from "../db/sql";
-import { userHasAnsweredZeQuestions } from "../server-helpers";
 import logger from "../utils/logger";
 import pg from "../db/pg-query";
+import { participantVoteCountSql } from "../db/activity";
 import {
-  doFamousQuery,
-  updateLastInteractionTimeForConversation,
-  getOneConversation,
-} from "../server-helpers";
+  isXidAccountError,
+  requireXidParticipantAccount,
+  respondToXidAccountError,
+} from "../auth/xid-account";
+import { doFamousQuery, getOneConversation } from "../server-helpers";
 
 // basic defaultdict implementation
 function DD(this: any, f: () => { votes: number; comments: number }) {
@@ -68,7 +74,7 @@ function _getParticipant(zid: number, uid?: number) {
     "_getParticipant",
     function (resolve: (arg0: any) => void, reject: (arg0: Error) => any) {
       pg.query_readOnly(
-        "SELECT * FROM participants WHERE zid = ($1) AND uid = ($2);",
+        `SELECT p.*, ${participantVoteCountSql("p")} AS vote_count FROM participants p WHERE zid = ($1) AND uid = ($2);`,
         [zid, uid],
         function (err: any, results: { rows: any[] }) {
           if (err) {
@@ -93,7 +99,7 @@ function handle_GET_participants(
   const zid = req.p.zid;
 
   pg.queryP_readOnly(
-    "select * from participants where uid = ($1) and zid = ($2)",
+    `select p.*, ${participantVoteCountSql("p")} AS vote_count from participants p where uid = ($1) and zid = ($2)`,
     [uid, zid]
   )
     .then(function (rows: string | any[]) {
@@ -105,90 +111,34 @@ function handle_GET_participants(
     });
 }
 
-function handle_POST_participants(
-  req: {
-    p: {
-      zid: number;
-      uid?: number;
-      answers: any;
-      parent_url: any;
-      referrer: any;
-    };
+const needParticipationConversationId = need(
+  "conversation_id",
+  (value: unknown) => {
+    if (typeof value === "string" && !value.trim()) {
+      return Promise.reject("polis_fail_parse_string_missing");
+    }
+    return getConversationIdFetchZid(value);
   },
-  res: ExpressResponse
-) {
-  const zid = req.p.zid;
-  const uid = req.p.uid;
-  const answers = req.p.answers;
-  const info: ParticipantInfo = {};
-
-  // Use direct parameters - no cookie fallback
-  const parent_url = req.p.parent_url;
-  const referrer = req.p.referrer;
-
-  if (parent_url) {
-    info.parent_url = parent_url;
+  assignToPCustom("zid"),
+  (res, code, err) => {
+    // The resolver rejects this string only for an absent invite; database
+    // Errors, including one with the same message, keep the existing fallback.
+    if (err === "polis_err_fetching_zid_for_conversation_id") {
+      failJson(res, 404, err);
+      return true;
+    }
+    if (
+      err === undefined ||
+      err === "polis_fail_parse_string_missing" ||
+      err === "polis_fail_parse_string_too_long" ||
+      err === "polis_fail_parse_string_too_short"
+    ) {
+      failJson(res, 400, code);
+      return true;
+    }
+    return false;
   }
-  if (referrer) {
-    info.referrer = referrer;
-  }
-
-  function finish(ptpt: any) {
-    setTimeout(function () {
-      updateLastInteractionTimeForConversation(zid, uid);
-    }, 0);
-    res.status(200).json(ptpt);
-  }
-
-  function doJoin() {
-    userHasAnsweredZeQuestions(zid, answers).then(
-      function () {
-        joinConversation(zid, uid, info, answers).then(
-          function (ptpt: any) {
-            finish(ptpt);
-          },
-          function (err: any) {
-            failJson(res, 500, "polis_err_add_participant", err);
-          }
-        );
-      },
-      function (err: { message: any }) {
-        failJson(res, 400, err.message, err);
-      }
-    );
-  }
-
-  // Check if already in the conversation
-  _getParticipant(zid, req.p.uid)
-    .then(
-      function (ptpt: { pid: number }) {
-        if (ptpt) {
-          finish(ptpt);
-          addExtendedParticipantInfo(zid, req.p.uid, info);
-          return;
-        }
-
-        getConversationInfo(zid)
-          .then(function () {
-            doJoin();
-          })
-          .catch(function (err: any) {
-            failJson(
-              res,
-              500,
-              "polis_err_post_participants_need_uid_to_check_lti_users_4",
-              err
-            );
-          });
-      },
-      function (err: any) {
-        failJson(res, 500, "polis_err_post_participants_db_err", err);
-      }
-    )
-    .catch(function (err: any) {
-      failJson(res, 500, "polis_err_post_participants_misc", err);
-    });
-}
+);
 
 function handle_GET_participation(
   req: { p: { zid: number; uid?: number; strict: any } },
@@ -197,19 +147,27 @@ function handle_GET_participation(
   const zid = req.p.zid;
   const uid = req.p.uid;
   const strict = req.p.strict;
-  isOwner(zid, uid)
-    .then(function (ok: any) {
-      if (!ok) {
+  getConversationInfo(zid)
+    .then(function (info) {
+      if (!info) {
+        failJson(res, 404, "polis_err_fetching_zid_for_conversation_id");
+        return;
+      }
+      if (info.owner !== uid) {
         failJson(res, 403, "polis_err_get_participation_auth");
         return;
       }
 
+      // This owner-gated route runs two whole-conversation group-by scans over
+      // votes and comments; like conversationStats they run on the bounded
+      // report/export pool, never the participation read pool. getXids stays on
+      // the read pool (it is a shared helper, not itself a heavy scan).
       return Promise.all([
-        pg.queryP_readOnly(
+        pg.queryP_reportExport(
           "select pid, count(*) from votes where zid = ($1) group by pid;",
           [zid]
         ),
-        pg.queryP_readOnly(
+        pg.queryP_reportExport(
           "select pid, count(*) from comments where zid = ($1) group by pid;",
           [zid]
         ),
@@ -281,6 +239,14 @@ function handle_GET_participation(
       });
     })
     .catch(function (err: any) {
+      // The report/export pool holds one connection per process by default, so
+      // an export or report running past its acquire timeout leaves these
+      // counts without a connection. That is a busy pool, not a defect: answer
+      // 503 with its own code so the caller can retry.
+      if (pg.isPoolAcquireTimeout(err)) {
+        failJson(res, 503, "polis_err_get_participation_busy", err);
+        return;
+      }
       failJson(res, 500, "polis_err_get_participation_misc", err);
     });
 }
@@ -368,9 +334,11 @@ async function handle_GET_participationInit(
       try {
         const xidRecords = await getXidRecord(req.p.xid, req.p.zid);
         if (xidRecords && xidRecords.length > 0) {
+          await requireXidParticipantAccount(xidRecords[0].uid);
           effectiveUidForUser = xidRecords[0].uid;
         }
       } catch (err) {
+        if (isXidAccountError(err)) throw err;
         logger.debug("XID not found for user resolution:", err);
       }
     }
@@ -382,7 +350,10 @@ async function handle_GET_participationInit(
         ? _getParticipant(req.p.zid, effectiveUidForUser)
         : Promise.resolve(null),
       getOneConversation(req.p.zid, effectiveUidForUser, null),
-      getPca(req.p.zid, undefined),
+      // The presented blob, not the raw one: for a conversation with no math
+      // this still carries the comment defaults already-loaded clients read
+      // (see utils/pcaPresentation).
+      getPca(req.p.zid, undefined).then((data) => presentPca(req.p.zid, data)),
     ]);
 
     response.user = user;
@@ -414,7 +385,7 @@ async function handle_GET_participationInit(
       doFamousQuery({
         uid: uid,
         zid: req.p.zid,
-        math_tick: response.pca?.math_tick || 0,
+        math_tick: pcaData?.asPOJO.math_tick ?? 0,
         ptptoiLimit: req.p.ptptoiLimit || 30,
       }),
     ]);
@@ -449,6 +420,9 @@ async function handle_GET_participationInit(
 
     res.status(200).json(response);
   } catch (err) {
+    if (isXidAccountError(err)) {
+      return respondToXidAccountError(res, err);
+    }
     logger.error("Error in handle_GET_participationInit:", err);
     failJson(res, 500, "polis_err_get_participationInit", err);
   }
@@ -464,6 +438,14 @@ function handle_PUT_participants_extended(
   const fields: ParticipantFields = {};
   if (!_.isUndefined(req.p.show_translation_activated)) {
     fields.show_translation_activated = req.p.show_translation_activated;
+  }
+
+  // Same defect as PUT /api/v3/users: the only assignable column comes from a
+  // want() parameter, so an empty update renders
+  // "UPDATE participants_extended SET  WHERE …" and Postgres answers 42601.
+  if (_.isEmpty(fields)) {
+    failJson(res, 400, "polis_err_param_missing_show_translation_activated");
+    return;
   }
 
   const q = sql_participants_extended
@@ -521,10 +503,10 @@ function handle_POST_query_participants_by_metadata(
 }
 
 export {
+  needParticipationConversationId,
   handle_GET_participants,
   handle_GET_participation,
   handle_GET_participationInit,
-  handle_POST_participants,
   handle_POST_query_participants_by_metadata,
   handle_PUT_participants_extended,
 };

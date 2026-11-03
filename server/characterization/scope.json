@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "exclusions": [
+    {
+      "id": 74,
+      "method": "GET",
+      "path": "/robots.txt",
+      "reason": "Static robots.txt response; not part of API replacement."
+    },
+    {
+      "id": 135,
+      "method": "GET",
+      "path": "/^\\/[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 145,
+      "method": "GET",
+      "path": "/^\\/m\\/[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 146,
+      "method": "GET",
+      "path": "/^\\/integrate(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 148,
+      "method": "GET",
+      "path": "/^\\/account(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 150,
+      "method": "GET",
+      "path": "/^\\/conversations(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 151,
+      "method": "GET",
+      "path": "/^\\/signout(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 152,
+      "method": "GET",
+      "path": "/^\\/signin(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 155,
+      "method": "GET",
+      "path": "/^\\/privacy$/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 156,
+      "method": "GET",
+      "path": "/^\\/tos$/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 157,
+      "method": "GET",
+      "path": "/^\\/donate$/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 174,
+      "method": "GET",
+      "path": "/^\\/report\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 175,
+      "method": "GET",
+      "path": "/^\\/narrativeReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 176,
+      "method": "GET",
+      "path": "/^\\/stats\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 177,
+      "method": "GET",
+      "path": "/^\\/commentsReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 178,
+      "method": "GET",
+      "path": "/^\\/topicReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 179,
+      "method": "GET",
+      "path": "/^\\/topicsVizReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 180,
+      "method": "GET",
+      "path": "/^\\/topicHierarchy\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 181,
+      "method": "GET",
+      "path": "/^\\/collectiveStatements\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 182,
+      "method": "GET",
+      "path": "/^\\/exportReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 183,
+      "method": "GET",
+      "path": "/^\\/topicMapNarrativeReport\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 184,
+      "method": "GET",
+      "path": "/^\\/topicStats\\/r?[0-9][0-9A-Za-z]+(\\/.*)?/",
+      "reason": "HTML preload/page-rendering contract retained in Node, not certified as a pure read or a Rust API route; underlying API registrations are separately driven."
+    },
+    {
+      "id": 191,
+      "method": "GET",
+      "path": "/^\\/home(\\/.*)?/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 193,
+      "method": "GET",
+      "path": "/",
+      "reason": "HTML shell or asset fetch delegated to the static server; retained with the Node page router."
+    },
+    {
+      "id": 197,
+      "method": "GET",
+      "path": "/^\\/report_bundle.*\\.js$/",
+      "reason": "Static proxy/routing tail retained in Node; unmatched API GET behavior is separately recorded by the mandatory proxied-HTML oracle."
+    },
+    {
+      "id": 198,
+      "method": "GET",
+      "path": "/^\\/report_style.*\\.css$/",
+      "reason": "Static proxy/routing tail retained in Node; unmatched API GET behavior is separately recorded by the mandatory proxied-HTML oracle."
+    },
+    {
+      "id": 199,
+      "method": "GET",
+      "path": "/.*\\//",
+      "reason": "Static proxy/routing tail retained in Node; unmatched API GET behavior is separately recorded by the mandatory proxied-HTML oracle."
+    },
+    {
+      "id": 208,
+      "method": "GET",
+      "path": "/^\\/ops(\\/.*)?$/",
+      "reason": "Optional operations page is not registered with operations disabled in the sealed fixture; API operations routes are recorded separately."
+    }
+  ]
+}

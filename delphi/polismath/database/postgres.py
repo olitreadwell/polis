@@ -14,20 +14,47 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from datetime import datetime
 import re
 import urllib.parse
+from collections.abc import Iterator
 from contextlib import contextmanager
 import asyncio
 
 import sqlalchemy as sa
-from sqlalchemy.orm import DeclarativeBase, sessionmaker, scoped_session
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker, scoped_session
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import text
 import numpy as np
 import pandas as pd
 
-from polismath.utils.general import postgres_vote_to_delphi
+from polismath.utils.serialization import convert_numpy_types
+from polismath.utils.vote_convention import (
+    CONVENTION_COLUMNS_SQL,
+    CONVENTION_JOIN_SQL,
+    ConstantConventionSource,
+    ConventionSource,
+    RowConventionSource,
+    StorageConvention,
+    database_row_fetcher,
+    load_semantic_votes,
+    validate_storage_agree_value,
+)
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+
+def encode_math_blob(data: Any) -> str:
+    """Encode a math blob for a ``jsonb`` parameter, or pass one through.
+
+    The poller pre-encodes all three blobs BEFORE opening the publication
+    transaction (``math_writer.write_conv_updates``) so that ``json.dumps`` of a
+    large ``math_main`` blob does not run while the ``(zid, math_env)`` row
+    locks are held — it lengthens both the lock hold and the
+    caching_tick allocate -> commit window (R12). Every other caller still
+    hands these writers a dict.
+    """
+    if isinstance(data, str):
+        return data
+    return json.dumps(data, default=convert_numpy_types)
 
 
 # Base class for SQLAlchemy models
@@ -52,7 +79,7 @@ class PostgresConfig:
         max_overflow: Optional[int] = None,
         ssl_mode: Optional[str] = None,
         math_env: Optional[str] = None,
-    ):
+    ) -> None:
         """
         Initialize PostgreSQL configuration.
 
@@ -178,7 +205,7 @@ class MathMain(Base):
     math_tick = sa.Column(sa.BigInteger, nullable=False, default=-1)
     modified = sa.Column(sa.BigInteger, server_default=text("now_as_millis()"))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<MathMain(zid={self.zid}, math_env='{self.math_env}')>"
 
 
@@ -195,7 +222,7 @@ class MathTicks(Base):
         sa.BigInteger, nullable=False, server_default=text("now_as_millis()")
     )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<MathTicks(zid={self.zid}, math_env='{self.math_env}', math_tick={self.math_tick})>"
 
 
@@ -210,8 +237,25 @@ class MathPtptStats(Base):
     data = sa.Column(JSONB, nullable=False)
     modified = sa.Column(sa.BigInteger, server_default=text("now_as_millis()"))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<MathPtptStats(zid={self.zid}, math_env='{self.math_env}')>"
+
+
+class MathBidToPid(Base):
+    """Stores the base-cluster bid -> participant-id mapping (server consumes it
+    via server/src/utils/participants.ts).  Mirrors the Clojure math_bidtopid
+    table written by upload-math-bidtopid (postgres.clj:369-380)."""
+
+    __tablename__ = "math_bidtopid"
+
+    zid = sa.Column(sa.Integer, primary_key=True)
+    math_env = sa.Column(sa.String, primary_key=True)
+    math_tick = sa.Column(sa.BigInteger, nullable=False, default=-1)
+    data = sa.Column(JSONB, nullable=False)
+    modified = sa.Column(sa.BigInteger, server_default=text("now_as_millis()"))
+
+    def __repr__(self) -> str:
+        return f"<MathBidToPid(zid={self.zid}, math_env='{self.math_env}')>"
 
 
 class MathReportCorrelationMatrix(Base):
@@ -225,7 +269,7 @@ class MathReportCorrelationMatrix(Base):
     math_tick = sa.Column(sa.BigInteger, nullable=False, default=-1)
     modified = sa.Column(sa.BigInteger, server_default=text("now_as_millis()"))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"<MathReportCorrelationMatrix(rid={self.rid}, math_env='{self.math_env}')>"
         )
@@ -247,20 +291,152 @@ class WorkerTasks(Base):
     task_bucket = sa.Column(sa.BigInteger)
     finished_time = sa.Column(sa.BigInteger)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<WorkerTasks(task_type='{self.task_type}', finished_time={self.finished_time})"
+
+
+# --------------------------------------------------------------------------- #
+# Bundle promotion (P-073 §4.4): a staged label's bundle copied into the
+# small poller's label inside one publication transaction. The payloads never
+# leave Postgres.
+# --------------------------------------------------------------------------- #
+class Fingerprint(tuple):
+    """(math_tick, last_vote_timestamp, modified) of one label's math_main row,
+    plus whether its bundle is structurally complete (all four rows at one
+    initialized tick). Compared as the plain triple."""
+
+    __slots__ = ()
+
+    def __new__(cls, math_tick: int, last_vote_timestamp: int, modified: int,
+                complete: bool = True) -> "Fingerprint":
+        return super().__new__(cls, (int(math_tick), int(last_vote_timestamp),
+                                     int(modified), bool(complete)))
+
+    math_tick = property(lambda self: self[0])
+    lvt = property(lambda self: self[1])
+    modified = property(lambda self: self[2])
+    complete = property(lambda self: self[3])
+
+    def key(self) -> Tuple[int, int, int]:
+        return (self[0], self[1], self[2])
+
+
+def fingerprint_key(fp: Optional["Fingerprint"]) -> Optional[Tuple[int, int, int]]:
+    return None if fp is None else fp.key()
+
+
+def staged_newer(staged: "Fingerprint", target: Optional["Fingerprint"]) -> bool:
+    """Never an older input over a newer one: a staged bundle replaces the
+    target only when its newest vote is later, or equal with a later write
+    (a moderation update or a restage of the same votes)."""
+    if target is None:
+        return True
+    return staged.lvt > target.lvt or (staged.lvt == target.lvt
+                                       and staged.modified > target.modified)
+
+
+class PromotionRefused(RuntimeError):
+    """A promotion rolled back (the target tick included). ``reason`` is one
+    of PROMOTION_REASONS."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+PROMOTION_REASONS = ("superseded", "missing_staged", "invalid_staged", "not_newer",
+                     "postcondition")
+
+_FINGERPRINT_COLUMNS = """
+    m.zid AS zid, m.math_env AS math_env, m.math_tick AS math_tick,
+    m.last_vote_timestamp AS last_vote_timestamp,
+    COALESCE(m.modified, 0) AS modified,
+    COALESCE(m.math_tick >= 0 AND b.math_tick = m.math_tick AND p.math_tick = m.math_tick
+             AND k.math_tick = m.math_tick, false) AS complete
+"""
+_BUNDLE_JOINS = """
+    FROM math_main m
+    LEFT JOIN math_bidtopid b ON b.zid = m.zid AND b.math_env = m.math_env
+    LEFT JOIN math_ptptstats p ON p.zid = m.zid AND p.math_env = m.math_env
+    LEFT JOIN math_ticks k ON k.zid = m.zid AND k.math_env = m.math_env
+"""
+FINGERPRINTS_SQL = ("SELECT" + _FINGERPRINT_COLUMNS + _BUNDLE_JOINS
+                    + " WHERE m.zid = ANY(:zids) AND m.math_env = ANY(:envs)")
+
+_COPY_COMPANION_SQL = """
+    insert into {table} (zid, math_env, math_tick, data)
+    select s.zid, :dst, :tick, s.data from {table} s
+    where s.zid = :zid and s.math_env = :src
+    on conflict (zid, math_env)
+    do update set modified = now_as_millis(),
+                  data = excluded.data,
+                  math_tick = excluded.math_tick
+"""
+COPY_BIDTOPID_SQL = _COPY_COMPANION_SQL.format(table="math_bidtopid")
+COPY_PTPTSTATS_SQL = _COPY_COMPANION_SQL.format(table="math_ptptstats")
+# Same columns and caching_tick rule as write_math_main; the source is the
+# staged row.
+COPY_MAIN_SQL = """
+    insert into math_main (zid, math_env, last_vote_timestamp, math_tick, data, caching_tick)
+    select s.zid, :dst, s.last_vote_timestamp, :tick, s.data,
+           COALESCE((select max(caching_tick) + 1 from math_main where math_env = :dst), 1)
+    from math_main s where s.zid = :zid and s.math_env = :src
+    on conflict (zid, math_env)
+    do update set modified = now_as_millis(),
+                  data = excluded.data,
+                  last_vote_timestamp = excluded.last_vote_timestamp,
+                  math_tick = excluded.math_tick,
+                  caching_tick = excluded.caching_tick
+"""
+PROMOTED_POSTCONDITION_SQL = """
+    SELECT (SELECT math_tick FROM math_main WHERE zid = :zid AND math_env = :dst) AS main_tick,
+           (SELECT math_tick FROM math_bidtopid WHERE zid = :zid AND math_env = :dst) AS bid_tick,
+           (SELECT math_tick FROM math_ptptstats WHERE zid = :zid AND math_env = :dst) AS stats_tick,
+           (SELECT math_tick FROM math_ticks WHERE zid = :zid AND math_env = :dst) AS ticks_tick
+"""
+
+
+def _fingerprint_row(row: Any) -> Fingerprint:
+    lvt = row["last_vote_timestamp"]
+    return Fingerprint(row["math_tick"], -1 if lvt is None else lvt, row["modified"] or 0,
+                       bool(row["complete"]))
 
 
 class PostgresClient:
     """PostgreSQL client for Pol.is math."""
 
-    def __init__(self, config: Optional[PostgresConfig] = None):
+    def __init__(
+        self,
+        config: Optional[PostgresConfig] = None,
+        storage_agree_value: Optional[int] = None,
+        convention_source: Optional[ConventionSource] = None,
+    ) -> None:
         """
         Initialize PostgreSQL client.
 
         Args:
             config: PostgreSQL configuration
+            storage_agree_value: a DECLARED raw storage sign of AGREE, -1 or
+                +1, for a database whose convention the caller knows (a
+                derived paired fixture). Validated here, so an unknown
+                convention fails at construction.
+            convention_source: where the sign comes from otherwise. Default:
+                this database's own ``vote_convention`` row (P-078), read once
+                per poll cycle; a database without the row (every database
+                before P-078 PR-A) is version 0 at
+                ``vote_convention.STORAGE_AGREE_VALUE``. When the row exists the
+                vote polls also read it in the same statement as the votes.
         """
+        if storage_agree_value is not None and convention_source is not None:
+            raise ValueError("pass storage_agree_value or convention_source, not both")
+        if storage_agree_value is not None:
+            self.convention_source: ConventionSource = ConstantConventionSource(
+                validate_storage_agree_value(storage_agree_value), origin="declared")
+        elif convention_source is not None:
+            self.convention_source = convention_source
+        else:
+            self.convention_source = RowConventionSource(
+                database_row_fetcher(lambda sql: self.query(sql)))
         self.config = config or PostgresConfig.from_env()
         self.engine = None
         self.session_factory = None
@@ -312,6 +488,43 @@ class PostgresClient:
                 f"Initialized PostgreSQL connection to {self.config.host}:{self.config.port}/{self.config.database}"
             )
 
+    @property
+    def storage_agree_value(self) -> int:
+        """The storage sign of AGREE this client reads votes with (its source's)."""
+        return self.convention_source.current().agree_value
+
+    def begin_convention_cycle(self) -> None:
+        """Start a poll cycle: the next vote read asks the source again."""
+        self.convention_source.begin_cycle()
+
+    def _vote_rows(self, where: str, params: Dict[str, Any],
+                   columns: str = "v.zid, v.tid, v.pid, v.vote, v.created") -> List[Dict[str, Any]]:
+        """``votes`` rows as semantic votes: the polismath vote chokepoint.
+
+        Every vote read of this client comes through here. The sign is the
+        convention source's; when the database carries the ``vote_convention``
+        row it is joined into the same statement (one snapshot for the votes
+        and their sign) and each row is converted by its own. A NULL vote is
+        not filtered: ``int(None)`` raises ``TypeError`` and fails the poll,
+        exactly as before the chokepoint (whether NULL should instead be
+        skipped is an open question, not decided here).
+        Row order is ``zid, tid, pid, created`` (Clojure conv-poll parity).
+        """
+        convention: StorageConvention = self.convention_source.current()
+        joined = convention.origin == "database"
+        sql = (f"SELECT {columns}"
+               + (f", {CONVENTION_COLUMNS_SQL}" if joined else "")
+               + " FROM votes v"
+               + (f" {CONVENTION_JOIN_SQL}" if joined else "")
+               + f" WHERE {where}"
+               + " ORDER BY v.zid, v.tid, v.pid, v.created")
+        # int() first, as the pre-chokepoint readers did: a NULL row raises
+        # TypeError here and the poll fails rather than skipping it.
+        rows = [{**r, "vote": int(r["vote"])} for r in self.query(sql, params)]
+        return load_semantic_votes(
+            rows, storage_agree_value=None if joined else convention.agree_value,
+            null_policy="refuse")
+
     def shutdown(self) -> None:
         """
         Shut down the database connection.
@@ -335,7 +548,7 @@ class PostgresClient:
             logger.info("Shut down PostgreSQL connection")
 
     @contextmanager
-    def session(self):
+    def session(self) -> Iterator[Session]:
         """
         Get a database session context.
 
@@ -392,9 +605,38 @@ class PostgresClient:
         if not self._initialized:
             self.initialize()
 
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
             result = conn.execute(text(sql), params or {})
             return result.rowcount
+
+    @contextmanager
+    def transaction(self) -> Iterator[sa.Connection]:
+        """One commit/rollback boundary; the connection belongs to the caller.
+
+        Never store it on this shared client: different zid workers must use
+        independent connections and transactions.
+        """
+        if not self._initialized:
+            self.initialize()
+        with self.engine.begin() as conn:
+            yield conn
+
+    def _write_returning(
+        self, sql: str, params: Optional[Dict[str, Any]] = None,
+        *, connection: Optional[sa.Connection] = None,
+    ) -> List[Dict[str, Any]]:
+        """Write within the supplied transaction, or commit a standalone call.
+
+        Only the owner of ``connection`` commits or rolls back. This lets the
+        poller publish a complete snapshot while retaining per-table callers.
+        """
+        if connection is None:
+            with self.transaction() as conn:
+                return self._write_returning(sql, params, connection=conn)
+        result = connection.execute(text(sql), params or {})
+        if result.returns_rows:
+            return [dict(row) for row in result.mappings().all()]
+        return []
 
     def get_zinvite_from_zid(self, zid: int) -> Optional[str]:
         """
@@ -433,55 +675,131 @@ class PostgresClient:
         return None
 
     def poll_votes(
-        self, zid: int, since: Optional[datetime] = None
+        self, zid: int, since: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
-        Poll for new votes in a conversation.
+        Poll for new votes in a conversation, as semantic votes (+1 agree).
 
-        Vote signs are flipped at this PostgreSQL boundary:
-        - PostgreSQL stores: AGREE=-1, DISAGREE=+1
-        - Delphi expects:    AGREE=+1, DISAGREE=-1
+        The raw storage sign is converted at this PostgreSQL boundary by the
+        one vote convention (``_vote_rows``); a NULL vote raises, as before.
 
         Args:
             zid: Conversation ID
-            since: Only get votes after this timestamp
+            since: Only get votes after this timestamp — epoch MILLIS (int),
+                matching the BIGINT ``votes.created`` column (a datetime would
+                make Postgres error on the bigint comparison)
 
         Returns:
             List of votes with signs converted to Delphi convention
         """
-        params = {"zid": zid}
-
-        # Build SQL query
-        sql = """
-        SELECT
-            zid,
-            tid,
-            pid,
-            vote,
-            created
-        FROM
-            votes
-        WHERE
-            zid = :zid
-        """
-
-        # Add timestamp filter if provided
-        if since:
-            sql += " AND created > :since"
+        params: Dict[str, Any] = {"zid": zid}
+        where = "v.zid = :zid"
+        if since is not None:
+            where += " AND v.created > :since"
             params["since"] = since
 
-        # Execute query
-        votes = self.query(sql, params)
+        # Row order matters for parity: Clojure conv-poll orders by
+        # [:zid :tid :pid :created] (postgres.clj:197-212).  update_votes assigns
+        # base-cluster IDs by first-appearance order of participants, which seeds
+        # k-means; a different row order changes k.  _vote_rows orders identically.
+        votes = self._vote_rows(where, params)
 
-        # Format votes for processing, flipping sign at PostgreSQL boundary
+        # pid AND tid are kept as the DB's native int (votes.pid/tid are both
+        # INTEGER) — NOT str()-wrapped. Found live (2026-07-24, poller-
+        # equivalence harness, session 2): the pid cast was the ONLY source
+        # of a Type-mismatch divergence in math_main.base-clusters.members
+        # against Clojure (which holds an int pid throughout) —
+        # Conversation.update_votes is deliberately type-agnostic at ingress
+        # ("Preserve original type", both pid AND tid) and
+        # raw_rating_mat/rating_mat are ALWAYS rebuilt fresh from these two
+        # methods on every load-or-init (never restored via from_dict — see
+        # polismath/poller/__init__.py's "load-or-init finding" docstring),
+        # so removing the cast is a one-point fix with no other code changes
+        # needed. Session 3 (same day): fixing pid alone left tid's OWN
+        # str() cast unmasked — a live vw full-run then showed the SAME
+        # Type-mismatch pattern on zid/tids[]/repness.*.tid, traced to this
+        # same cast. The certified/CSV replay driver never cast tid either,
+        # and matched clj int-for-int across 20 cross-validated entries —
+        # the evidence that authorized this fix. See also poll_moderation
+        # below, which needed the SAME fix for mod_out_tids/mod_in_tids/
+        # meta_tids/mod_out_ptpts to stay type-consistent with these two.
         return [
             {
-                "pid": str(v["pid"]),
-                "tid": str(v["tid"]),
-                "vote": postgres_vote_to_delphi(int(v["vote"])),
+                "pid": v["pid"],
+                "tid": v["tid"],
+                "vote": v["vote"],
                 "created": v["created"],
             }
             for v in votes
+        ]
+
+    def poll_votes_since(self, since: int) -> List[Dict[str, Any]]:
+        """
+        Global vote poll across ALL conversations since a watermark.
+
+        Mirrors the Clojure vote poller query (postgres.clj:132-145):
+            SELECT * FROM votes WHERE created > watermark
+            ORDER BY zid, tid, pid, created
+        Signs are converted to the Delphi convention at this ingress boundary
+        (``_vote_rows``); a NULL vote raises TypeError and fails the poll, as
+        before the chokepoint.
+
+        Args:
+            since: Watermark (millis since epoch); returns rows with created > since
+
+        Returns:
+            List of votes {zid, pid, tid, vote, created}, semantic sign, ordered.
+        """
+        rows = self._vote_rows("v.created > :since", {"since": since})
+        # pid AND tid kept as the DB's native int — see poll_votes's
+        # docstring/comment above for the full root-cause rationale
+        # (2026-07-24 live findings, sessions 2-3).
+        return [
+            {
+                "zid": int(v["zid"]),
+                "pid": v["pid"],
+                "tid": v["tid"],
+                "vote": v["vote"],
+                "created": v["created"],
+            }
+            for v in rows
+        ]
+
+    def poll_moderation_since(self, since: int) -> List[Dict[str, Any]]:
+        """
+        Global moderation poll across ALL conversations since a watermark.
+
+        Mirrors the Clojure mod poller query (postgres.clj:148-161):
+            SELECT * FROM comments WHERE modified > watermark
+            ORDER BY zid, tid, modified
+        Returns the raw changed-comment rows so the caller can group by zid and
+        advance the watermark to max(modified).  The per-zid worker then
+        re-derives the FULL current moderation state via poll_moderation(zid).
+
+        Args:
+            since: Watermark (millis since epoch); rows with modified > since
+
+        Returns:
+            List of {zid, tid, modified, mod, is_meta}.
+        """
+        rows = self.query(
+            """
+            SELECT zid, tid, modified, mod, is_meta
+            FROM comments
+            WHERE modified > :since
+            ORDER BY zid, tid, modified
+            """,
+            {"since": since},
+        )
+        return [
+            {
+                "zid": int(m["zid"]),
+                "tid": int(m["tid"]),
+                "modified": m["modified"],
+                "mod": m["mod"],
+                "is_meta": m["is_meta"],
+            }
+            for m in rows
         ]
 
     def get_report_comment_selections(
@@ -524,14 +842,15 @@ class PostgresClient:
         return self.query(sql, params)
 
     def poll_moderation(
-        self, zid: int, since: Optional[datetime] = None
+        self, zid: int, since: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Poll for moderation changes in a conversation.
 
         Args:
             zid: Conversation ID
-            since: Only get changes after this timestamp
+            since: Only get changes after this timestamp — epoch MILLIS (int),
+                matching the BIGINT ``comments.modified`` column
 
         Returns:
             Dictionary with moderation data
@@ -559,13 +878,22 @@ class PostgresClient:
         # Execute query
         mods = self.query(sql_mods, params)
 
-        # Format moderation data
+        # Format moderation data. tid is kept as the DB's native int — NOT
+        # str()-wrapped (2026-07-24 live finding, session 3): mod_out_tids
+        # feeds Conversation._apply_moderation's
+        # ``[c for c in self.mod_out_tids if c in self.rating_mat.columns]``
+        # intersection UNCONDITIONALLY (no engine-mode branch, unlike the
+        # participant-ban check below) — left str while poll_votes/
+        # poll_votes_since's tid became int, that intersection would ALWAYS
+        # be empty, silently disabling moderated-out comment zeroing in the
+        # live poller. poll_moderation_since (the OTHER, global-watermark
+        # variant) already used int(m["tid"]) and was never affected.
         mod_out_tids = []
         mod_in_tids = []
         meta_tids = []
 
         for m in mods:
-            tid = str(m["tid"])
+            tid = m["tid"]
 
             # Check moderation status with support for string values
             mod_value = m["mod"]
@@ -592,8 +920,15 @@ class PostgresClient:
         # Execute query
         mod_ptpts = self.query(sql_ptpts, params)
 
-        # Format moderated participants
-        mod_out_ptpts = [str(p["pid"]) for p in mod_ptpts]
+        # Format moderated participants. pid kept as the DB's native int —
+        # NOT str()-wrapped (2026-07-24 live finding, session 3): keeps this
+        # consistent with poll_votes/poll_votes_since's (also-int) pid, for
+        # Conversation._apply_moderation's ``p not in self.mod_out_ptpts``
+        # check ('improved' engine mode only — 'clojure-legacy' intentionally
+        # leaks bans and skips this check entirely, so this specific fix has
+        # no observable effect in the mode this harness runs in, but matters
+        # for 'improved' mode elsewhere).
+        mod_out_ptpts = [p["pid"] for p in mod_ptpts]
 
         return {
             "mod_out_tids": mod_out_tids,
@@ -603,36 +938,60 @@ class PostgresClient:
         }
 
     def load_math_main(self, zid: int) -> Optional[Dict[str, Any]]:
+        """Load main plus generation completeness in ONE statement snapshot.
+
+        Separate SELECTs at READ COMMITTED could straddle a successful publish
+        and falsely diagnose a mixed generation. Missing companions and NULL
+        ticks are incomplete, even if both companions are missing/NULL alike.
         """
-        Load math results for a conversation.
+        # bundle_valid: the backfill's shared validity rule over the same
+        # snapshot. The live restore uses warm state
+        # only from a valid bundle, so a malformed row (a wrong body zid, say)
+        # is never restored into its own replacement. Imported here to keep
+        # the database layer free of an import-time dependency on the poller.
+        from polismath.poller.backfill import VALID_BUNDLE_SQL
 
-        Args:
-            zid: Conversation ID
+        rows = self.query(
+            """
+            SELECT m.*, COALESCE(
+                m.math_tick = b.math_tick AND m.math_tick = p.math_tick,
+                false) AS snapshot_complete,
+            """ + VALID_BUNDLE_SQL + """ AS bundle_valid
+            FROM math_main m
+            LEFT JOIN math_bidtopid b ON b.zid = m.zid AND b.math_env = m.math_env
+            LEFT JOIN math_ptptstats p ON p.zid = m.zid AND p.math_env = m.math_env
+            LEFT JOIN math_ticks k ON k.zid = m.zid AND k.math_env = m.math_env
+            WHERE m.zid = :zid AND m.math_env = :math_env
+            """,
+            {"zid": zid, "math_env": self.config.math_env},
+        )
+        return rows[0] if rows else None
 
-        Returns:
-            Math data, or None if not found
+    def find_incomplete_math_snapshots(self) -> List[int]:
+        """Find legacy partial publications, including dormant/orphan rows.
+
+        Run once at startup, independent of vote/moderation lookback. FULL
+        JOINs include companion-only remnants; namespace predicates are applied
+        before joining so another engine's rows cannot complete this snapshot.
         """
-        with self.session() as session:
-            # Query for math main data
-            math_main = (
-                session.query(MathMain)
-                .filter_by(zid=zid, math_env=self.config.math_env)
-                .first()
-            )
-
-            if not math_main:
-                return None
-
-            # Return data with all fields
-            return {
-                "zid": math_main.zid,
-                "math_env": math_main.math_env,
-                "data": math_main.data,
-                "last_vote_timestamp": math_main.last_vote_timestamp,
-                "caching_tick": math_main.caching_tick,
-                "math_tick": math_main.math_tick,
-                "modified": math_main.modified,
-            }
+        rows = self.query(
+            """
+            SELECT zid FROM
+                (SELECT zid, math_tick AS main_tick FROM math_main
+                 WHERE math_env = :math_env) m
+            FULL JOIN
+                (SELECT zid, math_tick AS bid_tick FROM math_bidtopid
+                 WHERE math_env = :math_env) b USING (zid)
+            FULL JOIN
+                (SELECT zid, math_tick AS stats_tick FROM math_ptptstats
+                 WHERE math_env = :math_env) p USING (zid)
+            WHERE main_tick IS NULL OR bid_tick IS NULL OR stats_tick IS NULL
+               OR main_tick <> bid_tick OR main_tick <> stats_tick
+            ORDER BY zid
+            """,
+            {"math_env": self.config.math_env},
+        )
+        return [row["zid"] for row in rows]
 
     def write_math_main(
         self,
@@ -641,71 +1000,129 @@ class PostgresClient:
         last_vote_timestamp: Optional[int] = None,
         caching_tick: Optional[int] = None,
         math_tick: Optional[int] = None,
+        *, connection: Optional[sa.Connection] = None,
     ) -> None:
         """
-        Write math results for a conversation.
+        Write math results for a conversation (Clojure upload-math-main parity).
+
+        caching_tick is NEVER taken from the caller: it is derived in-SQL exactly
+        as Clojure does (postgres.clj:323-338):
+
+            caching_tick = COALESCE(
+                (SELECT max(caching_tick) + 1 FROM math_main WHERE math_env = ?),
+                1)
+
+        Allocation happens inside the publication transaction. MAX+1 still
+        races across different zids (R12); it is not a commit-order guarantee.
+        The `caching_tick` parameter is accepted for signature compatibility
+        but ignored.
 
         Args:
             zid: Conversation ID
-            data: Math data
+            data: Math data (JSON blob stored verbatim)
             last_vote_timestamp: Timestamp of last processed vote
-            caching_tick: Current caching tick
-            math_tick: Current math tick
+            caching_tick: Ignored (derived in SQL); kept for back-compat
+            math_tick: Current math tick (shared with the other writes this cycle)
         """
-        with self.session() as session:
-            # Check if record exists
-            math_main = (
-                session.query(MathMain)
-                .filter_by(zid=zid, math_env=self.config.math_env)
-                .first()
-            )
+        last_vote_timestamp = (
+            last_vote_timestamp
+            if last_vote_timestamp is not None
+            else int(time.time() * 1000)
+        )
+        # NOTE: math_env appears twice in the params — once for the row value and
+        # once inside the caching_tick subquery (mirrors Clojure's duplicated ?).
+        self._write_returning(
+            """
+            insert into math_main
+                (zid, math_env, last_vote_timestamp, math_tick, data, caching_tick)
+            values
+                (:zid, :math_env, :last_vote_timestamp, :math_tick,
+                 cast(:data as jsonb),
+                 COALESCE((select max(caching_tick) + 1 from math_main
+                           where math_env = :math_env), 1))
+            on conflict (zid, math_env)
+            do update set modified = now_as_millis(),
+                          data = excluded.data,
+                          last_vote_timestamp = excluded.last_vote_timestamp,
+                          math_tick = excluded.math_tick,
+                          caching_tick = excluded.caching_tick
+            returning zid;
+            """,
+            {
+                "zid": zid,
+                "math_env": self.config.math_env,
+                "last_vote_timestamp": last_vote_timestamp,
+                "math_tick": math_tick if math_tick is not None else -1,
+                "data": encode_math_blob(data),
+            },
+            connection=connection,
+        )
 
-            if math_main:
-                # Update existing record
-                math_main.data = data
-                if last_vote_timestamp is not None:
-                    math_main.last_vote_timestamp = last_vote_timestamp
-                if caching_tick is not None:
-                    math_main.caching_tick = caching_tick
-                if math_tick is not None:
-                    math_main.math_tick = math_tick
-            else:
-                # Create new record
-                math_main = MathMain(
-                    zid=zid,
-                    math_env=self.config.math_env,
-                    data=data,
-                    last_vote_timestamp=last_vote_timestamp or int(time.time() * 1000),
-                    caching_tick=caching_tick or 0,
-                    math_tick=math_tick or -1,
-                )
-                session.add(math_main)
-
-    def write_participant_stats(self, zid: int, data: Dict[str, Any]) -> None:
+    def write_math_bidtopid(
+        self, zid: int, data: Dict[str, Any], math_tick: Optional[int] = None,
+        *, connection: Optional[sa.Connection] = None,
+    ) -> None:
         """
-        Write participant statistics for a conversation.
+        Write the bid -> participant-id mapping (Clojure upload-math-bidtopid,
+        postgres.clj:369-380).  Net-new writer: the TS server's
+        getBidIndexToPidMapping / getPidsForGid (participants.ts) depend on it.
 
         Args:
             zid: Conversation ID
-            data: Participant statistics data
+            data: prep-bidToPid blob {"zid", "bidToPid", "lastVoteTimestamp"}
+            math_tick: Current math tick (shared with the other writes this cycle)
         """
-        with self.session() as session:
-            # Check if record exists
-            ptpt_stats = (
-                session.query(MathPtptStats)
-                .filter_by(zid=zid, math_env=self.config.math_env)
-                .first()
-            )
+        self._write_returning(
+            """
+            insert into math_bidtopid (zid, math_env, math_tick, data)
+            values (:zid, :math_env, :math_tick, cast(:data as jsonb))
+            on conflict (zid, math_env)
+            do update set modified = now_as_millis(),
+                          data = excluded.data,
+                          math_tick = excluded.math_tick
+            returning zid;
+            """,
+            {
+                "zid": zid,
+                "math_env": self.config.math_env,
+                "math_tick": math_tick if math_tick is not None else -1,
+                "data": encode_math_blob(data),
+            },
+            connection=connection,
+        )
 
-            if ptpt_stats:
-                # Update existing record
-                ptpt_stats.data = data
-            else:
-                # Create new record
-                ptpt_stats = MathPtptStats(
-                    zid=zid, math_env=self.config.math_env, data=data
-                )
-                session.add(ptpt_stats)
+    def write_participant_stats(
+        self, zid: int, data: Dict[str, Any], math_tick: Optional[int] = None,
+        *, connection: Optional[sa.Connection] = None,
+    ) -> None:
+        """
+        Write participant statistics (Clojure upload-math-ptptstats parity,
+        postgres.clj:350-361).  Writes math_tick so the three data tables share
+        the single tick minted for the cycle (conv_man.clj:158-169).
+
+        Args:
+            zid: Conversation ID
+            data: Participant statistics data (prep-ptpt-stats blob)
+            math_tick: Current math tick (shared with the other writes this cycle)
+        """
+        self._write_returning(
+            """
+            insert into math_ptptstats (zid, math_env, math_tick, data)
+            values (:zid, :math_env, :math_tick, cast(:data as jsonb))
+            on conflict (zid, math_env)
+            do update set modified = now_as_millis(),
+                          data = excluded.data,
+                          math_tick = excluded.math_tick
+            returning zid;
+            """,
+            {
+                "zid": zid,
+                "math_env": self.config.math_env,
+                "math_tick": math_tick if math_tick is not None else -1,
+                "data": encode_math_blob(data),
+            },
+            connection=connection,
+        )
 
     def write_correlation_matrix(self, rid: int, data: Dict[str, Any]) -> None:
         """
@@ -736,9 +1153,20 @@ class PostgresClient:
                 )
                 session.add(corr_matrix)
 
-    def increment_math_tick(self, zid: int) -> int:
+    def increment_math_tick(
+        self, zid: int, *, connection: Optional[sa.Connection] = None,
+    ) -> int:
         """
-        Increment the math tick counter for a conversation.
+        Atomically increment the math tick counter for a conversation.
+
+        Clojure inc-math-tick (postgres.clj:292-295) does this in a SINGLE
+        statement so concurrent writers never race a read-modify-write:
+
+            insert into math_ticks (zid, math_env) values (?, ?)
+            on conflict (zid, math_env)
+            do update set modified = now_as_millis(),
+                          math_tick = (math_ticks.math_tick + 1)
+            returning math_tick;
 
         Args:
             zid: Conversation ID
@@ -746,29 +1174,105 @@ class PostgresClient:
         Returns:
             New tick value
         """
-        with self.session() as session:
-            # Check if record exists
-            math_ticks = (
-                session.query(MathTicks)
-                .filter_by(zid=zid, math_env=self.config.math_env)
-                .first()
-            )
+        rows = self._write_returning(
+            """
+            insert into math_ticks (zid, math_env) values (:zid, :math_env)
+            on conflict (zid, math_env)
+            do update set modified = now_as_millis(),
+                          math_tick = (math_ticks.math_tick + 1)
+            returning math_tick;
+            """,
+            {"zid": zid, "math_env": self.config.math_env},
+            connection=connection,
+        )
+        return rows[0]["math_tick"]
 
-            if math_ticks:
-                # Update existing record
-                math_ticks.math_tick += 1
-                new_math_tick = math_ticks.math_tick
-            else:
-                # Create new record
-                math_ticks = MathTicks(
-                    zid=zid, math_env=self.config.math_env, math_tick=1
-                )
-                session.add(math_ticks)
-                new_math_tick = 1
+    def math_fingerprints(
+        self, zids: List[int], envs: List[str], *, timeout_ms: int = 30000,
+    ) -> Dict[Tuple[int, str], Fingerprint]:
+        """{(zid, math_env): Fingerprint} for the math_main rows of these zids
+        under these labels. No payload is read."""
+        zids = sorted({int(z) for z in zids})
+        if not zids or not envs:
+            return {}
+        with self.transaction() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+            rows = conn.execute(text(FINGERPRINTS_SQL),
+                                {"zids": zids, "envs": list(envs)}).mappings().all()
+        return {(int(r["zid"]), str(r["math_env"])): _fingerprint_row(r) for r in rows}
 
-            # Commit and return new math tick
-            session.commit()
-            return new_math_tick
+    def promote_bundle(
+        self,
+        zid: int,
+        *,
+        from_env: str,
+        to_env: str,
+        expected_target: Optional[Fingerprint],
+        expected_staged: Fingerprint,
+        timeout_ms: int = 120000,
+        lock_timeout_ms: int = 30000,
+    ) -> int:
+        """Copy the ``from_env`` bundle of ``zid`` into ``to_env`` (this
+        client's own label) as one new publication, or refuse.
+
+        One transaction, modelled on MathWriter.write_conv_updates and the
+        backfill's tie rule: mint the target tick (the upsert row-locks
+        ``(zid, to_env)``, serialising every publication of the target); take
+        the staged label's tick row FOR SHARE (its single writer cannot
+        publish mid-copy; a publication already in progress is waited for);
+        re-read both bundles and compare with what the caller saw (any change
+        -> ``superseded``); require the staged bundle to be complete and valid
+        by VALID_BUNDLE_SQL and newer than the target (``staged_newer``); copy
+        the two companions, then math_main last (its caching_tick allocation
+        stays next to COMMIT); check the target's four ticks. Any refusal
+        raises PromotionRefused and rolls everything back, the tick included.
+        Lock order is fixed (target tick, then staged tick); the staged writer
+        only ever locks its own label's rows. Returns the new math_tick.
+        """
+        if to_env != self.config.math_env:
+            raise ValueError("a promotion writes only this client's own label")
+        if from_env == to_env:
+            raise ValueError("a promotion needs two distinct labels")
+        from polismath.poller.backfill import VALID_BUNDLE_SQL
+
+        params = {"zid": zid, "src": from_env, "dst": to_env}
+        with self.transaction() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+            conn.execute(text(f"SET LOCAL lock_timeout = {int(lock_timeout_ms)}"))
+            tick = self.increment_math_tick(zid, connection=conn)
+            conn.execute(text("SELECT 1 FROM math_ticks WHERE zid = :zid AND math_env = :src "
+                              "FOR SHARE"), params)
+            rows = conn.execute(
+                # Validity is read for the staged row only (CASE: the target's
+                # payload is never parsed here).
+                text("SELECT" + _FINGERPRINT_COLUMNS + ", CASE WHEN m.math_env = :src THEN "
+                     + VALID_BUNDLE_SQL + " END AS valid" + _BUNDLE_JOINS
+                     + " WHERE m.zid = :zid AND m.math_env IN (:src, :dst)"),
+                params).mappings().all()
+            found = {str(r["math_env"]): r for r in rows}
+            target = _fingerprint_row(found[to_env]) if to_env in found else None
+            if fingerprint_key(target) != fingerprint_key(expected_target):
+                raise PromotionRefused("superseded")
+            if from_env not in found:
+                raise PromotionRefused("missing_staged")
+            staged = _fingerprint_row(found[from_env])
+            if staged.key() != expected_staged.key():
+                raise PromotionRefused("superseded")
+            if not staged.complete or found[from_env]["valid"] is not True:
+                raise PromotionRefused("invalid_staged")
+            if not staged_newer(staged, target):
+                raise PromotionRefused("not_newer")
+            copy = dict(params, tick=tick)
+            conn.execute(text(COPY_BIDTOPID_SQL), copy)
+            conn.execute(text(COPY_PTPTSTATS_SQL), copy)
+            conn.execute(text(COPY_MAIN_SQL), copy)
+            post = conn.execute(text(PROMOTED_POSTCONDITION_SQL), params).mappings().first()
+            if post is None or {post["main_tick"], post["bid_tick"], post["stats_tick"],
+                                post["ticks_tick"]} != {tick}:
+                raise PromotionRefused("postcondition")
+        logger.info("Promoted math for zid=%s %s -> %s math_tick=%s", zid, from_env, to_env,
+                    tick)
+        return tick
 
     def poll_tasks(
         self, task_type: str, last_timestamp: int = 0, limit: int = 10

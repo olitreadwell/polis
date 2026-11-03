@@ -1,10 +1,21 @@
 import pg from "./db/pg-query";
 import { getZinvite } from "./utils/zinvite";
 import { getXids } from "./routes/xids";
-import { getPca } from "./utils/pca";
+// The report joins participants, groups and comments across several reads.
+// `getPcaFromBundle` pins every one of them to a single coherent math
+// generation; it is byte-identical to `getPca(zid)` for a coherent Bundle.
+import { getPcaFromBundle } from "./utils/pca";
 import { failJson } from "./utils/fail";
 import logger from "./utils/logger";
+import {
+  EXPORT_VOTE_CONVENTION,
+  RawVote,
+  storageToExport,
+  storageToSemantic,
+  VOTE_CONVENTION_KEY,
+} from "./votes/convention";
 import { getCommentsWithClusters } from "./utils/commentClusters";
+import { presentPca } from "./utils/pcaPresentation";
 import type { XidRecord } from "./d";
 
 type Formatters<T> = Record<string, (row: T) => string>;
@@ -14,6 +25,11 @@ interface ResponseLike {
   send: (data: string) => void;
   write: (data: string) => void;
   end: () => void;
+  // The real Express response emits "close" on client disconnect; streamed
+  // exports pass it to stream_queryP_reportExport so an aborted download frees
+  // its connection. Optional so plain mock responses still satisfy the type.
+  on?: (event: string, listener: () => void) => void;
+  removeListener?: (event: string, listener: () => void) => void;
 }
 
 type CommentRow = {
@@ -179,11 +195,11 @@ async function loadParticipantExportContext(
   zid: number
 ): Promise<ParticipantExportContext> {
   const [commentRowsRaw, pca] = await Promise.all([
-    pg.queryP_readOnly(
+    pg.queryP_reportExport(
       "SELECT tid, pid FROM comments WHERE zid = ($1) ORDER BY tid ASC, created ASC",
       [zid]
     ),
-    getPca(zid),
+    getPcaFromBundle(zid),
   ]);
 
   const commentRows = (commentRowsRaw as { tid: number; pid: number }[]) || [];
@@ -234,15 +250,21 @@ export function formatCSV<T>(colFns: Formatters<T>, rows: T[]): string {
 export async function loadConversationSummary(zid: number, siteUrl: string) {
   const [zinvite, convoRows, commentersRow, pca] = await Promise.all([
     getZinvite(zid),
-    pg.queryP_readOnly(
+    pg.queryP_reportExport(
       `SELECT topic, description FROM conversations WHERE zid = $1`,
       [zid]
     ),
-    pg.queryP_readOnly(
+    pg.queryP_reportExport(
       `SELECT COUNT(DISTINCT pid) FROM comments WHERE zid = $1`,
       [zid]
     ),
-    getPca(zid),
+    // The presented blob, so the `comments` column keeps the count it has always
+    // had. For a conversation with math that is the math's own `n-cmts`; for one
+    // without, it is the `mod >= 1` count the empty-blob backfill supplied. That
+    // predicate is NOT the participant-visible one `getCommentsCount` applies,
+    // and it is NOT the report's `mod_gt = mod_level` one. Preserved as-is here;
+    // reconciling the three is P-025 work, not this change.
+    getPcaFromBundle(zid).then((data) => presentPca(zid, data)),
     // getPca(zid, -1),
   ]);
   if (!zinvite || !convoRows || !commentersRow || !pca) {
@@ -274,6 +296,9 @@ export async function loadConversationSummary(zid: number, siteUrl: string) {
         : Object.keys(groupClusters).length,
     ],
     ["conversation-description", formatEscapedText(convo.description)],
+    // The declared vote sign of every export file (P-078 PR-E). Last, so every
+    // row above keeps its position and bytes.
+    [VOTE_CONVENTION_KEY, EXPORT_VOTE_CONVENTION],
   ].map((row) => row.join(","));
 }
 
@@ -294,16 +319,8 @@ export async function sendCommentSummary(zid: number, res: ResponseLike) {
   const comments = new Map<number, CommentRow>();
 
   try {
-    // Check if importance is enabled for this conversation
-    const convRows = (await pg.queryP_readOnly(
-      "SELECT importance_enabled FROM conversations WHERE zid = ($1)",
-      [zid]
-    )) as { importance_enabled: boolean }[];
-    const importanceEnabled =
-      convRows.length > 0 ? convRows[0].importance_enabled : false;
-
     // First query: Load comments metadata
-    const commentRows = (await pg.queryP_readOnly(
+    const commentRows = (await pg.queryP_reportExport(
       "SELECT tid, pid, created, txt, mod, velocity, active FROM comments WHERE zid = ($1)",
       [zid]
     )) as CommentRow[];
@@ -311,26 +328,25 @@ export async function sendCommentSummary(zid: number, res: ResponseLike) {
       comment.agrees = 0;
       comment.disagrees = 0;
       comment.pass = 0;
-      if (importanceEnabled) {
-        comment.importance = 0;
-      }
+      comment.importance = 0;
       comments.set(comment.tid, comment);
     }
 
     // Second query: Count votes in a single pass
-    pg.stream_queryP_readOnly(
+    pg.stream_queryP_reportExport(
       "SELECT tid, vote, high_priority FROM votes WHERE zid = ($1) ORDER BY tid",
       [zid],
       (row) => {
         const comment = comments.get(row.tid);
         if (comment) {
-          // note that -1 means agree and 1 means disagree
-          if (row.vote === -1) comment.agrees += 1;
-          else if (row.vote === 1) comment.disagrees += 1;
-          else if (row.vote === 0) comment.pass += 1;
+          // NULL and out-of-range stored values are counted nowhere, as before.
+          const vote = storageToSemantic(row.vote, { onInvalid: "skip" });
+          if (vote === "agree") comment.agrees += 1;
+          else if (vote === "disagree") comment.disagrees += 1;
+          else if (vote === "pass") comment.pass += 1;
 
-          // Count high priority votes if enabled
-          if (importanceEnabled && row.high_priority) {
+          // Importance is always counted, whatever the conversation's importance_enabled
+          if (row.high_priority) {
             comment.importance = (comment.importance || 0) + 1;
           }
         } else {
@@ -342,7 +358,6 @@ export async function sendCommentSummary(zid: number, res: ResponseLike) {
           return b.velocity - a.velocity;
         });
 
-        // Build formatters conditionally based on importance_enabled
         const formatters: Formatters<CommentRow> = {
           timestamp: (row) => String(Math.floor(parseInt(row.created) / 1000)),
           datetime: (row) => formatDatetime(row.created),
@@ -351,22 +366,17 @@ export async function sendCommentSummary(zid: number, res: ResponseLike) {
           agrees: (row) => String(row.agrees),
           disagrees: (row) => String(row.disagrees),
           moderated: (row) => String(row.mod),
+          importance: (row) => String(row.importance || 0),
+          "comment-body": (row) => formatEscapedText(row.txt),
         };
-
-        // Add importance column if enabled
-        if (importanceEnabled) {
-          formatters.importance = (row) => String(row.importance || 0);
-        }
-
-        // Add comment-body last
-        formatters["comment-body"] = (row) => formatEscapedText(row.txt);
 
         res.setHeader("content-type", "text/csv");
         res.send(formatCSV(formatters, commentRows));
       },
       (error) => {
         logger.error("polis_err_report_comments", error);
-      }
+      },
+      res
     );
   } catch (err) {
     logger.error("polis_err_report_comments", err);
@@ -376,38 +386,22 @@ export async function sendCommentSummary(zid: number, res: ResponseLike) {
 
 export async function sendVotesSummary(zid: number, res: ResponseLike) {
   try {
-    // Check if importance is enabled for this conversation
-    const convRows = (await pg.queryP_readOnly(
-      "SELECT importance_enabled FROM conversations WHERE zid = ($1)",
-      [zid]
-    )) as { importance_enabled: boolean }[];
-    const importanceEnabled =
-      convRows.length > 0 ? convRows[0].importance_enabled : false;
-
-    // Build formatters conditionally based on importance_enabled
     const formatters: Formatters<any> = {
       timestamp: (row) => String(Math.floor(row.timestamp / 1000)),
       datetime: (row) => formatDatetime(row.timestamp),
       "comment-id": (row) => String(row.tid),
       "voter-id": (row) => String(row.pid),
-      vote: (row) => String(-row.vote), // have to flip -1 to 1 and vice versa
+      // The export's own convention (agree = +1); NULL is EXPORT_NULL_VALUE.
+      vote: (row) => String(storageToExport(row.vote, { onInvalid: "keep" })),
+      // Importance is always exported, whatever the conversation's importance_enabled
+      important: (row) => String(row.high_priority ? 1 : 0),
     };
-
-    // Add important column if enabled
-    if (importanceEnabled) {
-      formatters.important = (row) => String(row.high_priority ? 1 : 0);
-    }
 
     res.setHeader("Content-Type", "text/csv");
     res.write(formatCSVHeaders(formatters) + sep);
 
-    // Select high_priority field if importance is enabled
-    const selectClause = importanceEnabled
-      ? "SELECT created as timestamp, tid, pid, vote, high_priority FROM votes WHERE zid = $1 ORDER BY tid, pid"
-      : "SELECT created as timestamp, tid, pid, vote FROM votes WHERE zid = $1 ORDER BY tid, pid";
-
-    pg.stream_queryP_readOnly(
-      selectClause,
+    pg.stream_queryP_reportExport(
+      "SELECT created as timestamp, tid, pid, vote, high_priority FROM votes WHERE zid = $1 ORDER BY tid, pid",
       [zid],
       (row) => res.write(formatCSVRow(row, formatters) + sep),
       () => res.end(),
@@ -415,7 +409,8 @@ export async function sendVotesSummary(zid: number, res: ResponseLike) {
         // Handle any errors
         logger.error("polis_err_report_votes_csv", error);
         failJson(res, 500, "polis_err_data_export", error);
-      }
+      },
+      res
     );
   } catch (err) {
     logger.error("polis_err_report_votes", err);
@@ -445,15 +440,17 @@ export async function sendParticipantVotesSummary(
 
   // Query the votes in participant order so that we can summarize them in a streaming pass
   let currentParticipantId = -1;
-  const currentParticipantVotes = new Map<number, number>();
+  // tid -> the stored vote value, converted only when the row is written
+  const currentParticipantVotes = new Map<number, RawVote>();
 
   const sendCurrentParticipantRow = () => {
     const totalVotes = currentParticipantVotes.size;
     let agrees = 0;
     let disagrees = 0;
-    for (const vote of currentParticipantVotes.values()) {
-      if (vote === 1) agrees += 1;
-      else if (vote === -1) disagrees += 1;
+    for (const raw of currentParticipantVotes.values()) {
+      const vote = storageToSemantic(raw, { onInvalid: "skip" });
+      if (vote === "agree") agrees += 1;
+      else if (vote === "disagree") disagrees += 1;
     }
     const values = [
       currentParticipantId,
@@ -462,7 +459,13 @@ export async function sendParticipantVotesSummary(
       totalVotes,
       agrees,
       disagrees,
-      ...commentIds.map((tid) => currentParticipantVotes.get(tid)),
+      ...commentIds.map((tid) =>
+        currentParticipantVotes.has(tid)
+          ? storageToExport(currentParticipantVotes.get(tid), {
+              onInvalid: "keep",
+            })
+          : undefined
+      ),
     ];
     res.write(
       values
@@ -471,7 +474,7 @@ export async function sendParticipantVotesSummary(
     );
   };
 
-  pg.stream_queryP_readOnly(
+  pg.stream_queryP_reportExport(
     "SELECT pid, tid, vote FROM votes WHERE zid = ($1) ORDER BY pid, tid",
     [zid],
     (row) => {
@@ -483,8 +486,7 @@ export async function sendParticipantVotesSummary(
         currentParticipantId = pid;
         currentParticipantVotes.clear();
       }
-      // have to flip vote from -1 to 1 and vice versa
-      currentParticipantVotes.set(row.tid, -row.vote);
+      currentParticipantVotes.set(row.tid, row.vote);
     },
     () => {
       if (currentParticipantId != -1) {
@@ -495,7 +497,8 @@ export async function sendParticipantVotesSummary(
     (error) => {
       logger.error("polis_err_report_participant_votes", error);
       failJson(res, 500, "polis_err_data_export", error);
-    }
+    },
+    res
   );
 }
 
@@ -526,12 +529,12 @@ export async function sendParticipantImportance(
 
   // Query the votes in participant order so that we can summarize them in a streaming pass
   let currentParticipantId = -1;
-  const currentParticipantVotes = new Map<number, number>();
   const currentParticipantImportance = new Map<number, boolean>();
   const currentParticipantVotedComments = new Set<number>();
 
   const sendCurrentParticipantRow = () => {
-    const totalVotes = currentParticipantVotes.size;
+    // The vote value plays no part in this export; only which tids were voted.
+    const totalVotes = currentParticipantVotedComments.size;
     let importantVotes = 0;
     for (const tid of currentParticipantVotedComments) {
       if (currentParticipantImportance.get(tid)) {
@@ -561,7 +564,7 @@ export async function sendParticipantImportance(
     );
   };
 
-  pg.stream_queryP_readOnly(
+  pg.stream_queryP_reportExport(
     "SELECT pid, tid, vote, high_priority FROM votes WHERE zid = ($1) ORDER BY pid, tid",
     [zid],
     (row) => {
@@ -571,14 +574,12 @@ export async function sendParticipantImportance(
           sendCurrentParticipantRow();
         }
         currentParticipantId = pid;
-        currentParticipantVotes.clear();
         currentParticipantImportance.clear();
         currentParticipantVotedComments.clear();
       }
       if (!commentIdSet.has(row.tid)) {
         return;
       }
-      currentParticipantVotes.set(row.tid, -row.vote);
       currentParticipantImportance.set(row.tid, row.high_priority || false);
       currentParticipantVotedComments.add(row.tid);
     },
@@ -591,7 +592,8 @@ export async function sendParticipantImportance(
     (error) => {
       logger.error("polis_err_report_participant_importance", error);
       failJson(res, 500, "polis_err_data_export", error);
-    }
+    },
+    res
   );
 }
 
@@ -613,12 +615,13 @@ export async function sendCommentGroupsSummary(
   const csvText = [];
   // Get PCA data to identify groups and get groupVotes
   // const pca = await getPca(zid, -1);
-  const pca = await getPca(zid);
+  // Presented, because this CSV zips `tids` against `comment-extremity` below.
+  const pca = await presentPca(zid, await getPcaFromBundle(zid));
   if (!pca?.asPOJO) {
     throw new Error("polis_error_no_pca_data");
   }
 
-  const groupClusters = pca.asPOJO["group-clusters"];
+  const groupClusters = pca.asPOJO["group-clusters"] || [];
   const groupIds = Array.isArray(groupClusters)
     ? groupClusters.map((g) => g.id)
     : Object.keys(groupClusters as Record<string, any>).map(Number);
@@ -627,16 +630,14 @@ export async function sendCommentGroupsSummary(
     number,
     GroupVoteStats
   >;
-  const groupAwareConsensus = pca.asPOJO["group-aware-consensus"] as Record<
-    number,
-    number
-  >;
+  const groupAwareConsensus = (pca.asPOJO["group-aware-consensus"] ||
+    {}) as Record<number, number>;
 
   const commentExtremity =
     (pca.asPOJO["pca"]?.["comment-extremity"] as Array<number>) || [];
 
   // Load comment texts
-  const commentRows = (await pg.queryP_readOnly(
+  const commentRows = (await pg.queryP_reportExport(
     "SELECT tid, txt FROM comments WHERE zid = ($1)",
     [zid]
   )) as { tid: number; txt: string }[];
@@ -645,7 +646,12 @@ export async function sendCommentGroupsSummary(
   // Initialize stats map
   const commentStats = new Map<number, CommentGroupStats>();
 
-  // Create a mapping of tid to extremity index using math tids array
+  // Create a mapping of tid to extremity index using math tids array.
+  // `tids` here is the math's own comment index -- the comments that are in the
+  // math, positionally aligned with `comment-extremity`. It is not the
+  // conversation's comment list; the comment texts above come from `comments`.
+  // For a conversation with no math both arrays are empty, and every row below
+  // is emitted from group votes, of which there are none.
   const tidToExtremityIndex = new Map();
   const mathTids = pca.asPOJO.tids || []; // Array of tids in same order as extremity values
   commentExtremity.forEach((extremity, index) => {
@@ -918,12 +924,6 @@ export async function sendParticipantXidsSummary(
   res: ResponseLike
 ) {
   try {
-    // const pca = await getPca(zid, -1);
-    const pca = await getPca(zid);
-    if (!pca?.asPOJO) {
-      throw new Error("polis_error_no_pca_data");
-    }
-
     const xids = await getXids(zid);
     if (!xids) {
       throw new Error("polis_error_no_xid_response");

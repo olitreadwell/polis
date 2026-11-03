@@ -9,6 +9,7 @@ description = "Mathematical analytics pipeline for Polis conversations"
 requires-python = ">=3.12,<3.13" # Pin to Python 3.12.x
 
 dependencies = [
+    "certifi==2026.10.19",
     "numpy>=1.26.4,<2.0",
     "pandas>=2.1.4",
     "sqlalchemy>=2.0.36",
@@ -102,10 +103,9 @@ notebook = [
 delphi = "scripts.delphi_cli:main"
 run-delphi = "run_delphi:main"
 # Pipeline entry points
-run-math-pipeline = "polismath.run_math_pipeline:main"
 run-umap-pipeline = "umap_narrative.run_pipeline:main"
-calculate-extremity = "umap_narrative.501_calculate_comment_extremity:main"
-calculate-priorities = "umap_narrative.502_calculate_priorities:main"
+# The legacy DynamoDB math export; not a stage of run-delphi
+run-math-pipeline = "polismath.run_math_pipeline:main"
 # Utility entry points
 reset-conversation = "umap_narrative.reset_conversation:main"
 create-datamapplot = "umap_narrative.700_datamapplot_for_layer:main"
@@ -114,6 +114,10 @@ setup-minio = "setup_minio:setup_minio_bucket"
 # Hatchling configuration
 [tool.hatch.build.targets.wheel]
 packages = ["polismath", "umap_narrative"]
+
+# Ship the authoritative schedule for installations without the source tree.
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/schedules/pc-zerovote-01-empty.json" = "polismath/empty_output_schedule.json"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -130,11 +134,13 @@ include = [
 
 # Pytest configuration
 [tool.pytest.ini_options]
-# Force sequential execution (-n0) to leverage the session-scoped conversation cache.
-# The cache shares computed conversations across test files, but each xdist worker
-# has its own process with a separate cache. With only 2 datasets (biodiversity, vw),
-# sequential execution with caching is ~6x faster than parallel execution where each
-# worker recomputes the conversations independently.
+# A plain `pytest` runs sequentially (-n0) so the session-scoped conversation cache
+# is shared across test files: each xdist worker has its own process and cache, and
+# with `--dist load` every worker would recompute the same conversations.
+# ci/local/delphi-python.sh (the entry point CI calls) overrides this with
+# `-n <CPUs> --dist loadgroup`: dataset-parametrized tests carry
+# xdist_group(<dataset>), so each conversation is still computed by one worker only.
+# Tests marked `serial` run afterwards in a second, sequential pass.
 addopts = "-n0"
 filterwarnings = [
     # Ignore python_multipart deprecation warning from ddtrace (third-party)
@@ -145,6 +151,9 @@ filterwarnings = [
 markers = [
     "local_dataset: mark test as using local (non-committed) datasets from real_data/.local/",
     "clojure_comparison: mark test as comparing with Clojure reference implementation (can be excluded with '-m \"not clojure_comparison\"')",
+    "integration: mark test as an opt-in integration test needing a real Postgres (self-skips if docker/port unavailable)",
+    "serial: must not run concurrently with other tests (shared cluster-wide state or timing); the CI entry point runs these in a sequential pass after the parallel one",
+    "recovery: P-022 §C poller recovery matrix (R01-R12); REQUIRES a real Postgres via POLIS_TEST_POSTGRES_URL and FAILS (never skips) without one — run via `make test-recovery`",
 ]
 
 [tool.coverage.run]
@@ -176,3 +185,70 @@ exclude = [
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.12"
+
+# Strictness.
+#
+# `typeCheckingMode` was previously unset, which meant "whatever this pyright
+# release defaults to". Pinning it makes an upgrade a deliberate change rather
+# than a silent one. It applies to everything in `include` above.
+typeCheckingMode = "standard"
+
+# `polismath/` is annotated to 100% of parameters and returns, so it is held to
+# a higher bar than the rest of `include`. The rules below are pyright's
+# `strict`-mode settings that ALREADY hold across `polismath/` with zero
+# diagnostics, promoted to errors so they stay held. The load-bearing one is
+# `reportMissingParameterType`: it is what stops the annotation coverage
+# regressing one unannotated parameter at a time.
+#
+# Scoped to `polismath/` deliberately. `umap_narrative/`, `tests/` and
+# `scripts/` are NOT annotated to the same level yet (2742 parameters there
+# still have no annotation), so promoting these repo-wide would fail on day
+# one. Widening the root is the follow-on once those are annotated too.
+[[tool.pyright.executionEnvironments]]
+root = "polismath"
+reportMissingParameterType = "error"
+reportUntypedFunctionDecorator = "error"
+reportUntypedClassDecorator = "error"
+reportUntypedBaseClass = "error"
+reportUntypedNamedTuple = "error"
+reportTypeCommentUsage = "error"
+reportConstantRedefinition = "error"
+reportDeprecated = "error"
+reportInconsistentOverload = "error"
+reportOverlappingOverload = "error"
+reportInvalidStubStatement = "error"
+reportIncompleteStub = "error"
+reportInvalidTypeVarUse = "error"
+reportUnnecessaryCast = "error"
+reportUnnecessaryContains = "error"
+reportUnusedExpression = "error"
+reportAssertAlwaysTrue = "error"
+reportSelfClsParameterName = "error"
+reportMatchNotExhaustive = "error"
+reportShadowedImports = "error"
+reportUninitializedInstanceVariable = "error"
+
+# NOT enabled for `polismath/` either, with the reason. Each number is the
+# diagnostic count that rule adds on top of `standard` today; none can be
+# cleared by annotation alone, so none is silenced with an `Any` or an ignore
+# comment.
+#
+#   reportUnknownVariableType      976 |
+#   reportUnknownMemberType        913 | numpy / pandas / sqlalchemy inference.
+#   reportUnknownArgumentType      791 | An `ndarray` element or a DataFrame
+#   reportMissingTypeArgument      141 | column is `Any` at the library
+#   reportUnknownParameterType     129 | boundary; annotating our side does
+#   reportUnknownLambdaType         79 | not make the library's side known.
+#
+#   reportUnusedImport              61 | Dead-import cleanup: a behaviour-safe
+#   reportUnusedVariable             6 | but separate change (some are
+#   reportDuplicateImport            1 | re-exports).
+#   reportPrivateUsage              39 | The replay/regression harnesses reach
+#                                      | into engine internals on purpose.
+#   reportImplicitOverride          18 | Needs `@override` decorators added.
+#   reportUnnecessaryIsInstance     18 | Defensive isinstance chains on values
+#   reportUnnecessaryComparison     13 | typed narrower than they arrive.
+#   reportMissingTypeStubs          10 | Third-party packages ship no stubs.
+#
+# Blanket `strict` on `polismath/` reports 3192 today; `standard` reports 130.
+# Neither is reachable by adding annotations — closing them means editing logic.

@@ -94,7 +94,6 @@ if (initialData) {
     title: initialData.conversation.topic,
     description: initialData.conversation.description,
     requiresInviteCode: initialData.conversation.treevite_enabled,
-    importanceEnabled: initialData.conversation.importance_enabled === true,
   };
   
   if (initialData.nextComment) {
@@ -117,6 +116,20 @@ const hideHeader = Astro.url.searchParams.get('hide_header');
   lang={pageLang || 'en'}
   dir={s.direction}
 >
+  <style is:global>
+    html[data-polis-returning] [data-initial-statement] { visibility: hidden; }
+  </style>
+  <script define:vars={{ conversation_id, oidcPrefix: import.meta.env.PUBLIC_OIDC_CACHE_KEY_PREFIX }} is:inline>
+    try {
+      const known = localStorage.getItem('participant_token_' + conversation_id) ||
+        [localStorage, sessionStorage].some(storage => Object.keys(storage).some(key =>
+          oidcPrefix && key.startsWith(oidcPrefix)));
+      if (known) document.documentElement.setAttribute('data-polis-returning', '');
+    } catch {
+      // Storage unavailable: conservatively withhold until the authenticated check.
+      document.documentElement.setAttribute('data-polis-returning', '');
+    }
+  </script>
   {/* Handle JWT token from initial data on client side - MUST be synchronous to avoid race conditions */}
   <script define:vars={{ initialData }} is:inline>
     if (initialData && initialData.auth && initialData.auth.token) {
@@ -182,7 +195,6 @@ const hideHeader = Astro.url.searchParams.get('hide_header');
               conversation_id={initialData.conversation.conversation_id}
               s={s}
               requiresInviteCode={surveyDetails?.requiresInviteCode}
-              importanceEnabled={surveyDetails?.importanceEnabled}
             />
             <SurveyForm client:load s={s} conversation_id={conversation_id} requiresInviteCode={surveyDetails?.requiresInviteCode} />
             {surveyDetails?.requiresInviteCode && (<TreeviteInvites client:only="react" conversation_id={conversation_id} s={s} />)}

@@ -1,14 +1,6 @@
 #!/bin/bash
-set -e
-set -x
-
-# Stop any existing Docker containers (if needed)
-if docker ps -q --filter "name=polis-server" | grep -q .; then
-    docker stop polis-server-1
-fi
-if docker ps -q --filter "name=polis-math" | grep -q .; then
-    docker stop polis-math-1
-fi
-if docker ps -q --filter "name=polis-delphi" | grep -q .; then
-    docker stop polis-delphi-1
-fi
+set -eu
+# Keep the healthy revision running until AfterInstall has migrated successfully.
+# CodeDeploy executes ApplicationStop from the PREVIOUS successful revision; see
+# docs/upgrading.md for the one-time transition from the old stopping hook.
+echo "Service shutdown is deferred until migrations succeed in AfterInstall."

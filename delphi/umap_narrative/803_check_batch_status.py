@@ -11,6 +11,7 @@ Usage:
 """
 
 import os, sys, json, boto3, logging, argparse, asyncio
+from polismath.delphi_storage.resource import result_resource
 from typing import Dict, Optional
 from datetime import datetime, timedelta, timezone
 from botocore.exceptions import ClientError
@@ -46,9 +47,14 @@ class BatchStatusChecker:
         raw_endpoint = os.environ.get('DYNAMODB_ENDPOINT')
         endpoint_url = raw_endpoint if raw_endpoint and raw_endpoint.strip() else None
         
-        self.dynamodb = boto3.resource('dynamodb', endpoint_url=endpoint_url, region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        self.dynamodb = result_resource('dynamodb', endpoint_url=endpoint_url, region_name=os.environ.get('AWS_REGION', 'us-east-1'))
         self.job_table = self.dynamodb.Table('Delphi_JobQueue')
         self.report_table = self.dynamodb.Table('Delphi_NarrativeReports')
+        # Provider token usage summed over the stored results, only when the
+        # polis-jobs daemon runs this script (count_usage); the legacy run is unchanged.
+        self.count_usage = False
+        self.tokens_in = 0
+        self.tokens_out = 0
 
         try:
             from anthropic import Anthropic
@@ -78,7 +84,7 @@ class BatchStatusChecker:
             batch_id = job_item.get('batch_id')
             if not batch_id:
                 logger.error(f"Job {job_id} is missing a 'batch_id'. Cannot check status.")
-                self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED'})
+                self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, process_exit_confirmed = :confirmed", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':confirmed': True})
                 return EXIT_CODE_TERMINAL_STATE
 
             # 2. Check the status on the Anthropic API
@@ -94,7 +100,7 @@ class BatchStatusChecker:
             
             elif status in ["failed", "cancelled"]:
                 logger.error(f"Batch {batch_id} for job {job_id} is in a terminal failure state: {status}")
-                self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': f'Batch status: {status}'})
+                self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e, process_exit_confirmed = :confirmed", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': f'Batch status: {status}', ':confirmed': True})
                 return EXIT_CODE_TERMINAL_STATE
 
             elif status in ["in_progress", "preparing"]:
@@ -138,6 +144,10 @@ class BatchStatusChecker:
                     custom_id = entry.custom_id
                     response_message = entry.result.message
                     model = response_message.model
+                    usage = getattr(response_message, "usage", None) if self.count_usage else None
+                    if usage is not None:
+                        self.tokens_in += int(getattr(usage, "input_tokens", 0) or 0)
+                        self.tokens_out += int(getattr(usage, "output_tokens", 0) or 0)
                     if response_message.stop_reason == "max_tokens":
                         logger.warning(
                             f"Job {job_id}: response for {custom_id} was truncated by max_tokens; "
@@ -200,6 +210,10 @@ class BatchStatusChecker:
                 update_expression += ", error_message = :error"
                 expression_values[':error'] = f"{failed_count} of {failed_count + processed_count} batch requests failed."
 
+            # This script is the process doing the work, so its own terminal
+            # write can carry the exit claim the server's guard checks.
+            update_expression += ", process_exit_confirmed = :confirmed"
+            expression_values[':confirmed'] = True
             self.job_table.update_item(
                 Key={'job_id': job_id},
                 UpdateExpression=update_expression,
@@ -213,7 +227,7 @@ class BatchStatusChecker:
         except Exception as e:
             logger.error(f"Job {job_id}: A critical error occurred during result processing for batch {batch_id}: {e}", exc_info=True)
             # Mark the job as FAILED
-            self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': f"Result processing error: {str(e)}"})
+            self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e, process_exit_confirmed = :confirmed", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': f"Result processing error: {str(e)}", ':confirmed': True})
             return False
 
     async def check_and_process_jobs(self, specific_job_id: Optional[str] = None) -> Optional[int]:
@@ -292,7 +306,7 @@ class BatchStatusChecker:
             except Exception as processing_error:
                 logger.error(f"Critical error processing locked job {job_id}: {processing_error}", exc_info=True)
                 try:
-                    self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': str(processing_error)})
+                    self.job_table.update_item(Key={'job_id': job_id}, UpdateExpression="SET #s = :s, error_message = :e, process_exit_confirmed = :confirmed", ExpressionAttributeNames={'#s':'status'}, ExpressionAttributeValues={':s':'FAILED', ':e': str(processing_error), ':confirmed': True})
                 except Exception as final_error:
                     logger.critical(f"FATAL: Could not mark job {job_id} as FAILED. It is now a zombie: {final_error}")
                 current_job_processing_signal = self.EXIT_CODE_SCRIPT_ERROR
@@ -302,11 +316,130 @@ class BatchStatusChecker:
         
         return None
 
+# --- run by the polis-jobs daemon (P-077 P1) --------------------------------
+# The recheck is the same logical job as the submit, parked and reclaimed. The
+# batch id and report id come from the daemon's frame; the queue row lives in
+# Postgres, so nothing here writes Delphi_JobQueue. Active only when
+# DELPHI_OUTPUT_MANIFEST is set; the legacy poller never sets it.
+
+class _NoQueueWrites:
+    """Stands in for Delphi_JobQueue in daemon mode: the daemon owns the job's state."""
+
+    def update_item(self, **kwargs):
+        return {}
+
+    def put_item(self, **kwargs):
+        return {}
+
+
+class _RecordingTable:
+    """Passes writes through to Delphi_NarrativeReports and keeps each written item's key."""
+
+    def __init__(self, table):
+        self._table = table
+        self.keys = []
+
+    def put_item(self, Item, **kwargs):
+        response = self._table.put_item(Item=Item, **kwargs)
+        self.keys.append({"rid_section_model": str(Item["rid_section_model"]), "timestamp": str(Item["timestamp"])})
+        return response
+
+
+def _iso(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return str(value) or None
+
+
+async def run_daemon_recheck(cli_job_id: str, checker_factory=None) -> int:
+    """Check the job's provider batch; store results and write the manifest. Returns the exit code."""
+    from polismath import job_child
+
+    try:
+        job = job_child.JobContext.from_env(
+            expected_stage=job_child.STAGE_NARRATIVE, zid=None,
+            allowed_phases={job_child.PHASE_RECHECK}, default_phase=job_child.PHASE_RECHECK,
+        )
+    except job_child.JobEnvError as e:
+        job_child.refuse(str(e))
+    if cli_job_id != job.job_id:
+        job_child.refuse("--job-id does not match DELPHI_JOB_ID")
+    batch_id = job.provider_batch_id
+    report_id = job.report_id or os.environ.get('DELPHI_REPORT_ID')
+    if not batch_id:
+        job_child.refuse("the frame names no provider batch_id to recheck")
+    if not report_id:
+        job_child.refuse("the frame names no report_id")
+
+    checker = (checker_factory or BatchStatusChecker)()
+    if not checker.anthropic:
+        return job_child.EXIT_STAGE_FAILED
+    checker.job_table = _NoQueueWrites()
+    checker.count_usage = True
+    recorder = _RecordingTable(checker.report_table)
+    checker.report_table = recorder
+
+    try:
+        batch = checker.anthropic.beta.messages.batches.retrieve(batch_id)
+        status = batch.processing_status
+        logger.info(f"Anthropic API returned status '{status}' for batch {batch_id}.")
+        submitted_at = _iso(getattr(batch, "created_at", None))
+        provider_batches = ([{"provider": "anthropic", "batch_id": str(batch_id), "submitted_at": submitted_at}]
+                            if submitted_at else None)
+        model = (job.frame.get("config") or {}).get("model") or os.environ.get("ANTHROPIC_MODEL") or None
+
+        if status in ("in_progress", "preparing"):
+            recheck_seconds = int(os.environ.get("DELPHI_RECHECK_SECONDS", "300"))
+            manifest = job_child.build_manifest(
+                job, outcome="parked", inputs=job_child.empty_inputs(), outputs=[],
+                models={"embed": None, "topic": None, "narrative": model},
+                cost={"llm_tokens_in": None, "llm_tokens_out": None, "provider_batches": provider_batches},
+                recheck_after=_iso(datetime.now(timezone.utc) + timedelta(seconds=recheck_seconds)),
+            )
+        elif status in ("completed", "ended"):
+            ok = await checker.process_batch_results({'job_id': job.job_id, 'batch_id': batch_id, 'report_id': report_id})
+            if not ok:
+                logger.error(f"Batch {batch_id}: no result could be stored.")
+                return job_child.EXIT_STAGE_FAILED
+            keys = sorted(recorder.keys, key=lambda k: (k["rid_section_model"], k["timestamp"]))
+            manifest = job_child.build_manifest(
+                job, outcome="succeeded", inputs=job_child.empty_inputs(),
+                outputs=[{"store": "dynamodb", "family": "Delphi_NarrativeReports",
+                          "table": "Delphi_NarrativeReports", "keys": keys, "rows": len(keys)}],
+                models={"embed": None, "topic": None, "narrative": model},
+                cost={"llm_tokens_in": checker.tokens_in, "llm_tokens_out": checker.tokens_out,
+                      "provider_batches": provider_batches},
+            )
+        else:
+            logger.error(f"Batch {batch_id} ended in state '{status}'.")
+            return job_child.EXIT_STAGE_FAILED
+    except job_child.ManifestError as e:
+        print(f"polis-jobs child: the manifest could not be built: {e}", file=sys.stderr, flush=True)
+        return job_child.EXIT_MANIFEST_UNBUILDABLE
+    except Exception as e:
+        logger.error(f"Recheck of batch {batch_id} failed: {e}", exc_info=True)
+        return job_child.EXIT_STAGE_FAILED
+
+    try:
+        job_child.write_manifest(job, manifest)
+    except (job_child.ManifestError, OSError) as e:
+        print(f"polis-jobs child: the manifest could not be written: {e}", file=sys.stderr, flush=True)
+        return job_child.EXIT_MANIFEST_UNBUILDABLE
+    return job_child.EXIT_OK
+
+
 async def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='Check a single Anthropic Batch Job status.')
     parser.add_argument('--job-id', type=str, required=True, help='The main job ID (e.g., batch_report_...) to check.')
     args = parser.parse_args()
+
+    if os.environ.get("DELPHI_OUTPUT_MANIFEST", "").strip():
+        sys.exit(await run_daemon_recheck(args.job_id))
 
     checker = BatchStatusChecker()
     exit_signal = await checker.check_and_process_job(args.job_id)

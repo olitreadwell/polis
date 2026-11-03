@@ -5,11 +5,12 @@ import { failJson } from "./utils/fail";
 import { getBidsForPids } from "./routes/math";
 import { getConversationHasMetadata } from "./routes/metadata";
 import { getConversationInfo } from "./conversation";
-import { getPca } from "./utils/pca";
+import { presentExistingMathBundle } from "./utils/pca";
+import { getMathBundle } from "./utils/mathBundle";
 import { getSocialParticipants } from "./participant";
 import { getUserInfoForUid2 } from "./user";
 import { getZinvite, getZinvites } from "./utils/zinvite";
-import { ifDefinedFirstElseSecond, polisTypes } from "./utils/common";
+import { ifDefinedFirstElseSecond } from "./utils/common";
 import { MPromise } from "./utils/metered";
 import { PcaCacheItem } from "./utils/pca";
 import { sendTextEmail } from "./email/senders";
@@ -17,6 +18,8 @@ import { UserInfo } from "./d";
 import Config from "./config";
 import logger from "./utils/logger";
 import pg from "./db/pg-query";
+import { conversationModifiedSql } from "./db/activity";
+import { storageToSemantic } from "./votes/convention";
 
 // TODO consider "p2a24a2dadadu15" format
 const votesForZidPidCache = new LruCache({
@@ -59,9 +62,10 @@ function safeTimestampToMillis(timestamp: any): number {
       return Date.now();
     }
 
-    // If timestamp looks like Unix seconds (less than year 2100 in milliseconds)
+    // Legacy Unix seconds between 2001 and 2100; the upper bound is in seconds.
+    // Current database BIGINT milliseconds must survive repeated normalization.
     const timestampMs =
-      timestamp < 4102444800000 && timestamp > 1000000000
+      timestamp < 4102444800 && timestamp > 1000000000
         ? timestamp * 1000
         : timestamp;
     const date = new Date(timestampMs);
@@ -85,7 +89,7 @@ function safeTimestampToMillis(timestamp: any): number {
     }
 
     // Try parsing as number first (for string numbers)
-    const numericValue = parseFloat(timestamp);
+    const numericValue = Number(timestamp);
     if (!isNaN(numericValue) && Number.isFinite(numericValue)) {
       return safeTimestampToMillis(numericValue);
     }
@@ -266,7 +270,7 @@ function finishArray(
     });
 }
 
-function doFamousQuery(o?: {
+async function doFamousQuery(o?: {
   uid?: number;
   zid: number;
   math_tick: any;
@@ -283,62 +287,70 @@ function doFamousQuery(o?: {
   // let ALLOW_NON_FRIENDS_WHEN_EMPTY_SOCIAL_RESULT = true;
   const mod = 0; // for now, assume all conversations will show unmoderated and approved participants.
 
+  const mathEnv = Config.mathEnv;
+  const ownedRead = await getMathBundle(zid, mathEnv);
+
   function getAuthorUidsOfFeaturedComments() {
-    return getPca(zid, 0).then((pcaResult: PcaCacheItem | unknown) => {
-      if (
-        !pcaResult ||
-        typeof pcaResult !== "object" ||
-        pcaResult === null ||
-        !("asPOJO" in pcaResult)
-      ) {
-        return [];
+    // The latest committed generation, NOT `getPca(zid, 0)`: a literal 0
+    // discards a conversation's first committed generation (tick 0) and made
+    // this return no featured-comment authors at all for that window.
+    return presentExistingMathBundle(zid, mathEnv, ownedRead).then(
+      (pcaResult: PcaCacheItem | unknown) => {
+        if (
+          !pcaResult ||
+          typeof pcaResult !== "object" ||
+          pcaResult === null ||
+          !("asPOJO" in pcaResult)
+        ) {
+          return [];
+        }
+
+        interface PcaData {
+          consensus?: {
+            agree?: Array<{ tid: number }>;
+            disagree?: Array<{ tid: number }>;
+          };
+          repness?: {
+            [gid: string]: Array<{ tid: number }>;
+          };
+        }
+
+        const pcaData = (pcaResult as { asPOJO: PcaData }).asPOJO;
+        pcaData.consensus = pcaData.consensus || {};
+        pcaData.consensus.agree = pcaData.consensus.agree || [];
+        pcaData.consensus.disagree = pcaData.consensus.disagree || [];
+        const consensusTids = _.union(
+          _.pluck(pcaData.consensus.agree, "tid"),
+          _.pluck(pcaData.consensus.disagree, "tid")
+        );
+
+        let groupTids: number[] = [];
+        for (const gid in pcaData.repness) {
+          const commentData = pcaData.repness[gid];
+          groupTids = _.union(groupTids, _.pluck(commentData, "tid"));
+        }
+        let featuredTids = _.union(consensusTids, groupTids);
+        featuredTids.sort();
+        featuredTids = _.uniq(featuredTids);
+
+        if (featuredTids.length === 0) {
+          return [];
+        }
+        const q =
+          "with " +
+          "authors as (select distinct(uid) from comments where zid = ($1) and tid in (" +
+          featuredTids.join(",") +
+          ") order by uid) " +
+          "select authors.uid from authors inner join xids on xids.uid = authors.uid " +
+          "order by uid;";
+
+        return pg.queryP_readOnly(q, [zid]).then(function (comments: any) {
+          let uids = _.pluck(comments, "uid");
+          uids = _.uniq(uids);
+          return uids;
+        });
       }
-
-      interface PcaData {
-        consensus?: {
-          agree?: Array<{ tid: number }>;
-          disagree?: Array<{ tid: number }>;
-        };
-        repness?: {
-          [gid: string]: Array<{ tid: number }>;
-        };
-      }
-
-      const pcaData = (pcaResult as { asPOJO: PcaData }).asPOJO;
-      pcaData.consensus = pcaData.consensus || {};
-      pcaData.consensus.agree = pcaData.consensus.agree || [];
-      pcaData.consensus.disagree = pcaData.consensus.disagree || [];
-      const consensusTids = _.union(
-        _.pluck(pcaData.consensus.agree, "tid"),
-        _.pluck(pcaData.consensus.disagree, "tid")
-      );
-
-      let groupTids: number[] = [];
-      for (const gid in pcaData.repness) {
-        const commentData = pcaData.repness[gid];
-        groupTids = _.union(groupTids, _.pluck(commentData, "tid"));
-      }
-      let featuredTids = _.union(consensusTids, groupTids);
-      featuredTids.sort();
-      featuredTids = _.uniq(featuredTids);
-
-      if (featuredTids.length === 0) {
-        return [];
-      }
-      const q =
-        "with " +
-        "authors as (select distinct(uid) from comments where zid = ($1) and tid in (" +
-        featuredTids.join(",") +
-        ") order by uid) " +
-        "select authors.uid from authors inner join xids on xids.uid = authors.uid " +
-        "order by uid;";
-
-      return pg.queryP_readOnly(q, [zid]).then(function (comments: any) {
-        let uids = _.pluck(comments, "uid");
-        uids = _.uniq(uids);
-        return uids;
-      });
-    });
+    );
   }
   return Promise.all([
     getConversationInfo(zid),
@@ -381,7 +393,7 @@ function doFamousQuery(o?: {
       return getVotesForZidPidsWithTimestampCheck(zid, pids, math_tick).then(
         function (vectors: any) {
           // TODO parallelize with above query
-          return getBidsForPids(zid, -1, pids).then(
+          return getBidsForPids(zid, -1, pids, ownedRead).then(
             function (pidsToBids: { [x: string]: any }) {
               _.each(vectors, function (value: any, pid: number) {
                 const bid = pidsToBids[pid];
@@ -428,17 +440,13 @@ function updateConversationModifiedTime(zid: number, t?: Date | number) {
 }
 
 function updateLastInteractionTimeForConversation(zid: number, uid?: number) {
-  return pg.queryP(
+  return pg.queryP_notification(
     "update participants set last_interaction = now_as_millis(), nsli = 0 where zid = ($1) and uid = ($2);",
     [zid, uid]
-  );
-}
-
-function updateVoteCount(zid: number, pid: number) {
-  return pg.queryP(
-    "update participants set vote_count = (select count(*) from votes where zid = ($1) and pid = ($2)) where zid = ($1) and pid = ($2)",
-    [zid, pid]
-  );
+  ).catch((error) => {
+    // Best effort: a busy notification lane must never reject a committed vote.
+    logger.warn("notification_interaction_deferred", { error });
+  });
 }
 
 function addStar(
@@ -480,7 +488,6 @@ function pullXInfoIntoSubObjects(ptptoiRecord: any) {
   if (p.x_profile_image_url || p.xid || p.x_email) {
     p.xInfo = {};
     p.xInfo.x_profile_image_url = p.x_profile_image_url;
-    p.xInfo.xid = p.xid;
     p.xInfo.x_name = p.x_name;
     // p.xInfo.x_email = p.x_email;
     delete p.x_profile_image_url;
@@ -597,12 +604,12 @@ function aggregateVotesToPidVotesObj(votes: any[]): { [key: string]: string } {
     // set up a vector for the participant, if not there already
     vectors[v.pid] = vectors[v.pid] || createEmptyVoteVector(greatestTid);
     // assign a vote value at that location
-    const vote = v.vote;
-    if (polisTypes.reactions.push === vote) {
+    const vote = storageToSemantic(v.vote, { onInvalid: "skip" });
+    if (vote === "disagree") {
       vectors[v.pid][v.tid] = "d";
-    } else if (polisTypes.reactions.pull === vote) {
+    } else if (vote === "agree") {
       vectors[v.pid][v.tid] = "a";
-    } else if (polisTypes.reactions.pass === vote) {
+    } else if (vote === "pass") {
       vectors[v.pid][v.tid] = "p";
     } else {
       logger.error("unknown vote value");
@@ -667,7 +674,7 @@ function getOneConversation(zid: number, uid?: number, lang?: string) {
   return new Promise(function (resolve: any, _reject: any) {
     Promise.all([
       pg.queryP_readOnly(
-        "select * from conversations left join  (select uid, site_id from users) as u on conversations.owner = u.uid where conversations.zid = ($1);",
+        `select conversations.*, u.*, ${conversationModifiedSql("conversations")} as modified from conversations left join (select uid, site_id from users) as u on conversations.owner = u.uid where conversations.zid = ($1);`,
         [zid]
       ),
       getConversationHasMetadata(zid),
@@ -725,6 +732,5 @@ export {
   sendEmailByUid,
   updateConversationModifiedTime,
   updateLastInteractionTimeForConversation,
-  updateVoteCount,
   userHasAnsweredZeQuestions,
 };

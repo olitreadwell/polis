@@ -13,9 +13,9 @@ import express from "express";
 import morgan from "morgan";
 import timeout from "connect-timeout";
 
+import { handleVersion } from "./src/routes/version";
 import server from "./src/server";
 import Config from "./src/config";
-import { makeFileFetcher } from "./src/utils/file-fetcher";
 import logger from "./src/utils/logger";
 import { fetchIndexForConversation } from "./src/conversation";
 import { getPidForParticipant } from "./src/user";
@@ -31,6 +31,8 @@ import {
 } from "./src/server-middleware";
 
 import { handle_GET_conversationUuid } from "./src/routes/conversationUuid";
+import { jwtValidation } from "./src/auth/jwt-middleware";
+import { createOpsRoutes } from "./src/routes/ops";
 import { handle_GET_xidReport } from "./src/routes/export";
 import {
   handle_GET_delphi,
@@ -40,6 +42,12 @@ import { handle_GET_delphi_visualizations } from "./src/routes/delphi/visualizat
 import { handle_POST_delphi_jobs } from "./src/routes/delphi/jobs";
 import { handle_GET_delphi_reports } from "./src/routes/delphi/reports";
 import { handle_POST_delphi_batch_reports } from "./src/routes/delphi/batchReports";
+import { collectiveBody } from "./src/routes/delphi/collectiveBody";
+import {
+  handle_GET_collective_inputs,
+  handle_GET_collective_results,
+  handle_POST_collective_results,
+} from "./src/routes/delphi/collectiveExchange";
 import { handle_GET_participation_topicPrioritize } from "./src/routes/participation/topicPrioritize";
 
 import {
@@ -73,10 +81,6 @@ import {
 import { handle_GET_reportExport } from "./src/routes/export";
 import { handle_GET_reportNarrative } from "./src/routes/reportNarrative";
 import {
-  handle_POST_auth_deregister_jwt,
-  handle_POST_joinWithInvite,
-} from "./src/auth";
-import {
   handle_GET_comments_translations,
   handle_GET_comments,
   handle_GET_nextComment,
@@ -91,8 +95,6 @@ import {
   handle_GET_conversationsRecentActivity,
   handle_GET_conversationsRecentlyStarted,
   handle_GET_conversationStats,
-  handle_GET_iim_conversation,
-  handle_GET_iip_conversation,
   handle_POST_conversation_close,
   handle_POST_conversation_reopen,
   handle_POST_conversations,
@@ -110,10 +112,7 @@ import {
   handle_POST_metadata_questions,
 } from "./src/routes/metadata";
 import {
-  handle_GET_math_pca,
   handle_GET_math_pca2,
-  handle_POST_math_update,
-  handle_GET_math_correlationMatrix,
   handle_GET_bidToPid,
   handle_GET_bid,
 } from "./src/routes/math";
@@ -127,15 +126,11 @@ import {
 import {
   handle_GET_participants,
   handle_GET_participation,
+  needParticipationConversationId,
   handle_GET_participationInit,
-  handle_POST_participants,
   handle_POST_query_participants_by_metadata,
   handle_PUT_participants_extended,
 } from "./src/routes/participation";
-import {
-  handle_GET_dataExport,
-  handle_GET_dataExport_results,
-} from "./src/routes/dataExport";
 import {
   handle_GET_votes_famous,
   handle_GET_votes_me,
@@ -144,16 +139,11 @@ import {
   handle_POST_votes_bulk,
 } from "./src/routes/votes";
 import { handle_GET_implicit_conversation_generation } from "./src/routes/implicitConversation";
-import {
-  handle_GET_users,
-  handle_PUT_users,
-  handle_POST_users_invite,
-} from "./src/routes/users";
+import { handle_GET_users, handle_PUT_users } from "./src/routes/users";
 import {
   handle_GET_notifications_subscribe,
   handle_GET_notifications_unsubscribe,
   handle_POST_convSubscriptions,
-  handle_POST_notifyTeam,
 } from "./src/routes/notify";
 import {
   handle_GET_reports,
@@ -199,7 +189,6 @@ import {
   denyIfNotFromWhitelistedDomain,
   handle_GET_domainWhitelist,
   handle_POST_domainWhitelist,
-  makeRedirectorTo,
   proxy,
   redirectIfNotHttps,
   writeDefaultHead,
@@ -226,12 +215,32 @@ import {
   want,
   wantHeader,
 } from "./src/utils/parameter";
+import { WIRE_VOTE_MAX, WIRE_VOTE_MIN } from "./src/votes/convention";
+import { onParticipationPools } from "./src/db/participation-scope";
 
 const app = express();
 const devMode = Config.isDevMode;
-const hostname = Config.staticFilesHost;
-const staticFilesAdminPort = Config.staticFilesAdminPort;
-const staticFilesParticipationPort = Config.staticFilesParticipationPort;
+
+// Protected operations pages. Never throws: a bad ops setting logs one error
+// and leaves ops answering 404, and every other route is unaffected.
+const opsRoutes = createOpsRoutes({
+  enabled: Config.opsEnabled,
+  emailDomains: Config.opsEmailDomains,
+  devMode: Config.isDevMode,
+  namespace: Config.authNamespace,
+  audience: Config.authAudience,
+  issuer: Config.authIssuer,
+  validateJwt: jwtValidation,
+  minVotersForText: Config.opsMinVotersForText,
+  simpleAnalyticsApiKey: Config.simpleAnalyticsApiKey,
+  simpleAnalyticsHostname: Config.simpleAnalyticsHostname,
+  dataSource: Config.opsDataSource,
+  costExplorer: Config.opsCostExplorer,
+  awsRegion: Config.awsRegion,
+  logGroupName: Config.awsLogGroupName,
+  databaseUrl: Config.databaseURL,
+  mathEnv: Config.mathEnv,
+});
 const HMAC_SIGNATURE_PARAM_NAME = "signature";
 
 // Dev-only http logger
@@ -252,32 +261,24 @@ const helpersInitialized = new Promise(function (resolve) {
   resolve(server.initializePolisHelpers());
 });
 
-helpersInitialized.then(
+export const appReady = helpersInitialized.then(
   function (o: any) {
     const {
       fetchIndexForAdminPage,
       fetchIndexForReportPage,
-      fetchIndexWithoutPreloadData,
       haltOnTimeout,
       redirectIfHasZidButNoConversationId,
 
       handle_GET_conditionalIndexFetcher,
       handle_GET_contexts,
-      handle_GET_dummyButton,
       handle_GET_locations,
       handle_GET_perfStats,
-      handle_GET_snapshot,
       handle_GET_testConnection,
       handle_GET_testDatabase,
       handle_GET_verification,
       handle_GET_zinvites,
-
       handle_POST_contexts,
-      handle_POST_contributors,
-      handle_POST_metrics,
       handle_POST_sendCreatedLinkToEmail,
-      handle_POST_sendEmailExportReady,
-      handle_POST_tutorial,
       handle_POST_zinvites,
     } = o;
 
@@ -303,8 +304,17 @@ helpersInitialized.then(
     app.use(middleware_responseTime_start);
 
     app.use(redirectIfNotHttps);
-    app.use(express.bodyParser({ limit: "50mb" }));
-    app.use(express.cookieParser()); // Add cookie parser to access req.cookies
+    // Bounds the collective-statement import body before the shared parser.
+    app.use(collectiveBody);
+    // JSON and urlencoded bodies only: the parsers express.bodyParser runs,
+    // with the same options, minus its multipart step. No route reads
+    // multipart, and that step threw before routing on every multipart
+    // request (multiparty 3 calls os.tmpDir(), which Node no longer has), so
+    // such a request answered 500 on any path. Now it reaches the router like
+    // any other unparsed body: an unknown path answers 404, a known route
+    // validates an empty body.
+    app.use(express.json({ limit: "50mb" }));
+    app.use(express.urlencoded({ limit: "50mb" }));
     app.use(writeDefaultHead);
 
     app.use(express.compress());
@@ -312,7 +322,6 @@ helpersInitialized.then(
     app.use(middleware_log_middleware_errors);
 
     app.all("/api/v3/*", addCorsHeader);
-    app.all("/font/*", addCorsHeader);
     app.all("/api/v3/*", middleware_check_if_options);
 
     ////////////////////////////////////////////
@@ -331,7 +340,7 @@ helpersInitialized.then(
     ////////////////////////////////////////////
     ////////////////////////////////////////////
 
-    app.get("/api/v3/math/pca", handle_GET_math_pca);
+    app.get("/api/v3/version", handleVersion);
 
     app.get(
       "/api/v3/math/pca2",
@@ -353,50 +362,12 @@ helpersInitialized.then(
     );
 
     app.get(
-      "/api/v3/math/correlationMatrix",
-      moveToBody,
-      // need('conversation_id', getConversationIdFetchZid, assignToPCustom('zid')),
-      need("report_id", getReportIdFetchRid, assignToPCustom("rid")),
-      want("math_tick", getInt, assignToP, -1),
-      handle_GET_math_correlationMatrix
-    );
-
-    app.get(
-      "/api/v3/dataExport",
-      moveToBody,
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      need("conversation_id", getStringLimitLength(1, 1000), assignToP),
-      want("format", getStringLimitLength(1, 100), assignToP),
-      want("unixTimestamp", getStringLimitLength(99), assignToP),
-      handle_GET_dataExport
-    );
-
-    app.get(
       "/api/v3/reportExport/:report_id/:report_type",
       moveToBody,
       need("report_id", getReportIdFetchRid, assignToPCustom("rid")),
       need("report_id", getStringLimitLength(1, 1000), assignToP),
       need("report_type", getStringLimitLength(1, 1000), assignToP),
       handle_GET_reportExport
-    );
-
-    app.get(
-      "/api/v3/dataExport/results",
-      moveToBody,
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      need("conversation_id", getStringLimitLength(1, 1000), assignToP),
-      want("filename", getStringLimitLength(1, 1000), assignToP),
-      handle_GET_dataExport_results
     );
 
     // TODO doesn't scale, stop sending entire mapping.
@@ -416,6 +387,7 @@ helpersInitialized.then(
     app.get(
       "/api/v3/xid/:xid_report",
       moveToBody,
+      hybridAuth(assignToP),
       need("xid_report", getStringLimitLength(1, 99), assignToP),
       handle_GET_xidReport
     );
@@ -430,11 +402,19 @@ helpersInitialized.then(
         getConversationIdFetchZid,
         assignToPCustom("zid")
       ),
-      want("math_tick", getInt, assignToP, 0),
+      // -1, not 0: `handle_GET_bid` passes this straight to `getPca`, and a
+      // default of 0 means "only give me something newer than tick 0". A
+      // conversation's first committed generation IS tick 0
+      // (math_ticks.math_tick is NOT NULL DEFAULT 0), so getPca returned
+      // undefined and dereferencing `items[2].asPOJO` threw a 500 for the whole
+      // first-generation window. -1 is the "give me the latest" sentinel used
+      // by /api/v3/math/pca2 and /api/v3/votes/famous, and by
+      // getBidIndexToPidMapping's own `math_tick || -1`
+      // (src/utils/participants.ts:7), which this handler already calls.
+      // Identical behaviour for tick >= 1.
+      want("math_tick", getInt, assignToP, -1),
       handle_GET_bid
     );
-
-    app.post("/api/v3/auth/deregister", handle_POST_auth_deregister_jwt);
 
     app.get(
       "/api/v3/zinvites/:zid",
@@ -475,14 +455,6 @@ helpersInitialized.then(
     );
 
     app.get(
-      "/api/v3/dummyButton",
-      moveToBody,
-      need("button", getStringLimitLength(1, 999), assignToP),
-      hybridAuthOptional(assignToP),
-      handle_GET_dummyButton
-    );
-
-    app.get(
       "/api/v3/conversations/preload",
       moveToBody,
       need("conversation_id", getStringLimitLength(1, 1000), assignToP), // we actually need conversation_id to build a url
@@ -503,20 +475,6 @@ helpersInitialized.then(
       moveToBody,
       want("sinceUnixTimestamp", getStringLimitLength(99), assignToP),
       handle_GET_conversationsRecentActivity
-    );
-
-    app.post(
-      "/api/v3/participants",
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      want("answers", getArrayOfInt, assignToP, []), // {pmqid: [pmaid, pmaid], ...} where the pmaids are checked choices
-      want("parent_url", getStringLimitLength(9999), assignToP),
-      want("referrer", getStringLimitLength(9999), assignToP),
-      handle_POST_participants
     );
 
     app.get(
@@ -562,42 +520,7 @@ helpersInitialized.then(
       handle_POST_convSubscriptions
     );
 
-    app.post(
-      "/api/v3/joinWithInvite",
-      hybridAuthOptional(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      want("suzinvite", getOptionalStringLimitLength(32), assignToP),
-      want("answers", getArrayOfInt, assignToP, []), // {pmqid: [pmaid, pmaid], ...} where the pmaids are checked choices
-      want("referrer", getStringLimitLength(9999), assignToP),
-      want("parent_url", getStringLimitLength(9999), assignToP),
-      handle_POST_joinWithInvite
-    );
-
     app.get("/perfStats_9182738127", moveToBody, handle_GET_perfStats);
-
-    app.post(
-      "/api/v3/sendEmailExportReady",
-      need("webserver_username", getStringLimitLength(1, 999), assignToP),
-      need("webserver_pass", getStringLimitLength(1, 999), assignToP),
-      need("email", getEmail, assignToP),
-      // we actually need conversation_id to build a url
-      need("conversation_id", getStringLimitLength(1, 1000), assignToP),
-      need("filename", getStringLimitLength(9999), assignToP),
-      handle_POST_sendEmailExportReady
-    );
-
-    app.post(
-      "/api/v3/notifyTeam",
-      need("webserver_username", getStringLimitLength(1, 999), assignToP),
-      need("webserver_pass", getStringLimitLength(1, 999), assignToP),
-      need("subject", getStringLimitLength(9999), assignToP),
-      need("body", getStringLimitLength(99999), assignToP),
-      handle_POST_notifyTeam
-    );
 
     app.get(
       "/api/v3/domainWhitelist",
@@ -710,25 +633,6 @@ helpersInitialized.then(
     );
 
     app.get(
-      "/api/v3/snapshot",
-      moveToBody,
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      handle_GET_snapshot
-    );
-
-    app.post(
-      "/api/v3/tutorial",
-      hybridAuth(assignToP),
-      need("step", getInt, assignToP),
-      handle_POST_tutorial
-    );
-
-    app.get(
       "/api/v3/users",
       moveToBody,
       hybridAuthOptional(assignToP),
@@ -741,11 +645,7 @@ helpersInitialized.then(
       "/api/v3/participation",
       moveToBody,
       hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
+      needParticipationConversationId,
       want("strict", getBool, assignToP),
       handle_GET_participation
     );
@@ -774,8 +674,12 @@ helpersInitialized.then(
       handle_GET_comments
     );
 
+    // Votes, comments, the next statement and participationInit enter the
+    // participation pools first, so every query they make runs there and no
+    // other work can hold the connections they need (src/db/pg-query.ts).
     app.post(
       "/api/v3/comments",
+      onParticipationPools,
       hybridAuthOptional(assignToP),
       need(
         "conversation_id",
@@ -786,7 +690,7 @@ helpersInitialized.then(
       want("xid", getStringLimitLength(1, 999), assignToP),
       ensureParticipant({ createIfMissing: true, issueJWT: true }),
       need("txt", getStringLimitLength(1, 997), assignToP),
-      want("vote", getIntInRange(-1, 1), assignToP),
+      want("vote", getIntInRange(WIRE_VOTE_MIN, WIRE_VOTE_MAX), assignToP),
       want("is_seed", getBool, assignToP),
       attachAuthToken(),
       handle_POST_comments
@@ -860,6 +764,7 @@ helpersInitialized.then(
 
     app.get(
       "/api/v3/nextComment",
+      onParticipationPools,
       timeout(15000),
       moveToBody,
       hybridAuthOptional(assignToP),
@@ -870,6 +775,7 @@ helpersInitialized.then(
       ),
       resolve_pidThing("not_voted_by_pid", assignToP, "get:nextComment"),
       want("without", getArrayOfInt, assignToP),
+      want("initial_tid", getIntInRange(0, 2147483647), assignToP),
       // preferred language of nextComment
       want("lang", getStringLimitLength(1, 10), assignToP),
       ensureParticipantOptional({ createIfMissing: false, issueJWT: false }),
@@ -881,9 +787,20 @@ helpersInitialized.then(
 
     app.get("/api/v3/testDatabase", moveToBody, handle_GET_testDatabase);
 
+    // Unless OPS_ENABLED=true and its settings are valid, every path below
+    // answers 404.
+    app.get("/api/v3/ops/whoami", opsRoutes.gate, opsRoutes.whoami);
+    app.get("/api/v3/ops/page/:id", opsRoutes.gate, opsRoutes.page);
+    app.all(/^\/api\/v3\/ops(\/.*)?$/, opsRoutes.notFound);
+
     app.get("/api/v3/delphi", moveToBody, handle_GET_delphi);
 
-    app.get("/api/v3/delphi/logs", moveToBody, handle_GET_delphi_job_logs);
+    app.get(
+      "/api/v3/delphi/logs",
+      moveToBody,
+      hybridAuth(assignToP),
+      handle_GET_delphi_job_logs
+    );
 
     // Add POST endpoint for creating Delphi jobs
     app.post(
@@ -901,6 +818,28 @@ helpersInitialized.then(
           });
         }
       }
+    );
+
+    // The agent path for collective statements: the conversation owner exports
+    // a topic's inputs, an outside agent writes the statement, the owner
+    // imports it with its provenance. No model is called here.
+    app.get(
+      "/api/v3/delphi/collective/inputs",
+      moveToBody,
+      hybridAuth(assignToP),
+      handle_GET_collective_inputs
+    );
+    app.post(
+      "/api/v3/delphi/collective/results",
+      moveToBody,
+      hybridAuth(assignToP),
+      handle_POST_collective_results
+    );
+    // Every stored version for a report (optionally one topic), newest first.
+    app.get(
+      "/api/v3/delphi/collective/results",
+      moveToBody,
+      handle_GET_collective_results
     );
 
     // Add GET endpoint for Delphi reports
@@ -975,6 +914,7 @@ helpersInitialized.then(
     app.post(
       "/api/v3/topicMod/moderate",
       moveToBody,
+      hybridAuth(assignToP),
       need(
         "conversation_id",
         getConversationIdFetchZid,
@@ -1168,6 +1108,7 @@ helpersInitialized.then(
 
     app.get(
       "/api/v3/participationInit",
+      onParticipationPools,
       moveToBody,
       hybridAuthOptional(assignToP),
       want("ptptoiLimit", getInt, assignToP),
@@ -1209,6 +1150,7 @@ helpersInitialized.then(
 
     app.post(
       "/api/v3/votes",
+      onParticipationPools,
       hybridAuthOptional(assignToP),
       need(
         "conversation_id",
@@ -1219,7 +1161,7 @@ helpersInitialized.then(
       want("xid", getStringLimitLength(1, 999), assignToP),
       ensureParticipant({ createIfMissing: true, issueJWT: true }),
       need("tid", getInt, assignToP),
-      need("vote", getIntInRange(-1, 1), assignToP),
+      need("vote", getIntInRange(WIRE_VOTE_MIN, WIRE_VOTE_MAX), assignToP),
       want("starred", getBool, assignToP),
       want("high_priority", getBool, assignToP, false),
       want("lang", getStringLimitLength(1, 10), assignToP),
@@ -1527,7 +1469,6 @@ helpersInitialized.then(
       ),
       want("limit", getIntInRange(1, 9999), assignToP), // not allowing a super high limit to prevent DOS attacks
       want("context", getStringLimitLength(1, 999), assignToP),
-      want("xid", getStringLimitLength(1, 999), assignToP),
       handle_GET_conversations
     );
 
@@ -1567,19 +1508,6 @@ helpersInitialized.then(
       moveToBody,
       need("report_id", getReportIdFetchRid, assignToPCustom("rid")),
       handle_GET_reportNarrative
-    );
-
-    app.post(
-      "/api/v3/mathUpdate",
-      moveToBody,
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      need("math_update_type", getStringLimitLength(1, 32), assignToP), // expecting "recompute" or "update"
-      handle_POST_math_update
     );
 
     app.post(
@@ -1879,22 +1807,6 @@ helpersInitialized.then(
       handle_GET_einvites
     );
 
-    app.post(
-      "/api/v3/users/invite",
-      // authWithApiKey(assignToP),
-      hybridAuth(assignToP),
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      // we actually need conversation_id to build a url
-      need("conversation_id", getStringLimitLength(1, 1000), assignToP),
-      // need('single_use_tokens', getBool, assignToP),
-      need("emails", getArrayOfStringNonEmpty, assignToP),
-      handle_POST_users_invite
-    );
-
     app.get(
       /^\/polis_site_id.*/,
       moveToBody,
@@ -1926,126 +1838,28 @@ helpersInitialized.then(
     );
 
     app.get(
-      "/iip/:conversation_id",
-      moveToBody,
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      handle_GET_iip_conversation
-    );
-
-    app.get(
-      "/iim/:conversation_id",
-      moveToBody,
-      need(
-        "conversation_id",
-        getConversationIdFetchZid,
-        assignToPCustom("zid")
-      ),
-      handle_GET_iim_conversation
-    );
-
-    app.get(
       "/api/v3/verify",
       moveToBody,
       need("e", getStringLimitLength(1, 1000), assignToP),
       handle_GET_verification
     );
 
-    app.post(
-      "/api/v3/contributors",
-      hybridAuthOptional(assignToP),
-      need("agreement_version", getIntInRange(1, 999999), assignToP),
-      need("name", getStringLimitLength(746), assignToP),
-      need("email", getStringLimitLength(256), assignToP),
-      need("github_id", getStringLimitLength(256), assignToP),
-      need("company_name", getStringLimitLength(746), assignToP),
-      handle_POST_contributors
-    );
-
-    app.post(
-      "/api/v3/metrics",
-      hybridAuthOptional(assignToP),
-      need("types", getArrayOfInt, assignToP),
-      need("times", getArrayOfInt, assignToP),
-      need("durs", getArrayOfInt, assignToP),
-      need("clientTimestamp", getInt, assignToP),
-      handle_POST_metrics
-    );
-
-    function makeFetchIndexWithoutPreloadData() {
-      const port = staticFilesParticipationPort;
-      return function (req, res) {
-        return fetchIndexWithoutPreloadData(req, res, port);
-      };
-    }
-
-    // Conversation aliases
-    app.get(/^\/football$/, makeRedirectorTo("/2arcefpshi"));
-    app.get(/^\/pdf$/, makeRedirectorTo("/23mymwyhkn")); // pdf 2017
-    app.get(/^\/nabi$/, makeRedirectorTo("/8ufpzc6fkm")); //
-
     app.get(/^\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForConversation); // conversation view
-    app.get(/^\/explore\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForConversation); // power view
-    app.get(/^\/share\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForConversation); // share view
-    app.get(/^\/summary\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForConversation); // summary view
-    app.get(/^\/ot\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForConversation); // conversation view, one-time url
     // TODO consider putting static files on /static, and then using a catch-all to serve the index.
-    app.get(/^\/conversation\/create(\/.*)?/, fetchIndexWithoutPreloadData);
-    app.get(/^\/user\/create(\/.*)?$/, fetchIndexWithoutPreloadData);
-    app.get(/^\/user\/login(\/.*)?$/, fetchIndexWithoutPreloadData);
-
-    app.get(/^\/settings(\/.*)?$/, makeFetchIndexWithoutPreloadData());
-
-    app.get(/^\/user\/logout(\/.*)?$/, fetchIndexWithoutPreloadData);
 
     // admin dash routes
     app.get(/^\/m\/[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForAdminPage);
     app.get(/^\/integrate(\/.*)?/, fetchIndexForAdminPage);
-    app.get(/^\/other-conversations(\/.*)?/, fetchIndexForAdminPage);
     app.get(/^\/account(\/.*)?/, fetchIndexForAdminPage);
-    app.get(/^\/bot(\/.*)?/, fetchIndexForAdminPage);
+    if (opsRoutes.active) {
+      app.get(/^\/ops(\/.*)?$/, fetchIndexForAdminPage);
+    }
     app.get(/^\/conversations(\/.*)?/, fetchIndexForAdminPage);
     app.get(/^\/signout(\/.*)?/, fetchIndexForAdminPage);
     app.get(/^\/signin(\/.*)?/, fetchIndexForAdminPage);
-    app.get(
-      /^\/dist\/admin_bundle.js$/,
-      makeFileFetcher(hostname, staticFilesAdminPort, "/dist/admin_bundle.js", {
-        "Content-Type": "application/javascript",
-      })
-    );
-    app.get(
-      /^\/__webpack_hmr$/,
-      makeFileFetcher(hostname, staticFilesAdminPort, "/__webpack_hmr", {
-        "Content-Type": "eventsource",
-      })
-    );
     app.get(/^\/privacy$/, fetchIndexForAdminPage);
     app.get(/^\/tos$/, fetchIndexForAdminPage);
     app.get(/^\/donate$/, fetchIndexForAdminPage);
-
-    // admin dash-based landers
-    app.get(/^\/gov(\/.*)?/, fetchIndexForAdminPage);
-    app.get(/^\/createuser(\/.*)?/, fetchIndexForAdminPage);
-    app.get(/^\/contrib(\/.*)?/, fetchIndexForAdminPage);
-
-    app.get(/^\/bot\/install(\/.*)?/, fetchIndexForAdminPage);
-    app.get(/^\/bot\/support(\/.*)?/, fetchIndexForAdminPage);
-
-    app.get(/^\/inbox(\/.*)?$/, fetchIndexWithoutPreloadData);
-    // app.get(/^\/r/, fetchIndexWithoutPreloadData);
-    app.get(/^\/hk/, fetchIndexWithoutPreloadData);
-    app.get(/^\/s\//, fetchIndexWithoutPreloadData);
-    app.get(/^\/s$/, fetchIndexWithoutPreloadData);
-    app.get(/^\/hk\/new/, fetchIndexWithoutPreloadData);
-    app.get(/^\/inboxApiTest/, fetchIndexWithoutPreloadData);
-    app.get(/^\/pwresetinit.*/, fetchIndexForAdminPage);
-    app.get(/^\/demo\/[0-9][0-9A-Za-z]+/, fetchIndexForConversation);
-    app.get(/^\/demo$/, fetchIndexForAdminPage);
-    app.get(/^\/pwreset.*/, fetchIndexForAdminPage);
-    app.get(/^\/company$/, fetchIndexForAdminPage);
 
     app.get(/^\/report\/r?[0-9][0-9A-Za-z]+(\/.*)?/, fetchIndexForReportPage);
     app.get(
@@ -2105,67 +1919,11 @@ helpersInitialized.then(
       }
     );
 
-    app.get(
-      /^\/embed$/,
-      makeFileFetcher(hostname, staticFilesAdminPort, "/embed.html", {
-        "Content-Type": "text/html",
-      })
-    );
-    app.get(
-      /^\/embedPreprod$/,
-      makeFileFetcher(hostname, staticFilesAdminPort, "/embedPreprod.html", {
-        "Content-Type": "text/html",
-      })
-    );
-    app.get(
-      /^\/embedReport$/,
-      makeFileFetcher(hostname, staticFilesAdminPort, "/embedReport.html", {
-        "Content-Type": "text/html",
-      })
-    );
-    app.get(
-      /^\/embedReportPreprod$/,
-      makeFileFetcher(
-        hostname,
-        staticFilesAdminPort,
-        "/embedReportPreprod.html",
-        {
-          "Content-Type": "text/html",
-        }
-      )
-    );
-    app.get(
-      /^\/styleguide$/,
-      makeFileFetcher(
-        hostname,
-        staticFilesParticipationPort,
-        "/styleguide.html",
-        {
-          "Content-Type": "text/html",
-        }
-      )
-    );
-    // Duplicate url for content at root. Needed so we have something for "About" to link to.
-    app.get(/^\/about$/, makeRedirectorTo("/home"));
     app.get(/^\/home(\/.*)?/, fetchIndexForAdminPage);
-    app.get(
-      /^\/s\/CTE\/?$/,
-      makeFileFetcher(
-        hostname,
-        staticFilesParticipationPort,
-        "/football.html",
-        {
-          "Content-Type": "text/html",
-        }
-      )
-    );
 
     app.get("/", handle_GET_conditionalIndexFetcher);
 
     // proxy static files
-    app.get(/^\/cached\/.*/, proxy);
-    app.get(/^\/font\/.*/, proxy);
-    app.get(/^\/.*embed.*js\/.*/, proxy);
     app.get(/^\/report_bundle.*\.js$/, proxy);
     app.get(/^\/report_style.*\.css$/, proxy);
 
@@ -2192,18 +1950,26 @@ helpersInitialized.then(
       }
     });
 
-    const missingFilesGet404 = false;
-    if (missingFilesGet404) {
-      // 404 everything else
-      app.get(
-        /^\/[^(api\/)]?.*/,
-        makeFileFetcher(hostname, staticFilesAdminPort, "/404.html", {
-          "Content-Type": "text/html",
-        })
-      );
-    } else {
-      // proxy everything else
-      app.get(/^\/[^(api\/)]?.*/, proxy);
+    // P-038. This is the only position from which `globalErrorHandler` can see
+    // errors that a route hands to `next(err)`: Express 3 inserts `app.router`
+    // into the app stack at the first route registration (express
+    // `lib/application.js:464`) and `next(err)` walks the stack forward from
+    // there, so any error middleware mounted earlier — including the
+    // module-level `app.use(globalErrorHandler)` below and
+    // `middleware_log_middleware_errors` above — is never reached and the error
+    // falls through to connect's finalhandler.
+    //
+    // Mounting it here is NOT behaviour-preserving: finalhandler currently
+    // serves `400 text/html "Bad Request\n"` where `globalErrorHandler` would
+    // serve `500 application/json {"error":"internal_server_error",...}`. Note
+    // that the generic branch's status stays 500 either way — what the flag
+    // changes on an already-500 path is the Content-Type and body, and only the
+    // 400 paths (and the typed 23505/JWT/timeout branches) change status. It is
+    // therefore off by default and gated so the change can be recorded and
+    // approved before it ships. See the flag's comment in
+    // server/src/config.ts.
+    if (Config.reachableErrorHandler) {
+      app.use(globalErrorHandler);
     }
 
     // move app.listen to index.ts
@@ -2214,7 +1980,15 @@ helpersInitialized.then(
   }
 );
 
-// Setup global error handling
+// Setup global error handling.
+//
+// P-038: this mount runs during module evaluation, i.e. before the async
+// `helpersInitialized` callback above registers any route, so it sits ahead of
+// `app.router` in the app stack and is unreachable for route errors. It is kept
+// because it is the current production behaviour and it still covers errors
+// raised by the two middlewares registered above it (morgan /
+// `middleware_http_json_logger`). The reachable mount is inside the callback,
+// behind `POLIS_REACHABLE_ERROR_HANDLER`.
 app.use(globalErrorHandler);
 
 // Initialize global process-level error handlers

@@ -4,19 +4,11 @@ import pg from "../db/pg-query";
 import { getConversationInfo } from "../conversation";
 import Config from "../config";
 
+// Vote values are not here: they live in src/votes/convention.ts.
 type PolisTypes = {
-  reactions: Reactions;
   staractions: StarActions;
   mod: Mod;
-  reactionValues?: any;
   starValues?: any;
-};
-
-type Reactions = {
-  push: number;
-  pull: number;
-  see: number;
-  pass: number;
 };
 
 type StarActions = {
@@ -58,12 +50,6 @@ function hexToStr(hexString: string) {
 }
 
 const polisTypes: PolisTypes = {
-  reactions: {
-    push: 1,
-    pull: -1,
-    see: 0,
-    pass: 0,
-  },
   staractions: {
     unstar: 0,
     star: 1,
@@ -74,7 +60,6 @@ const polisTypes: PolisTypes = {
     ok: 1,
   },
 };
-polisTypes.reactionValues = _.values(polisTypes.reactions);
 polisTypes.starValues = _.values(polisTypes.staractions);
 
 function isConversationOwner(
@@ -113,29 +98,6 @@ function isModerator(zid: number, uid?: number) {
     .then(function (rows: { count: number }[]) {
       return rows[0].count >= 1;
     });
-}
-
-function doAddDataExportTask(
-  math_env: string | undefined,
-  email: string,
-  zid: number,
-  atDate: number,
-  format: string,
-  task_bucket: number
-) {
-  return pg.queryP(
-    "insert into worker_tasks (math_env, task_data, task_type, task_bucket) values ($1, $2, 'generate_export_data', $3);",
-    [
-      math_env,
-      {
-        email: email,
-        zid: zid,
-        "at-date": atDate,
-        format: format,
-      },
-      task_bucket, // TODO hash the params to get a consistent number?
-    ]
-  );
 }
 
 function isOwner(zid: number, uid: number) {
@@ -188,7 +150,6 @@ function ifDefinedFirstElseSecond(first: any, second: boolean) {
 //todo: only one export
 
 export {
-  doAddDataExportTask,
   escapeLiteral,
   hexToStr,
   ifDefinedFirstElseSecond,
@@ -204,7 +165,6 @@ export {
 };
 
 export default {
-  doAddDataExportTask,
   escapeLiteral,
   hexToStr,
   isConversationOwner,

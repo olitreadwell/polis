@@ -1,22 +1,19 @@
 import _ from "underscore";
 import { DEFAULTS } from "../utils/constants";
-import { createOneSuzinvite } from "../invites/suzinvites";
 import { failJson } from "../utils/fail";
 import { generateAndRegisterZinvite, generateToken } from "../auth";
 import { getUserInfoForUid2 } from "../user";
 import { getZinvite } from "../utils/zinvite";
 import { sql_conversations } from "../db/sql";
-import Config from "../config";
 import logger from "../utils/logger";
 import pg from "../db/pg-query";
+import { conversationModifiedSql } from "../db/activity";
 import { parsePagination, createPaginationMeta } from "../utils/pagination";
 import {
   doGetConversationPreloadInfo,
   getZidFromConversationId,
-  getConversationInfo,
 } from "../conversation";
 import type {
-  ConversationInfo,
   ConversationType,
   ExpressRequest,
   ExpressResponse,
@@ -48,20 +45,6 @@ function failWithRetryRequest(res: {
   res.setHeader("Retry-After", 0);
   logger.warn("failWithRetryRequest");
   res.writeHead(500).send(57493875);
-}
-
-function generateSingleUseUrl(
-  req: any,
-  conversation_id: string,
-  suzinvite: string
-) {
-  return (
-    Config.getServerNameWithProtocol(req) +
-    "/ot/" +
-    conversation_id +
-    "/" +
-    suzinvite
-  );
 }
 
 /**
@@ -176,40 +159,17 @@ async function processConversationData(
   isSiteAdmin: Record<number, boolean>
 ): Promise<any[]> {
   const uid = req.p.uid;
-  const xid = req.p.xid;
 
   try {
     // Add conversation IDs
     await addConversationIds(data);
-
-    // Handle single-use URLs if XID is provided
-    const suurlsPromise = xid
-      ? Promise.all(
-          data.map(function (conv: { zid: number; owner: number }) {
-            return createOneSuzinvite(
-              xid,
-              conv.zid,
-              conv.owner,
-              _.partial(generateSingleUseUrl, req)
-            );
-          })
-        )
-      : Promise.resolve();
-
-    const [suurlData] = await Promise.all([suurlsPromise]);
-
-    const suurlIndex = suurlData ? _.indexBy(suurlData, "zid") : null;
 
     // Process each conversation
     data.forEach(function (conv: any) {
       // Set ownership flag
       conv.is_owner = uid !== undefined && conv.owner === uid;
 
-      if (suurlIndex) {
-        conv.url = suurlIndex[conv.zid || ""].suurl;
-      } else {
-        conv.url = buildConversationUrl(req, conv.conversation_id);
-      }
+      conv.url = buildConversationUrl(req, conv.conversation_id);
 
       conv.created = Number(conv.created);
       conv.modified = Number(conv.modified);
@@ -255,7 +215,7 @@ export async function getConversations(req: { p: ConversationType }, res: any) {
 
     // Build and execute main query
     const query = buildConversationsQuery(req, participantInOrSiteAdminOf);
-    let data = (await pg.queryP_readOnly(query.toString())) as any[];
+    let data = (await pg.queryP_readOnly(`SELECT c.*, ${conversationModifiedSql("c")} AS modified FROM (${query.toString()}) c`)) as any[];
 
     // Process the conversation data
     data = await processConversationData(data, req, isSiteAdmin);
@@ -316,7 +276,7 @@ async function handle_GET_all_conversations(
       const ms =
         nowMs - Number(req.p.recently_updated_days) * 24 * 60 * 60 * 1000;
       params.push(ms);
-      where.push(`c.modified >= ($${params.length})`);
+      where.push(`${conversationModifiedSql("c")} >= ($${params.length})`);
     }
     if (!_.isUndefined(req.p.recently_created_days)) {
       const ms =
@@ -345,7 +305,7 @@ async function handle_GET_all_conversations(
     switch (sortByRaw) {
       case "updated":
       case "modified":
-        sortBy = "c.modified";
+        sortBy = conversationModifiedSql("c");
         break;
       case "participant_count":
         sortBy = "pc.participant_count";
@@ -367,7 +327,7 @@ async function handle_GET_all_conversations(
 
     const sql = `
       SELECT 
-        c.*, 
+        c.*, ${conversationModifiedSql("c")} AS modified,
         COALESCE(pc.participant_count, 0) AS participant_count,
         COALESCE(cc.comment_count, 0) AS comment_count,
         u.email AS owner_email
@@ -389,7 +349,7 @@ async function handle_GET_all_conversations(
       ${paginationSql};
     `;
 
-    const rows = (await pg.queryP_readOnly(sql, [
+    const rows = (await pg.queryP_reportExport(sql, [
       ...params,
       ...pagination.params,
     ])) as any[];
@@ -415,7 +375,7 @@ async function handle_GET_all_conversations(
         ${whereSql}
       ) t;
     `;
-    const totalRows = (await pg.queryP_readOnly(totalSql, params)) as Array<{
+    const totalRows = (await pg.queryP_reportExport(totalSql, params)) as Array<{
       count: string;
     }>;
     const total = Number(totalRows?.[0]?.count || 0);
@@ -564,8 +524,8 @@ function doGetConversationsRecent(
     time *= 1000;
   }
   time = parseInt(time);
-  pg.queryP_readOnly(
-    "select * from conversations where " + field + " >= ($1);",
+  pg.queryP_reportExport(
+    `select c.*, ${conversationModifiedSql("c")} AS modified from conversations c where ${field === "modified" ? conversationModifiedSql("c") : "c.created"} >= ($1);`,
     [time]
   )
     .then((rows: any) => {
@@ -637,9 +597,12 @@ function handle_GET_conversationStats(
         args.push(until);
       }
 
+      // conversationStats scans the whole conversation's comments and votes for
+      // the admin histograms; it runs on the bounded report/export pool, never
+      // the participation read pool.
       return Promise.all([
-        pg.queryP_readOnly(q0, args),
-        pg.queryP_readOnly(q1, args),
+        pg.queryP_reportExport(q0, args),
+        pg.queryP_reportExport(q1, args),
       ]).then(function (a: any[]) {
         function castTimestamp(o: { created: number }) {
           o.created = Number(o.created);
@@ -764,10 +727,21 @@ function handle_POST_conversation_close(
         return;
       }
       const conv = rows[0];
-      pg.queryP(
-        "update conversations set is_active = false where zid = ($1);",
-        [conv.zid]
-      );
+      // The update was fired and forgotten, so the owner's request never
+      // received a response and hung until the client timed out. Answer once
+      // the close has actually been written, exactly as
+      // handle_POST_conversation_reopen does.
+      return pg
+        .queryP(
+          "update conversations set is_active = false where zid = ($1);",
+          [conv.zid]
+        )
+        .then(function () {
+          res.status(200).json({});
+        })
+        .catch(function (err: any) {
+          failJson(res, 500, "polis_err_closing_conversation2", err);
+        });
     })
     .catch(function (err: any) {
       failJson(res, 500, "polis_err_closing_conversation", err);
@@ -814,6 +788,41 @@ function handle_POST_conversation_reopen(
     .catch(function (err: any) {
       failJson(res, 500, "polis_err_reopening_conversation", err);
     });
+}
+
+const XID_WHITELIST_FIXED = "polis_err_xid_whitelist_fixed_after_start";
+
+/**
+ * use_xid_whitelist is fixed once participation has started: it can be set
+ * freely while the conversation has no participant from outside the owner's
+ * site, and never changed after one has joined. The owner and their site's
+ * moderators do not count, since seeding statements gives them participant
+ * rows before the conversation is configured. Resolves when the requested
+ * value may be applied (unchanged, or not yet started); rejects with
+ * polis_err_xid_whitelist_fixed_after_start otherwise.
+ */
+async function requireXidWhitelistSettable(
+  zid: number,
+  requested: boolean
+): Promise<void> {
+  const rows = (await pg.queryP(
+    `select c.use_xid_whitelist,
+       exists(
+         select 1 from participants p
+         join users u on u.uid = p.uid
+         where p.zid = c.zid
+           and u.site_id is distinct from (select site_id from users where uid = c.owner)
+       ) as started
+     from conversations c where c.zid = ($1);`,
+    [zid]
+  )) as { use_xid_whitelist: boolean; started: boolean }[];
+  const conv = rows && rows[0];
+  if (!conv || !!conv.use_xid_whitelist === requested) {
+    return;
+  }
+  if (conv.started) {
+    throw new Error(XID_WHITELIST_FIXED);
+  }
 }
 
 function handle_PUT_conversations(
@@ -959,14 +968,19 @@ function handle_PUT_conversations(
         fields.use_xid_whitelist = !!req.p.use_xid_whitelist;
       }
 
+      // A refused setting refuses the whole update: nothing below runs.
+      const settingGuard = _.isUndefined(req.p.use_xid_whitelist)
+        ? Promise.resolve()
+        : requireXidWhitelistSettable(req.p.zid, !!req.p.use_xid_whitelist);
+
       const q = sql_conversations
         .update(fields)
         .where(sql_conversations.zid.equals(req.p.zid))
         // .and( sql_conversations.owner.equals(req.p.uid) )
         .returning("*");
-      verifyMetaPromise.then(
+      Promise.all([verifyMetaPromise, settingGuard]).then(
         function () {
-          pg.query(q.toString(), function (err: any, result: { rows: any[] }) {
+          pg.query(q.toString() + `, ${conversationModifiedSql("conversations")} AS modified`, function (err: any, result: { rows: any[] }) {
             if (err) {
               failJson(res, 500, "polis_err_update_conversation", err);
               return;
@@ -1032,6 +1046,10 @@ function handle_PUT_conversations(
           });
         },
         function (err: { message: any }) {
+          if (err && err.message === XID_WHITELIST_FIXED) {
+            failJson(res, 409, XID_WHITELIST_FIXED);
+            return;
+          }
           failJson(res, 500, err.message, err);
         }
       );
@@ -1246,58 +1264,6 @@ function handle_GET_conversationPreloadInfo(
   );
 }
 
-function handle_GET_iip_conversation(
-  req: { params: { conversation_id: any } },
-  res: {
-    set: (arg0: { "Content-Type": string }) => void;
-    send: (arg0: string) => void;
-  }
-) {
-  const conversation_id = req.params.conversation_id;
-  res.set({
-    "Content-Type": "text/html",
-  });
-  res.send(
-    "<a href='https://pol.is/" +
-      conversation_id +
-      "' target='_blank'>" +
-      conversation_id +
-      "</a>"
-  );
-}
-
-function handle_GET_iim_conversation(
-  req: { p: { zid: number }; params: { conversation_id: string } },
-  res: {
-    set: (arg0: { "Content-Type": string }) => void;
-    send: (arg0: string) => void;
-  }
-) {
-  const zid = req.p.zid;
-  const conversation_id = req.params.conversation_id;
-  getConversationInfo(zid)
-    .then(function (info: ConversationInfo) {
-      res.set({
-        "Content-Type": "text/html",
-      });
-      const title = info.topic || info.created;
-      res.send(
-        "<a href='https://pol.is/" +
-          conversation_id +
-          "' target='_blank'>" +
-          title +
-          "</a>" +
-          "<p><a href='https://pol.is/m" +
-          conversation_id +
-          "' target='_blank'>moderate</a></p>" +
-          (info.description ? "<p>" + info.description + "</p>" : "")
-      );
-    })
-    .catch(function (err: any) {
-      failJson(res, 500, "polis_err_fetching_conversation_info", err);
-    });
-}
-
 export {
   handle_GET_conversationPreloadInfo,
   handle_GET_all_conversations,
@@ -1305,8 +1271,6 @@ export {
   handle_GET_conversationsRecentActivity,
   handle_GET_conversationsRecentlyStarted,
   handle_GET_conversationStats,
-  handle_GET_iim_conversation,
-  handle_GET_iip_conversation,
   handle_POST_conversation_close,
   handle_POST_conversation_reopen,
   handle_POST_conversations,

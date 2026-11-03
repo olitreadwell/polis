@@ -3,7 +3,7 @@
 # the build command with `DOCKER_BUILDKIT=1`). The `RUN --mount=type=cache`
 # directives below are silently ignored without BuildKit.
 # To build locally, for example:
-# docker build -t polis-server:local .
+# docker build -t polis-server:local -f server/Dockerfile .
 # To run locally, for example:
 # docker run --rm --name polis-server --env-file .env --network polis-dev_polis-net \
 #  -p 5000:5000 --target dev polis-server:local
@@ -11,14 +11,22 @@
 # For a dev build, use `--target dev`.
 # Should default to prod build, but you can also explicitly use `--target prod`
 
-FROM docker.io/node:22-alpine as base
+FROM docker.io/node:22.23.4-alpine as base
 
 ARG NODE_ENV
 
 WORKDIR /app
 
+
 # Install Python and necessary tools (including pip)
-RUN apk add --no-cache python3 py3-pip
+RUN apk add --no-cache python3 py3-pip 'ca-certificates>=20261020-r0'
+
+# Verified startup migration checks use the same public RDS CA pin as the
+# runner image. Deployments with another private CA can override this env.
+RUN mkdir -p /etc/polis \
+ && wget -O /etc/polis/rds-ca.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+ && echo '90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b  /etc/polis/rds-ca.pem' | sha256sum -c -
+ENV NODE_EXTRA_CA_CERTS=/etc/polis/rds-ca.pem
 
 # This package is needed at runtime
 RUN apk add libpq-dev
@@ -26,7 +34,7 @@ RUN apk add libpq-dev
 RUN apk add --no-cache --virtual .build \
   g++ make python3
 
-COPY package*.json ./
+COPY server/package*.json ./
 
 EXPOSE 5000
 
@@ -40,9 +48,17 @@ ENV NODE_ENV ${NODE_ENV:-development}
 RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 20000 && \
     npm config set fetch-retry-maxtimeout 120000
-RUN --mount=type=cache,target=/root/.npm npm ci --production=false
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts --production=false
 
-COPY . .
+COPY server/. .
+
+ARG GIT_HASH=unknown
+ARG POLIS_BUILD_DISTANCE=unknown
+ARG POLIS_BUILD_TAG
+ARG POLIS_BUILD_SOURCE=unverified-archive
+ENV GIT_HASH=$GIT_HASH POLIS_BUILD_DISTANCE=$POLIS_BUILD_DISTANCE POLIS_BUILD_TAG=$POLIS_BUILD_TAG POLIS_BUILD_SOURCE=$POLIS_BUILD_SOURCE
+COPY VERSION VERSION_STABLE_COMMIT /
+COPY scripts/build_identity.py scripts/build-identity.cjs /scripts/
 
 CMD npm run dev
 
@@ -56,17 +72,25 @@ FROM base as prod
 ENV NODE_ENV ${NODE_ENV:-production}
 
 # Install OpenSSL and CA Certificates (CRITICAL for production)
-RUN apk add --no-cache openssl ca-certificates
+RUN apk add --no-cache openssl 'ca-certificates>=20261020-r0'
 
 RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 20000 && \
     npm config set fetch-retry-maxtimeout 120000
-RUN --mount=type=cache,target=/root/.npm npm ci --production=false
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts --production=false
 
 # For prod builds, to minimize the image size, remove the dependencies tagged with `--virtual .build` above.
 RUN apk del .build
 
-COPY . .
+COPY server/. .
+
+ARG GIT_HASH=unknown
+ARG POLIS_BUILD_DISTANCE=unknown
+ARG POLIS_BUILD_TAG
+ARG POLIS_BUILD_SOURCE=unverified-archive
+ENV GIT_HASH=$GIT_HASH POLIS_BUILD_DISTANCE=$POLIS_BUILD_DISTANCE POLIS_BUILD_TAG=$POLIS_BUILD_TAG POLIS_BUILD_SOURCE=$POLIS_BUILD_SOURCE
+COPY VERSION VERSION_STABLE_COMMIT /
+COPY scripts/build_identity.py scripts/build-identity.cjs /scripts/
 
 RUN npm run build
 

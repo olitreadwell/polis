@@ -1,0 +1,421 @@
+import { beforeEach, describe, expect, jest, test } from "@jest/globals";
+import { Readable } from "node:stream";
+// The fixture vote helper: the stored value of a vote named by meaning.
+import { seedVote } from "../../characterization/seed-vote.cjs";
+
+jest.mock("@aws-sdk/client-s3", () => ({
+  S3Client: jest.fn().mockImplementation(() => ({ send: jest.fn() })),
+  GetObjectCommand: class {
+    operation = "get";
+    constructor(public input: unknown) {}
+  },
+  DeleteObjectCommand: class {
+    operation = "delete";
+    constructor(public input: unknown) {}
+  },
+}));
+jest.mock("../../src/db/pg-query", () => ({
+  __esModule: true,
+  default: { queryP: jest.fn(), connect: jest.fn() },
+}));
+jest.mock("../../src/utils/logger", () => ({
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+jest.mock("../../src/config", () => ({
+  __esModule: true,
+  default: {
+    AWS_S3_BUCKET_NAME: "public-import-fixture",
+    polisFromAddress: "sender@example.invalid",
+  },
+}));
+jest.mock("../../src/email/senders", () => ({ sendTextEmail: jest.fn() }));
+
+import pg from "../../src/db/pg-query";
+import logger from "../../src/utils/logger";
+import { sendTextEmail } from "../../src/email/senders";
+import {
+  processImportJob,
+  s3Client,
+  splitImportDeclaration,
+} from "../../src/workers/import-processor";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  semanticToStorage,
+  VOTE_DECLARATION_ERRORS,
+} from "../../src/votes/convention";
+
+const query = jest.mocked(pg.queryP);
+const connect = jest.mocked(pg.connect);
+const send = s3Client.send as jest.Mock;
+const mail = jest.mocked(sendTextEmail);
+const payload = {
+  jobId: 11,
+  zid: 7,
+  s3Key: "public/import.csv",
+  email: "reader@example.invalid",
+};
+const header = "vote_id,user_id,vote_value,timestamp,comment_id\n";
+const events: string[] = [];
+let csv: string;
+let resetDatabase: () => void;
+let client: { query: jest.Mock; release: jest.Mock };
+
+function jobUpdates(status: string) {
+  return query.mock.calls.filter(([sql]) =>
+    String(sql).includes(`status = '${status}'`)
+  );
+}
+function voteInserts() {
+  return client.query.mock.calls.filter(([sql]) =>
+    String(sql).includes("INSERT INTO votes (")
+  );
+}
+
+beforeEach(() => {
+  jest.resetAllMocks();
+  events.length = 0;
+  csv = header + "v1,public-one,1,2024-01-01T00:00:00Z,comment-one\n";
+  const identities = new Map<string, number>();
+  const latest = new Map<string, any>();
+  let count = 0;
+  resetDatabase = () => {
+    identities.clear();
+    latest.clear();
+    count = 0;
+  };
+  client = {
+    query: jest.fn(async (sql: unknown, values?: any[]) => {
+      const text = String(sql);
+      events.push(text.trim().split(/\s+/).slice(0, 3).join(" "));
+      if (text.includes("AS occupied")) return { rows: [{ occupied: false }] };
+      if (text.includes("pg_try_advisory_xact_lock"))
+        return { rows: [{ acquired: true }] };
+      if (text.includes("INSERT INTO participants")) {
+        const rows = values![2].map((name: string) => {
+          const pid = identities.size;
+          identities.set(name, pid);
+          return { pid, uid: pid };
+        });
+        return { rows };
+      }
+      if (text.includes("SELECT p.pid"))
+        return {
+          rows: [...identities]
+            .filter(([, pid]) => values![1].includes(pid))
+            .map(([username, pid]) => ({ username, pid })),
+        };
+      if (text.includes("SELECT count(*)")) return { rows: [{ n: count }] };
+      if (text.includes("INSERT INTO votes (")) {
+        const [, pids, tids, votes, timestamps] = values!;
+        count += pids.length;
+        pids.forEach((pid: number, i: number) =>
+          latest.set(`${pid}:${tids[i]}`, {
+            pid,
+            tid: tids[i],
+            vote: votes[i],
+            modified: String(timestamps[i]),
+          })
+        );
+      }
+      if (text.includes("SELECT v.pid")) return { rows: [...latest.values()] };
+      return { rows: [] };
+    }),
+    release: jest.fn(),
+  };
+  connect.mockResolvedValue(client as never);
+  query.mockImplementation(async (sql: string) => {
+    events.push(sql.replace(/\s+/g, " ").trim());
+    if (sql.includes("AS occupied")) return [{ occupied: false }];
+    return sql.includes("SELECT tid, original_id")
+      ? [{ tid: 0, original_id: "comment-one" }]
+      : [];
+  });
+  send.mockImplementation(async (command: any) => {
+    events.push("s3:" + command.operation);
+    return command.operation === "get" ? { Body: Readable.from([csv]) } : {};
+  });
+  mail.mockResolvedValue({ $metadata: {} });
+});
+
+describe("CSV import transaction and lifecycle boundaries", () => {
+  test("stores an out-of-range vote_value unchanged, as before the convention module", async () => {
+    csv += "v2,public-one,2,2024-01-02T00:00:00Z,comment-one\n";
+    csv += "v3,public-two,-7,2024-01-03T00:00:00Z,comment-one\n";
+    await processImportJob(payload);
+    expect(voteInserts()[0][1][3]).toEqual([-1, 2, -7]);
+  });
+
+  test("maps public CSV signs and comment IDs, retains participant zero, and skips unknown comments", async () => {
+    csv += "v2,public-one,-1,2024-01-02T00:00:00Z,comment-one\n";
+    csv += "v3,public-two,0,2024-01-03T00:00:00Z,comment-one\n";
+    csv += "v4,public-two,1,2024-01-04T00:00:00Z,missing-comment\n";
+    await processImportJob(payload);
+    expect(voteInserts()).toHaveLength(1);
+    expect(voteInserts()[0][1]).toEqual([
+      7,
+      [0, 0, 1],
+      [0, 0, 0],
+      // The three CSV vote_value cells (export convention) stored as agree, disagree, pass.
+      [seedVote("agree"), seedVote("disagree"), seedVote("pass")],
+      [1704067200000, 1704153600000, 1704240000000],
+    ]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("missing-comment")
+    );
+    expect(client.release).toHaveBeenCalledTimes(1);
+    // Closed, not pooled: the batch's participant lock must not outlive it.
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(jobUpdates("completed")).toHaveLength(1);
+    expect(jobUpdates("failed")).toHaveLength(0);
+    expect(events.indexOf("COMMIT")).toBeLessThan(
+      events.findIndex(
+        (e, i) =>
+          i > events.indexOf("COMMIT") &&
+          e.startsWith("INSERT INTO votes_latest_unique")
+      )
+    );
+    const completed = events.findIndex((e) => e.includes("'completed'"));
+    const latest = events.findIndex((e) =>
+      e.startsWith("INSERT INTO votes_latest_unique")
+    );
+    const stats = events.findIndex((e) => e.startsWith("WITH ptpt_stats"));
+    const tick = events.findIndex((e) =>
+      e.startsWith("INSERT INTO math_ticks")
+    );
+    expect(latest).toBeGreaterThan(-1);
+    expect(stats).toBeGreaterThan(latest);
+    expect(tick).toBeGreaterThan(stats);
+    expect(completed).toBeGreaterThan(tick);
+    expect(events.indexOf("s3:delete")).toBeGreaterThan(completed);
+    expect(send.mock.calls[0][0]).toEqual({
+      operation: "get",
+      input: { Bucket: "public-import-fixture", Key: payload.s3Key },
+    });
+    expect(send.mock.calls[1][0]).toEqual({
+      operation: "delete",
+      input: { Bucket: "public-import-fixture", Key: payload.s3Key },
+    });
+    expect(mail).toHaveBeenCalledWith(
+      "sender@example.invalid",
+      payload.email,
+      "Import Successful: Your Data is Ready",
+      expect.stringContaining("Processed 3 votes.")
+    );
+  });
+
+  test("crossing the 1000-row boundary commits every row exactly once in two released batches", async () => {
+    csv =
+      header +
+      Array.from(
+        { length: 1001 },
+        (_, i) => `v${i},public-one,1,2024-01-01T00:00:00Z,comment-one\n`
+      ).join("");
+    await processImportJob(payload);
+    expect(
+      voteInserts().map(([, values]) => (values as any[])[1].length)
+    ).toEqual([1000, 1]);
+    expect(
+      client.query.mock.calls.filter(([sql]) => sql === "COMMIT")
+    ).toHaveLength(2);
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(client.release).toHaveBeenCalledTimes(2);
+    expect(mail.mock.calls[0][3]).toContain("Processed 1001 votes.");
+  });
+
+  test("no mapped comments aborts before downloading or opening a transaction", async () => {
+    query.mockImplementation(async (sql) =>
+      sql.includes("AS occupied") ? [{ occupied: false }] : []
+    );
+    await expect(processImportJob(payload)).rejects.toThrow(
+      "No comments found"
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect(jobUpdates("failed")).toHaveLength(1);
+    expect(jobUpdates("completed")).toHaveLength(0);
+  });
+
+  test("download failure retains the source and original error while marking the job failed", async () => {
+    const error = new Error("object unavailable");
+    send.mockRejectedValue(error as never);
+    await expect(processImportJob(payload)).rejects.toBe(error);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(connect).not.toHaveBeenCalled();
+    expect(jobUpdates("failed")[0][1]).toEqual([11, "object unavailable"]);
+    expect(jobUpdates("completed")).toHaveLength(0);
+  });
+
+  test("an object without a body cannot be completed or deleted", async () => {
+    send.mockResolvedValue({} as never);
+    await expect(processImportJob(payload)).rejects.toThrow(
+      "Empty body from S3"
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(jobUpdates("failed")).toHaveLength(1);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  test("malformed CSV rejects before flushing partial records", async () => {
+    csv = header + 'v1,"unterminated';
+    await expect(processImportJob(payload)).rejects.toThrow();
+    expect(connect).not.toHaveBeenCalled();
+    expect(jobUpdates("failed")).toHaveLength(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed batch rolls back, releases its client and stops derived publication", async () => {
+    const original = client.query.getMockImplementation()!;
+    const error = new Error("vote insert refused");
+    client.query.mockImplementation(async (...args: unknown[]) => {
+      if (String(args[0]).includes("INSERT INTO votes (")) throw error;
+      return original(...args);
+    });
+    await expect(processImportJob(payload)).rejects.toBe(error);
+    expect(client.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(client.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(
+      query.mock.calls.some(([sql]) =>
+        String(sql).includes("INSERT INTO votes_latest_unique")
+      )
+    ).toBe(false);
+    expect(jobUpdates("completed")).toHaveLength(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test("derived-publication failure keeps the uploaded source despite a committed vote batch", async () => {
+    const original = query.getMockImplementation()!;
+    const error = new Error("latest-vote publication refused");
+    query.mockImplementation(async (...args: Parameters<typeof pg.queryP>) => {
+      if (String(args[0]).includes("INSERT INTO votes_latest_unique"))
+        throw error;
+      return original(...args);
+    });
+    await expect(processImportJob(payload)).rejects.toBe(error);
+    expect(client.query).toHaveBeenCalledWith("COMMIT");
+    expect(jobUpdates("failed")).toHaveLength(1);
+    expect(jobUpdates("completed")).toHaveLength(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test("object cleanup failure does not turn a completed import into a failed job", async () => {
+    const original = send.getMockImplementation()!;
+    send.mockImplementation(async (command: any) => {
+      if (command.operation === "delete") throw new Error("delete unavailable");
+      return original(command);
+    });
+    await expect(processImportJob(payload)).resolves.toBeUndefined();
+    expect(jobUpdates("completed")).toHaveLength(1);
+    expect(jobUpdates("failed")).toHaveLength(0);
+    expect(mail).toHaveBeenCalledTimes(1);
+  });
+
+  test("success email failure does not undo a completed import", async () => {
+    mail.mockRejectedValue(new Error("mail unavailable"));
+    await expect(processImportJob(payload)).resolves.toBeUndefined();
+    expect(jobUpdates("completed")).toHaveLength(1);
+    expect(jobUpdates("failed")).toHaveLength(0);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  test("failure-reporting double faults preserve the original import error", async () => {
+    const original = query.getMockImplementation()!;
+    const error = new Error("original download error");
+    send.mockRejectedValue(error as never);
+    query.mockImplementation(async (...args: Parameters<typeof pg.queryP>) => {
+      if (String(args[0]).includes("status = 'failed'"))
+        throw new Error("failure update unavailable");
+      return original(...args);
+    });
+    mail.mockRejectedValue(new Error("failure email unavailable"));
+    await expect(processImportJob(payload)).rejects.toBe(error);
+    expect(jobUpdates("completed")).toHaveLength(0);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("CRITICAL DOUBLE FAULT")
+    );
+  });
+});
+
+// The declared sign (P-078 PR-E). Fixture files hold the declaration lines; see
+// docs/export-format.md for the rule.
+const declarationFixture = (name: string) =>
+  readFileSync(
+    join(__dirname, "..", "fixtures", "vote-declaration", name),
+    "utf8"
+  );
+const withoutFirstLine = (text: string) => text.slice(text.indexOf("\n") + 1);
+const storedValues = () => voteInserts()[0][1][3];
+
+describe("a declared vote sign on the import file", () => {
+  test("absent: the file is read in the export convention, as before", async () => {
+    csv = withoutFirstLine(declarationFixture("import-declared.csv"));
+    await processImportJob(payload);
+    expect(storedValues()).toEqual(
+      (["agree", "disagree", "pass"] as const).map((v) => semanticToStorage(v))
+    );
+    expect(jobUpdates("completed")).toHaveLength(1);
+  });
+
+  test("present and matching: the declaration line is dropped and every row stores what the undeclared file stores", async () => {
+    csv = withoutFirstLine(declarationFixture("import-declared.csv"));
+    await processImportJob(payload);
+    const undeclared = storedValues();
+    jest.clearAllMocks();
+    // This comparison is a new empty target, not redelivery of a prior import.
+    client.query.mockClear();
+    resetDatabase();
+    csv = declarationFixture("import-declared.csv");
+    await processImportJob(payload);
+    expect(voteInserts()).toHaveLength(1);
+    expect(storedValues()).toEqual(undeclared);
+    expect(voteInserts()[0][1][1]).toEqual([0, 1, 2]); // three participants, header read
+    expect(jobUpdates("completed")).toHaveLength(1);
+    expect(jobUpdates("failed")).toHaveLength(0);
+  });
+
+  test("present with CRLF line endings and no format id: accepted", async () => {
+    csv = declarationFixture("import-declared-crlf-no-format.csv");
+    await processImportJob(payload);
+    expect(storedValues()).toEqual([semanticToStorage("agree")]);
+    expect(jobUpdates("completed")).toHaveLength(1);
+  });
+
+  test.each([
+    ["import-mismatch-sign.csv", VOTE_DECLARATION_ERRORS.mismatch],
+    ["import-mismatch-format.csv", VOTE_DECLARATION_ERRORS.mismatch],
+    ["import-malformed.csv", VOTE_DECLARATION_ERRORS.malformed],
+  ])("%s: refused with %s before any row is written", async (file, code) => {
+    csv = declarationFixture(file);
+    await expect(processImportJob(payload)).rejects.toThrow(code);
+    expect(connect).not.toHaveBeenCalled();
+    expect(jobUpdates("failed")[0][1]).toEqual([11, code]);
+    expect(jobUpdates("completed")).toHaveLength(0);
+    expect(mail.mock.calls[0][3]).toContain(code);
+  });
+
+  test("the declaration is found however the object body is chunked, and no byte after it is lost", async () => {
+    const text = declarationFixture("import-declared.csv");
+    const chunks = Array.from(text, (c) => Buffer.from(c));
+    const { body, declared } = await splitImportDeclaration(
+      Readable.from(chunks)
+    );
+    expect(declared).not.toBeNull();
+    let rest = "";
+    for await (const chunk of body) rest += Buffer.from(chunk).toString();
+    expect(rest).toBe(withoutFirstLine(text));
+  });
+
+  test("an undeclared body is replayed byte for byte", async () => {
+    const text = withoutFirstLine(declarationFixture("import-declared.csv"));
+    const { body, declared } = await splitImportDeclaration(
+      Readable.from([text.slice(0, 7), text.slice(7)])
+    );
+    expect(declared).toBeNull();
+    let rest = "";
+    for await (const chunk of body) rest += Buffer.from(chunk).toString();
+    expect(rest).toBe(text);
+  });
+});

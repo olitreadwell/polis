@@ -1,6 +1,11 @@
 #!/bin/bash
-set -e
-set -x
+set -eo pipefail
+
+# The commit this CodeDeploy revision was built from. The deploy workflow writes
+# it into the bundle (scripts/deploy-revision.txt) before zipping. Resolve it
+# before any cd: CodeDeploy runs this file from the revision's own archive.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_REVISION="$(cat "$HOOK_DIR/deploy-revision.txt" 2>/dev/null || true)"
 
 # MINIMAL CHANGE: Ensure parent directory exists before trying to cd into it
 sudo mkdir -p /opt/polis
@@ -22,7 +27,26 @@ fi
 cd polis
 sudo git config --global --add safe.directory /opt/polis/polis
 sudo git config pull.rebase true
-sudo git reset --hard origin/$GIT_BRANCH && sudo git pull
+# Check out exactly this deployment's commit, never whatever the branch is at
+# hook time: with ONE_AT_A_TIME, a promotion merged mid-rollout would otherwise
+# reach the remaining boxes (and its migrations would be applied below) without
+# a deployment of its own. The commit must be on the branch, so a bundle built
+# from another branch cannot deploy, and a redeploy of an earlier bundle (a
+# CodeDeploy rollback) checks out that earlier commit.
+if ! printf '%s\n' "$DEPLOY_REVISION" | grep -Eqx '[0-9a-f]{40}'; then
+  echo "Error: this deployment bundle names no source commit (scripts/deploy-revision.txt); refusing to deploy whatever $GIT_BRANCH is now"
+  exit 1
+fi
+if [ "$(sudo git rev-parse --is-shallow-repository)" = "true" ]; then
+  sudo git fetch --unshallow origin "$GIT_BRANCH"
+fi
+sudo git fetch origin "+refs/heads/$GIT_BRANCH:refs/remotes/origin/$GIT_BRANCH"
+if ! sudo git merge-base --is-ancestor "$DEPLOY_REVISION" "origin/$GIT_BRANCH"; then
+  echo "Error: deployment commit $DEPLOY_REVISION is not on origin/$GIT_BRANCH; refusing to deploy it"
+  exit 1
+fi
+sudo git reset --hard "$DEPLOY_REVISION"
+echo "Deploying commit $DEPLOY_REVISION (origin/$GIT_BRANCH is $(sudo git rev-parse "origin/$GIT_BRANCH"))"
 
 # --- Fetch pre-configured .env from SSM Parameter Store ---
 PRE_CONFIGURED_ENV=$(aws secretsmanager get-secret-value --secret-id polis-web-app-env-vars --query SecretString --output text --region us-east-1)
@@ -73,7 +97,7 @@ DB_PORT=$(aws ssm get-parameter --name "/polis/db-port" --query 'Parameter.Value
 # --- Construct DATABASE_URL using values from Secrets Manager AND SSM Parameters ---
 DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=require"
 
-echo "Constructed DATABASE_URL: $DATABASE_URL" # Original logging
+echo "Constructed DATABASE_URL for host ${DB_HOST}:${DB_PORT}"
 
 # --- Append DATABASE_URL to the end of .env ---
 echo "Appending DATABASE_URL to .env"
@@ -83,16 +107,131 @@ printf "\nDATABASE_URL=%s\n" "$DATABASE_URL" | sudo tee -a .env > /dev/null
 SERVICE_FROM_FILE=$(cat /etc/app-info/service_type.txt)
 echo "DEBUG: Service type read from /etc/app-info/service_type.txt: [$SERVICE_FROM_FILE]"
 
-# Original Docker cleanup/start logic
-echo "Stopping and removing existing Docker containers..."
-sudo /usr/local/bin/docker-compose down || true
-sudo docker rm -f $(docker ps -aq) || true
-echo "Docker containers stopped and removed."
+case "$SERVICE_FROM_FILE" in
+  server|delphi|math|delphi-large|delphi-worker) ;;
+  *) echo "Error: Unknown service type: [$SERVICE_FROM_FILE]"; exit 1 ;;
+esac
 
-yes | sudo docker system prune -a --filter "until=72h"
-echo "Docker cache cleared"
+POLIS_API_IMAGE_AVAILABLE=1
+if [ "$SERVICE_FROM_FILE" == "server" ]; then
+  # Resolve the new revision's environment before pulling images. The previous
+  # image override is not needed here. Never print config: it contains credentials.
+  RUST_API_ROUTES_NAMED=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["nginx-proxy"].environment.RUST_API_ROUTES // ""' | tr -d ', \t\r\n')
+  POLIS_API_START=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["polis-api"].environment.POLIS_API_START // "0"')
+  case "$POLIS_API_START" in
+    0|1) ;;
+    *) echo "POLIS_API_START must be 0 or 1; refusing service replacement" >&2; exit 1 ;;
+  esac
+  if [ "$POLIS_API_START" = 1 ] || [ -n "$RUST_API_ROUTES_NAMED" ]; then
+    POLIS_API_TRANSPORT=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["polis-api"].environment.POLIS_API_DB_TRANSPORT // "tls"')
+    if [ "$POLIS_API_TRANSPORT" != tls ]; then
+      echo "The web deployment requires verified TLS for polis-api" >&2
+      exit 1
+    fi
+  fi
+fi
 
-sudo /usr/local/bin/docker-compose config
+# Every image this box runs (and the migration runner) was built once, for
+# exactly this commit, on the deploy workflow's build box (cdk/buildBox.ts,
+# deploy/build-images.sh) and pushed to the registry; the workflow wrote the
+# digests into the bundle (scripts/deploy-images.txt) next to this hook. A box
+# only pulls, by digest: building here competed with live traffic for CPU and
+# filled the 8 GB root disks. Every pull, and every check below, happens before
+# the migration and before any service is replaced, so a missing or mismatched
+# required image fails the deploy while the healthy revision keeps serving.
+ECR_REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.us-east-1.amazonaws.com"
+DEPLOY_IMAGES="$HOOK_DIR/deploy-images.txt"
+image_ref() { sed -n "s/^$1=//p" "$DEPLOY_IMAGES" 2>/dev/null | head -n 1; }
+if [ "$(image_ref revision)" != "$DEPLOY_REVISION" ]; then
+  echo "Error: this deployment bundle has no image manifest for commit $DEPLOY_REVISION (scripts/deploy-images.txt); refusing to deploy"
+  exit 1
+fi
+pull_image() {
+  local ref
+  ref="$(image_ref "$1")"
+  case "$ref" in "$ECR_REGISTRY"/*) ;; *) ref="" ;; esac
+  if ! printf '%s\n' "$ref" | grep -Eqx '[0-9]{12}\.dkr\.ecr\.us-east-1\.amazonaws\.com/polis(/[a-z-]+)?@sha256:[0-9a-f]{64}'; then
+    echo "Error: the image manifest names no digest in this registry for '$1'; refusing to deploy"
+    exit 1
+  fi
+  if [ "$1" = polis-api ] && [ -z "$RUST_API_ROUTES_NAMED" ]; then
+    if ! sudo docker pull "$ref"; then
+      POLIS_API_IMAGE_AVAILABLE=0
+      echo "Could not pull polis-api; no Rust route is selected, so skipping its startup and continuing the Node deployment" >&2
+    fi
+  else
+    sudo docker pull "$ref"
+  fi
+}
+# The web box also pulls polis-api (the Rust read routes) on every deploy; it
+# starts when warm startup is enabled or a route is selected. Only a selected
+# route makes its image pull required; manifest errors remain fatal.
+case "$SERVICE_FROM_FILE" in
+  server) ROLE_IMAGES="server nginx-proxy client-participation-alpha polis-api" ;;
+  delphi) ROLE_IMAGES="delphi math-python" ;;
+  delphi-large|delphi-worker) ROLE_IMAGES="delphi" ;;
+  *) ROLE_IMAGES="" ;;
+esac
+aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
+for image in migrate $ROLE_IMAGES; do
+  pull_image "$image"
+done
+
+# Readiness identity (P-072), for every box that runs the math poller or its
+# queue child (the Delphi box's math-python; the large box's math_rebuild
+# jobs, P-073 r2): the poller logs the source commit and a digest of this
+# instance's id in its readiness lines, so the operator's readiness record
+# names the holder, and the queue child's version-skew guard compares the
+# commit with the one the small poller put on the job.
+# Never fatal here: a missing commit makes the collector refuse to build a
+# record, and a missing instance id makes the poller itself refuse to start
+# (exit 2; the heartbeat alarm then fires) rather than name the holder by
+# container hostname.
+poller_identity() {
+  POLLER_COMMIT=$(sudo git rev-parse HEAD 2>/dev/null || true)
+  POLLER_INSTANCE=""
+  for attempt in 1 2 3; do
+    IMDS_TOKEN=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+    POLLER_INSTANCE=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id || true)
+    case "$POLLER_INSTANCE" in i-*) break ;; *) POLLER_INSTANCE=""; sleep 1 ;; esac
+  done
+  if [ -z "$POLLER_INSTANCE" ]; then
+    echo "WARNING: no EC2 instance id from IMDS; the math poller will refuse to start (P-072)"
+  fi
+  printf "\nMATH_POLLER_SOURCE_COMMIT=%s\nMATH_POLLER_INSTANCE_ID=%s\n" "$POLLER_COMMIT" "$POLLER_INSTANCE" | sudo tee -a .env > /dev/null
+}
+
+# client-participation-alpha bakes four public settings (its build args in
+# docker-compose.yml) into its bundle at build time. The build box got them
+# from the workflow, not from this box's env document, so refuse an image built
+# with other values than this box would have built it with.
+if [ "$SERVICE_FROM_FILE" == "server" ]; then
+  WEB_ARGS_SHA256=$(sudo /usr/local/bin/docker-compose config --format json | jq -cS '.services["client-participation-alpha"].build.args | del(.GIT_HASH, .POLIS_BUILD_DISTANCE, .POLIS_BUILD_TAG, .POLIS_BUILD_SOURCE)' | sha256sum | cut -d' ' -f1)
+  if [ "$WEB_ARGS_SHA256" != "$(image_ref web-build-args-sha256)" ]; then
+    echo "Error: client-participation-alpha was built with other public settings (PUBLIC_SERVICE_URL, AUTH_NAMESPACE, OIDC_CACHE_KEY_PREFIX, OIDC_CACHE_KEY_ID_TOKEN_SUFFIX) than this box's env document gives it; refusing to deploy"
+    exit 1
+  fi
+fi
+
+# Apply the release schema before stopping/replacing any healthy service.
+# All roles use the same database lock; a second box waits, then applies nothing.
+sudo docker tag "$(image_ref migrate)" polis-migrate:deploy
+sudo docker run --rm --network host --env-file .env polis-migrate:deploy deploy
+
+# Compose runs the pulled digests: this override sets each service's image, and
+# every `up` below passes --no-build, so nothing is built on this box.
+if [ -n "$ROLE_IMAGES" ]; then
+  { echo "services:"
+    for image in $ROLE_IMAGES; do printf '  %s:\n    image: %s\n' "$image" "$(image_ref "$image")"; done
+  } | sudo tee docker-compose.images.yml > /dev/null
+else
+  echo "services: {}" | sudo tee docker-compose.images.yml > /dev/null
+fi
+COMPOSE=(sudo /usr/local/bin/docker-compose -f docker-compose.yml -f docker-compose.images.yml)
+
+# Validate configuration before replacing any running container. Compose replaces
+# only this Compose project below; never remove unrelated containers or prune here.
+"${COMPOSE[@]}" config --quiet
 
 if [ -f "/etc/app-info/log_group_name.txt" ]; then
   LOG_GROUP_NAME=$(cat "/etc/app-info/log_group_name.txt")
@@ -100,26 +239,76 @@ if [ -f "/etc/app-info/log_group_name.txt" ]; then
   printf "\nAWS_LOG_GROUP_NAME=%s\n" "$LOG_GROUP_NAME" | sudo tee -a .env > /dev/null
 fi
 
-if [ "$SERVICE_FROM_FILE" == "server" ]; then
-  echo "Starting docker-compose up for 'server', 'nginx-proxy', and 'client-participation-alpha' services"
-  sudo /usr/local/bin/docker-compose up -d server nginx-proxy client-participation-alpha --build --force-recreate
-elif [ "$SERVICE_FROM_FILE" == "math" ]; then
-  echo "Starting docker-compose up for 'math' service"
-  sudo /usr/local/bin/docker-compose up -d math --build --force-recreate
-elif [ "$SERVICE_FROM_FILE" == "delphi" ]; then
-  echo "Starting docker-compose up for 'delphi' service"
-  echo "Fetching Ollama Service URL for Delphi..."
-  OLLAMA_URL=$(aws secretsmanager get-secret-value --secret-id /polis/ollama-service-url --query SecretString --output text --region us-east-1)
-
-  if [ -z "$OLLAMA_URL" ]; then
-    echo "Error: Could not retrieve Ollama Service URL from Secrets Manager: /polis/ollama-service-url"
+# A queue worker box (service types delphi-large and delphi-worker, written by
+# the worker launch templates, cdk/workerClasses.ts) runs ONE thing: the
+# polis-jobs daemon of its class, as the systemd unit polis-jobs.service that
+# its user data installed (cdk/launchTemplates.ts). The deploy tags the pulled
+# Delphi image (it carries the daemon) as the image that unit runs and
+# restarts that unit only; it starts no compose service. The restart is queued
+# (--no-block): the unit's stop drains the running job (docker stop -t 900),
+# which can outlast this hook, and then starts the new image. Refuses, failing
+# the deploy, when the box's class or unit is not what the service type says.
+worker_daemon() {
+  local want_class="$1" have_class=""
+  if [ -f /etc/app-info/worker_class.txt ]; then have_class=$(cat /etc/app-info/worker_class.txt); fi
+  if [ "$have_class" != "$want_class" ]; then
+    echo "Error: service type '$SERVICE_FROM_FILE' runs worker class '$want_class', but /etc/app-info/worker_class.txt says '$have_class'"
     exit 1
   fi
-  echo "Retrieved Ollama Service URL."
+  if [ ! -f /etc/systemd/system/polis-jobs.service ]; then
+    echo "Error: service type '$SERVICE_FROM_FILE' runs the polis-jobs daemon, but /etc/systemd/system/polis-jobs.service is missing (the worker launch template installs it)"
+    exit 1
+  fi
+  local jobs_image
+  jobs_image=$(sed -n 's/^POLIS_JOBS_IMAGE=//p' /etc/app-info/polis-jobs.env 2>/dev/null | head -n 1)
+  if [ -z "$jobs_image" ]; then
+    echo "Error: service type '$SERVICE_FROM_FILE' runs the polis-jobs daemon, but /etc/app-info/polis-jobs.env names no POLIS_JOBS_IMAGE (the worker launch template writes it)"
+    exit 1
+  fi
+  echo "Tagging the pulled Delphi image (it carries polis-jobs) as $jobs_image and restarting polis-jobs.service for worker class '$want_class'"
+  sudo docker tag "$(image_ref delphi)" "$jobs_image"
+  "${COMPOSE[@]}" down
+  sudo systemctl restart --no-block polis-jobs.service
+}
 
-  echo "Appending OLLAMA_HOST to .env for Delphi"
-  printf "\nOLLAMA_HOST=%s\n" "$OLLAMA_URL" | sudo tee -a .env > /dev/null
-  echo "OLLAMA_HOST appended."
+if [ "$SERVICE_FROM_FILE" == "server" ]; then
+  echo "Starting the pulled 'server', 'nginx-proxy', and 'client-participation-alpha' images"
+  "${COMPOSE[@]}" --profile rust-api down
+  "${COMPOSE[@]}" up -d server nginx-proxy client-participation-alpha --no-build --force-recreate
+  if [ "$POLIS_API_IMAGE_AVAILABLE" = 1 ] && { [ "$POLIS_API_START" = 1 ] || [ -n "$RUST_API_ROUTES_NAMED" ]; }; then
+    # Only a selected route makes Rust startup a requirement of this deploy.
+    if ! "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate polis-api; then
+      echo "polis-api start failed" >&2
+      if [ -n "$RUST_API_ROUTES_NAMED" ]; then
+        exit 1
+      fi
+      echo "No Rust route is selected; continuing the Node deployment" >&2
+    fi
+  fi
+elif [ "$SERVICE_FROM_FILE" == "math" ]; then
+  # The Clojure math engine is retired; the Python engine (math-python) runs on
+  # the Delphi role. A box still tagged `math` (the math-worker ASG until it is
+  # scaled to zero) starts nothing. This branch must stay until no such box is
+  # left: without it the box would fall through to the catch-all below and
+  # start every service, including a second Delphi job poller.
+  "${COMPOSE[@]}" down
+  echo "Service type 'math' is retired (the Clojure engine was removed); starting no services on this box"
+elif [ "$SERVICE_FROM_FILE" == "delphi" ]; then
+  echo "Starting docker-compose up for 'delphi' and 'math-python' (math engine) services"
+  # The Ollama GPU stack is optional (topic naming defaults to the Anthropic
+  # Batch API). Only fetch OLLAMA_HOST if the secret exists; never fail the
+  # deploy when it doesn't. Re-enable Ollama with CDK_ENABLE_OLLAMA=true +
+  # LLM_PROVIDER=ollama.
+  echo "Checking for optional Ollama Service URL for Delphi..."
+  OLLAMA_URL=$(aws secretsmanager get-secret-value --secret-id /polis/ollama-service-url --query SecretString --output text --region us-east-1 2>/dev/null || true)
+
+  if [ -n "$OLLAMA_URL" ]; then
+    echo "Retrieved Ollama Service URL; appending OLLAMA_HOST to .env for Delphi"
+    printf "\nOLLAMA_HOST=%s\n" "$OLLAMA_URL" | sudo tee -a .env > /dev/null
+    echo "OLLAMA_HOST appended."
+  else
+    echo "No Ollama Service URL secret found (/polis/ollama-service-url); skipping OLLAMA_HOST. Delphi will use the Anthropic Batch API for topic naming."
+  fi
 
 
   if [ -f "/etc/app-info/instance_size.txt" ]; then
@@ -169,8 +358,92 @@ elif [ "$SERVICE_FROM_FILE" == "delphi" ]; then
     printf "DELPHI_CONTAINER_CPUS=%s\n" "$DELPHI_CONTAINER_CPUS" | sudo tee -a .env > /dev/null
   fi
 
-  sudo /usr/local/bin/docker-compose up -d delphi --build --force-recreate
+  # Python math poller: `math-python` is the math engine. It writes math rows
+  # under its own math_env label (`python`), which the server and Delphi serve
+  # (the secret's MATH_ENV=python). The retired Clojure engine's `prod` rows are
+  # frozen; pointing MATH_ENV back at `prod` would serve stale math, so rolling
+  # back the engine means reverting the code change. Naming a
+  # profile-gated service on the `up` command line starts it without --profile
+  # (Compose v2.40.0 enables named services' profiles: cmd/compose/compose.go
+  # `project.WithServicesEnabled(services...)`).
+  # The production env secret (polis-web-app-env-vars) must carry these four
+  # lines BEFORE this deploys:
+  #   MATH_PYTHON_ENV=python   (compose default is also `python`; pinned in the
+  #       secret so the poller's write label does not depend on a compose default)
+  #   DATABASE_SSL_MODE=require   (compose default is `disable`; the Python
+  #       Postgres client rebuilds the URL from its parts and appends this mode,
+  #       dropping DATABASE_URL's ?sslmode=require. The secret is shared, so the
+  #       delphi service moves from `disable` to `require` too)
+  #   DELPHI_POLLER_CONTAINER_MEMORY=6g   (compose default 16g; 6g fit beside
+  #       Delphi's 8g DELPHI_CONTAINER_MEMORY on the old 16 GiB c7i.2xlarge. On
+  #       the 64 GiB r7i.2xlarge raise it to 48g once that box is up; see
+  #       cdk/README.md "Delphi small box: r7i.2xlarge")
+  #   MATH_CONV_CACHE_CAP=200   (compose default is also 200; pinned because the
+  #       certified bundle's cohort size is this cap plus one)
+  # POLL_FROM_DAYS_AGO stays at its default of 10. MATH_POLLER_ALLOW_SERVED_ENV
+  # must stay UNSET: it is the override that lets the poller write the `prod`
+  # label (the retired engine's frozen rows), and the poller must never write there.
+  # Singleton: every Delphi-role box (both launch templates, any ASG scale-out
+  # or replacement) runs this line, so the poller admits itself: at startup it
+  # takes a Postgres session-level advisory lock keyed on its math_env label
+  # (pg_try_advisory_lock(hashtext('polis-math-python:' || label))) on a
+  # dedicated connection named math-python:<label>@<hostname>. Other boxes'
+  # pollers log `waiting for single-writer lock; holder=...` and retry every
+  # 30 s, taking over only once the holder's session is gone. The holder
+  # re-checks its lock about every 5 s and exits (code 3) if the check fails;
+  # that interval is a scheduling target, not a wall-clock bound or a
+  # publication fence. Delphi's report role on every box is unaffected. An
+  # ASG max of 1 for the Delphi small group is a later belt-and-braces CDK
+  # change, not needed for correctness.
+  # Durable stop: remove `math-python` from this line and redeploy (the hook
+  # removes this Compose project's containers before starting the named ones).
+  # Removing only the holder's container is a FAILOVER, not a stop: a waiting
+  # poller on another Delphi box takes the lock. Fleet-wide emergency stop:
+  #   1. Pause anything that runs this hook: no deploy, and suspend Launch on
+  #      both Delphi ASGs (AsgDelphiSmall, AsgDelphiLarge) so no new box starts
+  #      a poller; list every InService instance in both groups.
+  #   2. On every box, via SSM Run Command targeted at both groups, find the
+  #      math-python container; its log says `holding single-writer lock` on
+  #      the holder, `waiting for single-writer lock` on standbys.
+  #   3. `sudo docker rm -f` the standbys' math-python containers first, then
+  #      the holder's, so nothing is admitted during the stop.
+  #   4. Verify: no math-python container on any box (SSM across both groups);
+  #      zero rows from `SELECT application_name FROM pg_stat_activity WHERE
+  #      application_name LIKE 'math-python:%'`; max(math_tick) under
+  #      math_env='python' no longer advances.
+  #   5. Make it durable (remove `math-python` here and redeploy) before
+  #      resuming deploys or ASG launches.
+  poller_identity
+  "${COMPOSE[@]}" down
+  "${COMPOSE[@]}" up -d delphi math-python --no-build --force-recreate
+elif [ "$SERVICE_FROM_FILE" == "delphi-large" ]; then
+  # The large memory class box (P-073 r2). Its worker is the polis-jobs
+  # daemon run as worker class `large`, which starts `math_poller.py --job`
+  # for one conversation at a time; it starts no compose service. The
+  # readiness identity is written for it (the child's version-skew guard reads
+  # MATH_POLLER_SOURCE_COMMIT). No Delphi job poller and no small poller run
+  # here: `math-python` is the single writer of the `python` label and runs on
+  # the Delphi box.
+  echo "Service type 'delphi-large': no compose service to start (the large class runs as queue jobs under the polis-jobs daemon)"
+  poller_identity
+  worker_daemon large
+elif [ "$SERVICE_FROM_FILE" == "delphi-worker" ]; then
+  # A Delphi queue worker box: the polis-jobs daemon run as worker class
+  # `delphi` (the Delphi stages). It starts no compose service: no Delphi job
+  # poller and no math poller run here.
+  echo "Service type 'delphi-worker': no compose service to start (the Delphi stages run as queue jobs under the polis-jobs daemon)"
+  worker_daemon delphi
 else
-  echo "Error: Unknown service type: [$SERVICE_FROM_FILE]. Starting all services (default docker-compose up -d)"
-  sudo /usr/local/bin/docker-compose up -d --build --force-recreate
+  echo "Error: Unknown service type: [$SERVICE_FROM_FILE]"
+  exit 1
 fi
+
+# Free the disk the previous deployment's images held, now replaced. Only the
+# digests the previous manifest named, never forced: an image a container still
+# uses (a polis-jobs drain in progress) stays.
+if [ -f /opt/polis/deployed-images.txt ]; then
+  for ref in $(sed -n 's/^[a-z-]*=\(.*@sha256:[0-9a-f]*\)$/\1/p' /opt/polis/deployed-images.txt); do
+    grep -qF "=$ref" "$DEPLOY_IMAGES" || sudo docker image rm "$ref" > /dev/null 2>&1 || true
+  done
+fi
+sudo cp "$DEPLOY_IMAGES" /opt/polis/deployed-images.txt

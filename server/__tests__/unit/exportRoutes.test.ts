@@ -3,6 +3,7 @@ import {
   formatCSVRow,
   formatCSV,
   loadConversationSummary,
+  sendCommentSummary,
   sendVotesSummary,
   sendParticipantVotesSummary,
   sendParticipantXidsSummary,
@@ -10,11 +11,17 @@ import {
 } from "../../src/report";
 import pg from "../../src/db/pg-query";
 import { getZinvite } from "../../src/utils/zinvite";
-import { getPca } from "../../src/utils/pca";
+// report.ts reads the latest generation through the coherent Bundle reader.
+import { getPcaFromBundle } from "../../src/utils/pca";
 import { getXids } from "../../src/routes/xids";
 import { jest } from "@jest/globals";
 import logger from "../../src/utils/logger";
 import { failJson } from "../../src/utils/fail";
+import {
+  EXPORT_VOTE_CONVENTION,
+  VOTE_CONVENTION_KEY,
+  semanticToStorage,
+} from "../../src/votes/convention";
 
 type Formatters<T> = Record<string, (row: T) => string>;
 
@@ -36,9 +43,9 @@ function createMockResponse(): MockResponse {
   };
 }
 
-// Helper function to mock stream_queryP_readOnly with row callbacks
+// Helper function to mock stream_queryP_reportExport with row callbacks
 function mockStreamWithRows(rows: any[], shouldError = false, error?: Error) {
-  return (pg.stream_queryP_readOnly as jest.Mock).mockImplementation(
+  return (pg.stream_queryP_reportExport as jest.Mock).mockImplementation(
     (...args: any[]) => {
       if (shouldError) {
         const onError = args[4];
@@ -60,8 +67,8 @@ jest.mock("../../src/db/pg-query", () => {
   return {
     __esModule: true,
     default: {
-      queryP_readOnly: jest.fn(),
-      stream_queryP_readOnly: jest.fn(),
+      queryP_reportExport: jest.fn(),
+      stream_queryP_reportExport: jest.fn(),
     },
   };
 });
@@ -176,12 +183,12 @@ describe("handle_GET_reportExport", () => {
 
       // Mock the dependencies
       (getZinvite as jest.Mock).mockResolvedValue("test-zinvite" as never);
-      (pg.queryP_readOnly as jest.Mock)
+      (pg.queryP_reportExport as jest.Mock)
         .mockResolvedValueOnce([
           { topic: "Test Topic", description: "Test Description" },
         ] as never)
         .mockResolvedValueOnce([{ count: 10 }] as never);
-      (getPca as jest.Mock).mockResolvedValue({
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: {
           "in-conv": [1, 2, 3],
           "user-vote-counts": { 1: 5, 2: 3 },
@@ -201,6 +208,7 @@ describe("handle_GET_reportExport", () => {
         "comments,20",
         "groups,1",
         'conversation-description,"Test Description"',
+        `${VOTE_CONVENTION_KEY},${EXPORT_VOTE_CONVENTION}`,
       ]);
     });
 
@@ -219,7 +227,7 @@ describe("handle_GET_reportExport", () => {
   describe("Participant XIDs summary", () => {
     it("sendParticipantXidsSummary should send the participant XIDs as CSV", async () => {
       // Mock the dependencies
-      (getPca as jest.Mock).mockResolvedValue({
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: {
           "in-conv": [1, 2, 3],
           "user-vote-counts": { 1: 5, 2: 3, 3: 2 },
@@ -246,7 +254,7 @@ describe("handle_GET_reportExport", () => {
 
     it("sendParticipantXidsSummary should handle empty xids array", async () => {
       // Mock the dependencies
-      (getPca as jest.Mock).mockResolvedValue({
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: {
           "in-conv": [],
           "user-vote-counts": {},
@@ -266,10 +274,10 @@ describe("handle_GET_reportExport", () => {
     });
 
     it("sendParticipantXidsSummary should handle errors during export", async () => {
-      const mockError = new Error("polis_error_no_pca_data");
+      const mockError = new Error("polis_err_xids_unavailable");
 
-      // Mock getPca to throw an error
-      (getPca as jest.Mock).mockRejectedValue(mockError as never);
+      // The xid export no longer depends on math; the xid lookup itself fails here.
+      (getXids as jest.Mock).mockRejectedValue(mockError as never);
 
       await sendParticipantXidsSummary(zid, mockRes as any);
 
@@ -286,6 +294,96 @@ describe("handle_GET_reportExport", () => {
     });
   });
 
+  describe("Importance in the export, whatever the conversation's flag", () => {
+    // Answers a query on the conversation's importance_enabled with `flag`; the
+    // export must come out the same either way.
+    function conversationWithImportanceFlag(flag: boolean, comments: any[]) {
+      (pg.queryP_reportExport as jest.Mock).mockImplementation(
+        async (sql: any) =>
+          String(sql).includes("importance_enabled")
+            ? [{ importance_enabled: flag }]
+            : String(sql).includes("FROM comments")
+            ? comments
+            : []
+      );
+    }
+
+    afterEach(() => (pg.queryP_reportExport as jest.Mock).mockReset());
+
+    for (const flag of [false, true]) {
+      it(`votes.csv carries the important column when importance_enabled is ${flag}`, async () => {
+        conversationWithImportanceFlag(flag, []);
+        mockStreamWithRows([
+          {
+            timestamp: 94668411,
+            tid: 1,
+            pid: 1,
+            vote: semanticToStorage("agree"),
+            high_priority: true,
+          },
+          {
+            timestamp: 94668412,
+            tid: 2,
+            pid: 1,
+            vote: semanticToStorage("disagree"),
+            high_priority: false,
+          },
+        ]);
+
+        await sendVotesSummary(zid, mockRes as any);
+
+        const lines = mockRes.write.mock.calls.map((c) => String(c[0]));
+        expect(lines[0]).toBe(
+          "timestamp,datetime,comment-id,voter-id,vote,important\n"
+        );
+        expect(lines.slice(1).map((l) => l.split(",").slice(2))).toEqual([
+          ["1", "1", "1", "1\n"],
+          ["2", "1", "-1", "0\n"],
+        ]);
+        expect(mockRes.end).toHaveBeenCalled();
+      });
+
+      it(`comments.csv counts important votes when importance_enabled is ${flag}`, async () => {
+        conversationWithImportanceFlag(flag, [
+          {
+            tid: 1,
+            pid: 5,
+            created: "1700000000000",
+            txt: "a",
+            mod: 1,
+            velocity: 1,
+            active: true,
+          },
+        ]);
+        mockStreamWithRows([
+          { tid: 1, vote: semanticToStorage("agree"), high_priority: true },
+          { tid: 1, vote: semanticToStorage("disagree"), high_priority: true },
+          { tid: 1, vote: semanticToStorage("agree"), high_priority: false },
+        ]);
+
+        await sendCommentSummary(zid, mockRes as any);
+
+        const [header, row] = String(mockRes.send!.mock.calls[0][0]).split(
+          "\n"
+        );
+        expect(header).toBe(
+          "timestamp,datetime,comment-id,author-id,agrees,disagrees,moderated,importance,comment-body"
+        );
+        const cells = row.split(",");
+        expect([cells[0], ...cells.slice(2)]).toEqual([
+          "1700000000",
+          "1",
+          "5",
+          "2",
+          "1",
+          "1",
+          "2",
+          '"a"',
+        ]);
+      });
+    }
+  });
+
   describe("Votes summary", () => {
     it("sendVotesSummary should send the votes summary as CSV", async () => {
       // Use the original require approach since it's more compatible with jest.spyOn
@@ -298,30 +396,26 @@ describe("handle_GET_reportExport", () => {
         "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"
       );
 
-      // Mock the importance_enabled query (returns false by default)
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
-        { importance_enabled: false },
-      ] as never);
-
       // Mock stream with a single vote row
       mockStreamWithRows([{ timestamp: 94668411, tid: 1, pid: 1, vote: -1 }]);
 
       await sendVotesSummary(zid, mockRes as any);
 
+      expect(pg.queryP_reportExport).not.toHaveBeenCalled();
       expect(mockRes.setHeader).toHaveBeenCalledWith(
         "Content-Type",
         "text/csv"
       );
       expect(mockRes.write).toHaveBeenCalledWith(
-        "timestamp,datetime,comment-id,voter-id,vote\n"
+        "timestamp,datetime,comment-id,voter-id,vote,important\n"
       );
       expect(mockRes.write).toHaveBeenCalledWith(
-        "94668,Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time),1,1,1\n"
+        "94668,Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time),1,1,1,0\n"
       );
       expect(mockRes.end).toHaveBeenCalled();
     });
 
-    it("sendVotesSummary should include important column when importance is enabled", async () => {
+    it("sendVotesSummary should mark important votes 1 and the others 0", async () => {
       // Use the original require approach since it's more compatible with jest.spyOn
       const formatDatetimeSpy = jest.spyOn(
         // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -331,11 +425,6 @@ describe("handle_GET_reportExport", () => {
       formatDatetimeSpy.mockReturnValue(
         "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"
       );
-
-      // Mock the importance_enabled query (returns true)
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
-        { importance_enabled: true },
-      ] as never);
 
       // Mock stream with vote rows including high_priority field
       mockStreamWithRows([
@@ -363,11 +452,6 @@ describe("handle_GET_reportExport", () => {
 
     it("sendVotesSummary should handle errors during vote summary export", async () => {
       const mockError = new Error("Test error");
-
-      // Mock the importance_enabled query
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
-        { importance_enabled: false },
-      ] as never);
 
       // Mock stream with error
       mockStreamWithRows([], true, mockError);
@@ -409,15 +493,15 @@ describe("handle_GET_reportExport", () => {
     };
 
     it("sendParticipantVotesSummary should send the participant votes summary as CSV", async () => {
-      // Mock pg.queryP_readOnly to return comment data
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // Mock pg.queryP_reportExport to return comment data
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 1, pid: 1 },
         { tid: 2, pid: 1 },
         { tid: 3, pid: 2 },
       ] as never);
 
-      // Mock getPca to return properly structured PCA data
-      (getPca as jest.Mock).mockResolvedValue({
+      // Mock getPcaFromBundle to return properly structured PCA data
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: basePcaData,
       } as never);
 
@@ -446,8 +530,8 @@ describe("handle_GET_reportExport", () => {
     it("sendParticipantVotesSummary should handle errors during participant vote summary export", async () => {
       const mockError = new Error("Test error");
 
-      // Mock pg.queryP_readOnly to return an empty array
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([] as never);
+      // Mock pg.queryP_reportExport to return an empty array
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([] as never);
 
       // Mock stream with error
       mockStreamWithRows([], true, mockError);
@@ -467,8 +551,8 @@ describe("handle_GET_reportExport", () => {
     });
 
     it("sendParticipantVotesSummary should handle participants not found in any base cluster", async () => {
-      // Mock pg.queryP_readOnly to return comment data
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // Mock pg.queryP_reportExport to return comment data
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 1, pid: 1 },
         { tid: 2, pid: 3 }, // Participant 3 is in in-conv but not in any base cluster
       ] as never);
@@ -487,8 +571,8 @@ describe("handle_GET_reportExport", () => {
         },
       };
 
-      // Mock getPca with the modified data
-      (getPca as jest.Mock).mockResolvedValue({
+      // Mock getPcaFromBundle with the modified data
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: modifiedPcaData,
       } as never);
 
@@ -522,15 +606,15 @@ describe("handle_GET_reportExport", () => {
       const zid = 789;
       const mockResNonSequential = createMockResponse();
 
-      // 1. Mock comment data (pg.queryP_readOnly)
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // 1. Mock comment data (pg.queryP_reportExport)
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 101, pid: 10 }, // Participant 10 authored comment 101
         { tid: 102, pid: 20 }, // Participant 20 authored comment 102
         { tid: 103, pid: 30 }, // Participant 30 authored comment 103 (will be in-conv but no group)
         { tid: 104, pid: 40 }, // Participant 40 authored comment 104 (not in PCA)
       ] as never);
 
-      // 2. Mock PCA data (getPca)
+      // 2. Mock PCA data (getPcaFromBundle)
       const pcaDataWithNonSequentialBaseClusterIds = {
         "in-conv": [10, 20, 30], // Participants 10, 20, 30 are in the conversation
         "base-clusters": {
@@ -550,11 +634,11 @@ describe("handle_GET_reportExport", () => {
         ],
         "user-vote-counts": { 10: 1, 20: 1, 30: 1 },
       };
-      (getPca as jest.Mock).mockResolvedValue({
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: pcaDataWithNonSequentialBaseClusterIds,
       } as never);
 
-      // 3. Mock votes data (stream_queryP_readOnly)
+      // 3. Mock votes data (stream_queryP_reportExport)
       mockStreamWithRows([
         { pid: 10, tid: 101, vote: -1 }, // Participant 10 voted on their comment (agree)
         { pid: 20, tid: 102, vote: 1 }, // Participant 20 voted on their comment (disagree)
@@ -567,7 +651,7 @@ describe("handle_GET_reportExport", () => {
         "content-type",
         "text/csv"
       );
-      // Header should now include all tids from the mocked queryP_readOnly call for comments
+      // Header should now include all tids from the mocked queryP_reportExport call for comments
       expect(mockResNonSequential.write).toHaveBeenCalledWith(
         "participant,group-id,n-comments,n-votes,n-agree,n-disagree,101,102,103,104\n"
       );
@@ -611,15 +695,15 @@ describe("handle_GET_reportExport", () => {
     };
 
     it("sendParticipantImportance should send the participant importance summary as CSV", async () => {
-      // Mock pg.queryP_readOnly to return comment data
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // Mock pg.queryP_reportExport to return comment data
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 1, pid: 1 },
         { tid: 2, pid: 1 },
         { tid: 3, pid: 2 },
       ] as never);
 
-      // Mock getPca to return properly structured PCA data
-      (getPca as jest.Mock).mockResolvedValue({
+      // Mock getPcaFromBundle to return properly structured PCA data
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: basePcaData,
       } as never);
 
@@ -647,14 +731,14 @@ describe("handle_GET_reportExport", () => {
     });
 
     it("sendParticipantImportance should handle participants with no important votes", async () => {
-      // Mock pg.queryP_readOnly to return comment data
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // Mock pg.queryP_reportExport to return comment data
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 1, pid: 1 },
         { tid: 2, pid: 1 },
       ] as never);
 
-      // Mock getPca to return properly structured PCA data
-      (getPca as jest.Mock).mockResolvedValue({
+      // Mock getPcaFromBundle to return properly structured PCA data
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: basePcaData,
       } as never);
 
@@ -681,8 +765,8 @@ describe("handle_GET_reportExport", () => {
     it("sendParticipantImportance should handle errors during participant importance export", async () => {
       const mockError = new Error("Test error");
 
-      // Mock pg.queryP_readOnly to return an empty array
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([] as never);
+      // Mock pg.queryP_reportExport to return an empty array
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([] as never);
 
       // Mock stream with error
       mockStreamWithRows([], true, mockError);
@@ -702,8 +786,8 @@ describe("handle_GET_reportExport", () => {
     });
 
     it("sendParticipantImportance should handle participants not found in any base cluster", async () => {
-      // Mock pg.queryP_readOnly to return comment data
-      (pg.queryP_readOnly as jest.Mock).mockResolvedValueOnce([
+      // Mock pg.queryP_reportExport to return comment data
+      (pg.queryP_reportExport as jest.Mock).mockResolvedValueOnce([
         { tid: 1, pid: 1 },
         { tid: 2, pid: 3 }, // Participant 3 is in in-conv but not in any base cluster
       ] as never);
@@ -715,8 +799,8 @@ describe("handle_GET_reportExport", () => {
         "user-vote-counts": { 1: 1, 3: 1 },
       };
 
-      // Mock getPca with the modified data
-      (getPca as jest.Mock).mockResolvedValue({
+      // Mock getPcaFromBundle with the modified data
+      (getPcaFromBundle as jest.Mock).mockResolvedValue({
         asPOJO: modifiedPcaData,
       } as never);
 

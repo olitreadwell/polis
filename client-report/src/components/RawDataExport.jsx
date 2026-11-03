@@ -36,6 +36,11 @@ const RawDataExport = ({ conversation, report_id }) => {
       <p style={{ wordBreak: "break-all", fontFamily: "monospace", fontStyle: "italic" }}>
         {`The following data exports are anonymized. Participants are identifed by an integer representing the order in which they first voted. For a full description of files and columns, please see: `}
         <a href="https://compdemocracy.org/export/"> https://compdemocracy.org/export/ </a>
+        {` and, for the vote sign of each file: `}
+        <a href="https://github.com/compdemocracy/polis/blob/edge/docs/export-format.md">
+          {" "}
+          docs/export-format.md{" "}
+        </a>
       </p>
       <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
         {`----------Summary: `}
@@ -80,19 +85,28 @@ const RawDataExport = ({ conversation, report_id }) => {
         </a>
         {` (as comments x participants matrix)`}
       </p>
-      {conversation.importance_enabled && (
-        <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
-          {`Importance matrix: `}
-          <a
-            download={getDownloadFilename("participant-importance", conversation)}
-            href={`//${window.location.hostname}/api/v3/reportExport/${report_id}/participant-importance.csv`}
-            type="text/csv"
-          >
-            {getDownloadFilename("participant-importance", conversation)}
-          </a>
-          {` (as comments x participants matrix)`}
-        </p>
-      )}
+      <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
+        {`Importance matrix: `}
+        <a
+          download={getDownloadFilename("participant-importance", conversation)}
+          href={`//${window.location.hostname}/api/v3/reportExport/${report_id}/participant-importance.csv`}
+          type="text/csv"
+        >
+          {getDownloadFilename("participant-importance", conversation)}
+        </a>
+        {` (as comments x participants matrix)`}
+      </p>
+      <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
+        {`------Format (sign): `}
+        <a
+          download={`${conversation.conversation_id}-format.json`}
+          href={`//${window.location.hostname}/api/v3/reportExport/${report_id}/format.json`}
+          type="application/json"
+        >
+          {`${conversation.conversation_id}-format.json`}
+        </a>
+        {` (the agree / disagree / pass values every file uses; also the vote-convention row of summary.csv)`}
+      </p>
       <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
         {`---Comment groups: `}
         <a
@@ -120,13 +134,14 @@ const RawDataExport = ({ conversation, report_id }) => {
         <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
           {`$ curl ${window.location.protocol}//${window.location.hostname}/api/v3/reportExport/${report_id}/participant-votes.csv`}
         </p>
-        {conversation.importance_enabled && (
-          <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
-            {`$ curl ${window.location.protocol}//${window.location.hostname}/api/v3/reportExport/${report_id}/participant-importance.csv`}
-          </p>
-        )}
+        <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
+          {`$ curl ${window.location.protocol}//${window.location.hostname}/api/v3/reportExport/${report_id}/participant-importance.csv`}
+        </p>
         <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
           {`$ curl ${window.location.protocol}//${window.location.hostname}/api/v3/reportExport/${report_id}/comment-groups.csv`}
+        </p>
+        <p style={{ wordBreak: "break-all", fontFamily: "monospace" }}>
+          {`$ curl ${window.location.protocol}//${window.location.hostname}/api/v3/reportExport/${report_id}/format.json`}
         </p>
       </div>
 

@@ -6,6 +6,7 @@ var PostMessageUtils = require("../util/postMessageUtils");
 var preloadHelper = require("../util/preloadHelper");
 var Utils = require("../util/utils");
 var Net = require("../util/net");
+var VoteConvention = require("../util/voteConvention");
 var $ = require("jquery");
 var _ = require("lodash");
 var d3 = require("../3rdparty/d3.v4.min");
@@ -18,10 +19,13 @@ var polisGet = Net.polisGet;
 
 module.exports = function (params) {
   var polisTypes = {
+    // Legacy names for the wire values (pull = agree, push = disagree), kept on
+    // window.polisTypes for anything outside this bundle that reads them. The
+    // values come from the one wire module.
     reactions: {
-      push: 1,
-      pull: -1,
-      pass: 0,
+      push: VoteConvention.WIRE_DISAGREE,
+      pull: VoteConvention.WIRE_AGREE,
+      pass: VoteConvention.WIRE_PASS,
       trash: "trash",
       see: "see"
     },
@@ -39,7 +43,6 @@ module.exports = function (params) {
   var trashesPath = "api/v3/trashes";
   var commentsPath = "api/v3/comments";
   var nextCommentPath = "api/v3/nextComment";
-  var finishedTutorialPath = "api/v3/tutorial";
 
   var pcaPath = "api/v3/math/pca2";
   var votesFamousPath = "api/v3/votes/famous";
@@ -149,7 +152,7 @@ module.exports = function (params) {
     removeEmptyBucketsFromClusters(clusters);
 
     for (var i = 0; i < clusters.length; i++) {
-      clusters[i]["n-members"] = cachedPcaData["group-votes"][i]["n-members"];
+      clusters[i]["n-members"] = _.get(cachedPcaData, ["group-votes", i, "n-members"], 0);
     }
     return clusters;
   }
@@ -252,7 +255,7 @@ module.exports = function (params) {
     clearComment(commentId, "push");
     var o = {
       high_priority: high_priority,
-      vote: polisTypes.reactions.push,
+      vote: VoteConvention.toWire(VoteConvention.DISAGREE),
       tid: commentId
     };
     if (!_.isUndefined(starred)) {
@@ -330,7 +333,7 @@ module.exports = function (params) {
     clearComment(commentId);
     var o = {
       high_priority: high_priority,
-      vote: polisTypes.reactions.pull,
+      vote: VoteConvention.toWire(VoteConvention.AGREE),
       tid: commentId
     };
     if (!_.isUndefined(starred)) {
@@ -343,7 +346,7 @@ module.exports = function (params) {
     clearComment(tid);
     var o = {
       high_priority: high_priority,
-      vote: polisTypes.reactions.pass,
+      vote: VoteConvention.toWire(VoteConvention.PASS),
       tid: tid
     };
     if (!_.isUndefined(starred)) {
@@ -610,8 +613,8 @@ module.exports = function (params) {
         if (_.isNumber(pcaData.math_tick)) {
           lastServerTokenForPCA = pcaData.math_tick;
         }
-        consensusComments = pcaData.consensus;
-        groupVotes = pcaData["group-votes"];
+        consensusComments = pcaData.consensus || { agree: [], disagree: [] };
+        groupVotes = pcaData["group-votes"] || {};
 
         modOutTids = {};
         var modOut = pcaData["mod-out"];
@@ -641,7 +644,7 @@ module.exports = function (params) {
 
             pcX = pcaData.pca.comps[0];
             pcY = pcaData.pca.comps[1];
-            pcaCenter = pcaData.pca.center;
+            pcaCenter = pcaData.pca.center || [];
 
             // in case of malformed PCs (seen on conversations with only one comment)
             pcX = pcX || [];
@@ -679,7 +682,7 @@ module.exports = function (params) {
                   bids: [],
                   gid: gid,
                   count: 0, // total ptpt count
-                  clusterCount: groupVotes[gid]["n-members"],
+                  clusterCount: _.get(groupVotes, [gid, "n-members"], 0),
                   x: clusters[gid].center[0],
                   y: clusters[gid].center[1],
                   isSummaryBucket: true
@@ -1121,17 +1124,18 @@ module.exports = function (params) {
         }
         var votesVectorInAscii_adpu_format = o.votes;
         var voteForPtpoi = votesVectorInAscii_adpu_format[tid];
-        if (voteForPtpoi === "a") {
+        var ptpoiVote = VoteConvention.fromLetter(voteForPtpoi);
+        if (ptpoiVote === VoteConvention.AGREE) {
           // buckets.A[pid] = buckets.A[pid] || {};
           buckets.A[o.fakeBid] = 1;
           buckets.D[o.fakeBid] = 0;
         }
-        if (voteForPtpoi === "d") {
+        if (ptpoiVote === VoteConvention.DISAGREE) {
           // buckets.D[pid] = buckets.D[pid] || {};
           buckets.A[o.fakeBid] = 0;
           buckets.D[o.fakeBid] = 1;
         }
-        if (voteForPtpoi === "u") {
+        if (voteForPtpoi === VoteConvention.LETTER_UNSEEN) {
           buckets.S[o.fakeBid] = 0; // unseen
         } else {
           buckets.S[o.fakeBid] = 1; // seen
@@ -1143,13 +1147,13 @@ module.exports = function (params) {
       });
       buckets.A[myBid] =
         _.filter(myVotes, function (v) {
-          return v.get("vote") === polisTypes.reactions.pull;
+          return VoteConvention.isAgree(v.get("vote"));
         }).length > 0
           ? 1
           : 0;
       buckets.D[myBid] =
         _.filter(myVotes, function (v) {
-          return v.get("vote") === polisTypes.reactions.push;
+          return VoteConvention.isDisagree(v.get("vote"));
         }).length > 0
           ? 1
           : 0;
@@ -1157,7 +1161,7 @@ module.exports = function (params) {
         buckets.A[myBid] ||
         buckets.D[myBid] ||
         _.filter(myVotes, function (v) {
-          return v.get("vote") === polisTypes.reactions.pass;
+          return VoteConvention.isPass(v.get("vote"));
         }).length > 0
           ? 1
           : 0;
@@ -1282,21 +1286,13 @@ module.exports = function (params) {
       var len = votesVectorInAscii_adpu_format.length;
       for (var i = 0; i < len; i++) {
         var c = votesVectorInAscii_adpu_format[i];
-        if (c !== "u" /* && c !== "p" */) {
+        if (c !== VoteConvention.LETTER_UNSEEN /* && c !== "p" */) {
           // TODO think about "p", and whether it should be counted in the jetpack vote count
-          if (c === "a") {
+          // Re-encode the letter as a wire number: the projection below runs in the wire's axis.
+          var semantic = VoteConvention.fromLetter(c);
+          if (semantic) {
             votesToUseForProjection.push({
-              vote: -1,
-              tid: i
-            });
-          } else if (c === "d") {
-            votesToUseForProjection.push({
-              vote: 1,
-              tid: i
-            });
-          } else if (c === "p") {
-            votesToUseForProjection.push({
-              vote: 0,
+              vote: VoteConvention.toWire(semantic),
               tid: i
             });
           } else {
@@ -1509,10 +1505,11 @@ module.exports = function (params) {
         }
       };
     }
+    var group = (groupVotes || {})[gid] || { "n-members": 0, votes: {} };
     return {
-      count: groupVotes[gid]["n-members"],
-      repness: repness[gid],
-      votes: groupVotes[gid]["votes"]
+      count: group["n-members"],
+      repness: (repness || {})[gid],
+      votes: group.votes
     };
   }
 
@@ -1561,11 +1558,6 @@ module.exports = function (params) {
     return projectedComments;
   }
 
-  function finishedTutorial() {
-    return polisPost(finishedTutorialPath, {
-      step: 1
-    });
-  }
 
   function getParticipantsOfInterestForGid(gid) {
     if (_.isUndefined(gid) || gid === null) {
@@ -1684,17 +1676,11 @@ module.exports = function (params) {
   }
 
   function getConsensus() {
-    if (!cachedPcaData) {
-      return [];
-    }
-    return cachedPcaData["consensus"];
+    return (cachedPcaData && cachedPcaData.consensus) || { agree: [], disagree: [] };
   }
 
   function getGroupAwareConsensus() {
-    if (!cachedPcaData) {
-      return [];
-    }
-    return cachedPcaData["group-aware-consensus"];
+    return (cachedPcaData && cachedPcaData["group-aware-consensus"]) || {};
   }
 
   function getGroupVotes(gid_or_all) {
@@ -1717,7 +1703,7 @@ module.exports = function (params) {
       return x;
     }
 
-    return cachedPcaData["group-votes"][gid_or_all];
+    return (cachedPcaData["group-votes"] || {})[gid_or_all];
   }
 
   function put_participants_extended(params) {
@@ -1766,7 +1752,6 @@ module.exports = function (params) {
       personUpdateCallbacks.add.apply(personUpdateCallbacks, arguments);
       prepAndSendVisData();
     },
-    finishedTutorial: finishedTutorial,
     addCommentsAvailableListener: commentsAvailableCallbacks.add,
     createConversation: createConversation,
     getConversations: getConversations,

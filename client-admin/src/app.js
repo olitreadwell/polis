@@ -31,6 +31,8 @@ import Account from './components/conversations-and-account/Account'
 import Integrate from './components/conversations-and-account/Integrate'
 
 import MainLayout from './components/MainLayout'
+import About from './components/About'
+import Ops from './components/ops/Ops'
 
 const AUTH_LOADING_TIMEOUT = 3000
 
@@ -151,7 +153,9 @@ const App = () => {
             <Route path="/conversations" element={<Conversations />} />
             <Route path="/integrate" element={<Integrate />} />
             <Route path="/account" element={<Account />} />
+            <Route path="/home/about" element={<About />} />
             <Route path="/m/:conversation_id/*" element={<ConversationAdminContainer />} />
+            <Route path="/ops/*" element={<Ops />} />
           </Route>
         </Routes>
       </UserProvider>

@@ -5,14 +5,51 @@
 # Run with: `docker compose -f docker-compose.test.yml --env-file test.env up --build`.
 
 services:
+  coordinator-idle:
+    profiles: [coordinator-idle]
+    image: polis/coordinator-idle:local
+    build:
+      context: .
+      dockerfile: coordinator-rs/deploy/Dockerfile
+    entrypoint: [/usr/local/bin/coordinator-idle]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      DATABASE_URL: ${COORDINATOR_DATABASE_URL:-postgresql://polis_coordinator_observer_login@postgres:5432/polisdb?sslmode=verify-full}
+      COORDINATOR_DB_HOST_ALLOWLIST: ${COORDINATOR_DB_HOST_ALLOWLIST:-postgres}
+      COORDINATOR_DB_PASSWORD_FILE: /run/coordinator/password
+      COORDINATOR_DB_CA_BUNDLE: /etc/polis/local-ca.pem
+      COORDINATOR_MODE: inactive
+      COORDINATOR_WRITER_ENABLED: "false"
+      P026_RESERVATION_BYTES: "0"
+    volumes:
+      - type: bind
+        source: ${COORDINATOR_PASSWORD_FILE:-./.coordinator/password}
+        target: /run/coordinator/password
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COORDINATOR_CA_FILE:-./.coordinator/ca.pem}
+        target: /etc/polis/local-ca.pem
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [polis-test]
+    restart: "no"
+
   client-participation-alpha:
     build:
-      context: ./client-participation-alpha
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: client-participation-alpha/Dockerfile
       args:
-        - OIDC_CACHE_KEY_ID_TOKEN_SUFFIX=${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
-        - OIDC_CACHE_KEY_PREFIX=${OIDC_CACHE_KEY_PREFIX}
-        - PUBLIC_SERVICE_URL=${PUBLIC_SERVICE_URL}
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
+        OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: "${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}"
+        OIDC_CACHE_KEY_PREFIX: "${OIDC_CACHE_KEY_PREFIX}"
+        PUBLIC_SERVICE_URL: "${PUBLIC_SERVICE_URL}"
     depends_on:
       - "server"
     environment:
@@ -35,10 +72,14 @@ services:
     env_file:
       - test.env
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
       target: prod
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         NODE_ENV: production
     labels:
       polis_tag: test
@@ -49,29 +90,51 @@ services:
       - ${AUTH_CERTS_PATH:-~/.simulacrum/certs}:/root/.simulacrum/certs:ro
     restart: unless-stopped
     depends_on:
-      - oidc-simulator
-      - postgres
-      - dynamodb-init
+      oidc-simulator:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      dynamodb-init:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  math:
+  # The math engine: the Python poller, run from the same image as the `delphi`
+  # service below and writing the label the test server reads.
+  math-python:
+    image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
-      context: ./math
+      context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
+      target: test
+      args:
+        USE_CPU_TORCH: "true"
+    command: ["python", "scripts/math_poller.py"]
     labels:
       polis_tag: test
     environment:
       - DATABASE_URL=${DATABASE_URL}
-      - DD_ENABLED=false
-      - LOGGING_LEVEL=${MATH_LOG_LEVEL:-warn}
+      - DATABASE_SSL_MODE=disable
+      - LOG_LEVEL=${DELPHI_LOG_LEVEL:-INFO}
       - MATH_ENV=${MATH_ENV:-dev}
-      - WEBSERVER_USERNAME=${WEBSERVER_USERNAME}
-      - WEBSERVER_PASS=${WEBSERVER_PASS}
+      # No EC2 instance id here; name the poller by its container hostname.
+      - MATH_POLLER_ALLOW_HOSTNAME_IDENTITY=1
     networks:
       - polis-test
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # The poller sizes its memory admission from the cgroup limit and refuses
+    # to start without one. Same limit and default as docker-compose.yml, which
+    # the dev overlay inherits.
+    deploy:
+      resources:
+        limits:
+          memory: ${DELPHI_POLLER_CONTAINER_MEMORY:-16g}
 
   ses-local:
     image: dasprid/aws-ses-v2-local:latest
@@ -109,6 +172,8 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile-db
+      additional_contexts:
+        queue-rs: ./queue-rs
       labels:
         polis_tag: test
     environment:
@@ -116,7 +181,8 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_USER=${POSTGRES_USER}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # The init server is socket-only; TCP refuses until migrations finish.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -124,7 +190,7 @@ services:
     networks:
       - polis-test
     ports:
-      - 5432:5432
+      - "${POLIS_RECOVERY_PG_PORT:-5432}:5432"
     restart: unless-stopped
     # PostgreSQL configuration for development/testing
     command: >
@@ -165,13 +231,16 @@ services:
       context: ./
       dockerfile: file-server/Dockerfile
       args:
+        GIT_HASH: "${GIT_HASH:-${GITHUB_SHA:-unknown}}"
+        POLIS_BUILD_DISTANCE: "${POLIS_BUILD_DISTANCE:-unknown}"
+        POLIS_BUILD_TAG: "${POLIS_BUILD_TAG:-}"
+        POLIS_BUILD_SOURCE: "${POLIS_BUILD_SOURCE:-unverified-archive}"
         ADMIN_UIDS: ${ADMIN_UIDS}
         AUTH_AUDIENCE: users
         AUTH_CLIENT_ID: dev-client-id
         AUTH_ISSUER: https://localhost:3000/
         AUTH_NAMESPACE: https://pol.is/
         EMBED_SERVICE_HOSTNAME: localhost
-        GIT_HASH: test
         NODE_ENV: production
         OIDC_CACHE_KEY_ID_TOKEN_SUFFIX: ${OIDC_CACHE_KEY_ID_TOKEN_SUFFIX}
         OIDC_CACHE_KEY_PREFIX: ${OIDC_CACHE_KEY_PREFIX}
@@ -186,6 +255,8 @@ services:
     image: 050917022930.dkr.ecr.us-east-1.amazonaws.com/polis/delphi:latest
     build:
       context: ./delphi
+      additional_contexts:
+        queue-rs: ./queue-rs  # the polis-jobs stage (delphi/Dockerfile)
       target: test
       args:
         USE_CPU_TORCH: "true"
@@ -203,13 +274,57 @@ services:
       - AWS_SECRET_ACCESS_KEY=minioadmin
       - AWS_S3_BUCKET_NAME=polis-delphi
       - LOG_LEVEL=DEBUG
+      # Must match the `math-python` service's MATH_ENV: the report pipeline
+      # reads math rows scoped by math_env, and the test stack's poller writes dev.
+      - MATH_ENV=${MATH_ENV:-dev}
     networks:
       - "polis-test"
     depends_on:
-      - postgres
-      - dynamodb-init
+      postgres:
+        condition: service_healthy
+      dynamodb-init:
+        condition: service_completed_successfully
     command: tail -f /dev/null
     restart: unless-stopped
+
+  # S3 for the delphi visualization routes. The server's visualizations handler
+  # lists objects before it answers, so without an S3 endpoint to reach, its
+  # route-level tests cannot run at all.
+  minio:
+    # MinIO's own quay.io and Docker Hub images refuse anonymous pulls (seen
+    # 2026-09-24). This is Bitnami's frozen legacy build of MinIO
+    # RELEASE.2025-07-23, pinned by digest; it bundles mc and a shell.
+    image: docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+    # `server ...` skips the Bitnami setup script and runs plain minio; the
+    # image runs as uid 1001, which can write this directory but not /data.
+    command: server /bitnami/minio/data
+    environment:
+      # Match the credentials test.env gives the server.
+      - MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID:-DUMMYIDEXAMPLE}
+      - MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY:-DUMMYEXAMPLEKEY}
+    ports:
+      - "9000:9000"
+    networks:
+      - polis-test
+    labels:
+      polis_tag: test
+
+  # One-time init container to create the visualization bucket.
+  minio-init:
+    # Same image as minio above: it ships mc.
+    image: docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+    networks:
+      - polis-test
+    depends_on:
+      - minio
+    entrypoint: >
+      sh -c "
+        until mc alias set local http://minio:9000 ${AWS_ACCESS_KEY_ID:-DUMMYIDEXAMPLE} ${AWS_SECRET_ACCESS_KEY:-DUMMYEXAMPLEKEY}; do sleep 1; done &&
+        mc mb --ignore-existing local/${AWS_S3_BUCKET_NAME:-polis-delphi} &&
+        echo 'MinIO bucket ready'
+      "
+    labels:
+      polis_tag: test
 
   dynamodb:
     image: amazon/dynamodb-local:latest

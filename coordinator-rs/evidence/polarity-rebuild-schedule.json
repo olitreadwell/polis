@@ -1,0 +1,20 @@
+[
+  {
+    "step": 0,
+    "positive": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+    "paired": "5cae7b0ef58bce2a14ad61e8da6c9c12683c17d4400c78ea67294b25f1767094",
+    "negative": "c6f4569922ba59a129f9829e7302affc217c6535936b7f982b8cbe6c84bbd1ea"
+  },
+  {
+    "step": 1,
+    "positive": "c60ffbbf383d8c28aa2b54dd08fa8f74a8d847783e83d65139cb7e88fbf02bb0",
+    "paired": "c60ffbbf383d8c28aa2b54dd08fa8f74a8d847783e83d65139cb7e88fbf02bb0",
+    "negative": "88cdf4a14a1ab28c28fec8e71604dfabf1f1c96ef232a87caa6cb808e49f6794"
+  },
+  {
+    "step": 2,
+    "positive": "dc964987e5f188f13b4676480457dcff90b3ece75a73097236bb14cda110e764",
+    "paired": "dc964987e5f188f13b4676480457dcff90b3ece75a73097236bb14cda110e764",
+    "negative": "659e22fd4abb89b8c8c99a4476c639c6171a34e7133256b2ab34e686eac971a6"
+  }
+]

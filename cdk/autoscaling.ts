@@ -5,35 +5,46 @@ import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import { ByClass, WorkerClassesSettings, mathLargeRow } from './workerClasses';
 
 export default (
   self: Construct,
   vpc: cdk.aws_ec2.Vpc,
   instanceRole: cdk.aws_iam.Role,
-  ollamaLaunchTemplate: cdk.aws_ec2.LaunchTemplate,
+  ollamaLaunchTemplate: cdk.aws_ec2.LaunchTemplate | undefined,
   logGroup: cdk.aws_logs.LogGroup,
-  fileSystem: cdk.aws_efs.FileSystem,
+  fileSystem: cdk.aws_efs.FileSystem | undefined,
   webLaunchTemplate: cdk.aws_ec2.LaunchTemplate,
   mathWorkerLaunchTemplate: cdk.aws_ec2.LaunchTemplate,
   delphiSmallLaunchTemplate: cdk.aws_ec2.LaunchTemplate,
   delphiLargeLaunchTemplate: cdk.aws_ec2.LaunchTemplate,
   ollamaNamespace: string,
-  alarmTopic: cdk.aws_sns.Topic
+  alarmTopic: cdk.aws_sns.Topic,
+  enableOllama: boolean = false,
+  // Queue worker classes (-c enableLargeClass=true, cdk/workerClasses.ts): one group per row
+  // of the class table; see the AsgDelphiLarge comment. Undefined: no worker group.
+  workers?: { settings: WorkerClassesSettings; launchTemplates: ByClass<cdk.aws_ec2.LaunchTemplate> }
 ) => {
   const commonAsgProps = { vpc, role: instanceRole };
 
-  // Ollama ASG
-  const asgOllama = new autoscaling.AutoScalingGroup(self, 'AsgOllama', {
-    vpc,
-    launchTemplate: ollamaLaunchTemplate,
-    minCapacity: 1,
-    maxCapacity: 3,
-    desiredCapacity: 1,
-    vpcSubnets: { subnetGroupName: 'PrivateWithEgress' },
-    healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(10) }),
-  });
-  asgOllama.node.addDependency(logGroup);
-  asgOllama.node.addDependency(fileSystem); // Ensure EFS is ready before instances start
+  // Ollama ASG (only when the GPU stack is enabled)
+  let asgOllama: autoscaling.AutoScalingGroup | undefined;
+  if (enableOllama) {
+    if (!ollamaLaunchTemplate || !fileSystem) {
+      throw new Error('enableOllama is true but ollamaLaunchTemplate/fileSystem were not provided to createAutoScalingAndAlarms');
+    }
+    asgOllama = new autoscaling.AutoScalingGroup(self, 'AsgOllama', {
+      vpc,
+      launchTemplate: ollamaLaunchTemplate,
+      minCapacity: 1,
+      maxCapacity: 3,
+      desiredCapacity: 1,
+      vpcSubnets: { subnetGroupName: 'PrivateWithEgress' },
+      healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(10) }),
+    });
+    asgOllama.node.addDependency(logGroup);
+    asgOllama.node.addDependency(fileSystem); // Ensure EFS is ready before instances start
+  }
 
   // Web ASG
   const asgWeb = new autoscaling.AutoScalingGroup(self, 'Asg', {
@@ -50,9 +61,12 @@ export default (
   const asgMathWorker = new autoscaling.AutoScalingGroup(self, 'AsgMathWorker', {
     vpc,
     launchTemplate: mathWorkerLaunchTemplate,
-    minCapacity: 1,
-    desiredCapacity: 1,
-    maxCapacity: 5,
+    // Emptied: the Clojure math engine is retired and the Python engine (math-python) runs on
+    // the Delphi boxes. scripts/after_install.sh starts nothing on a `math` box. The construct
+    // stays until this group has scaled to zero in production; removing it is a later change.
+    minCapacity: 0,
+    desiredCapacity: 0,
+    maxCapacity: 0,
     vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(2) }),
   });
@@ -61,23 +75,67 @@ export default (
   const asgDelphiSmall = new autoscaling.AutoScalingGroup(self, 'AsgDelphiSmall', {
     vpc,
     launchTemplate: delphiSmallLaunchTemplate,
-    minCapacity: 2,
-    desiredCapacity: 2,
+    // Halved 2026-09 (2 -> 1). 14 days of CloudWatch on this ASG show a 0.625% mean hourly CPU
+    // (max hourly average 1.082%), and the Delphi_JobQueue has had zero jobs created since
+    // 2026-08-01; lifetime demanded compute is 74 hours in 12.9 months. The second instance is not
+    // redundancy: delphi/scripts/job_poller.py is a single-threaded claimant behind a DynamoDB
+    // lease, so a second poller adds a competing claimant, not throughput. maxCapacity stays at 7
+    // so the CPU target-tracking policy below can still scale out under real load.
+    // Revert by setting both back to 2 and running cdk deploy.
+    minCapacity: 1,
+    desiredCapacity: 1,
     maxCapacity: 7,
     vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(5) }),
   });
 
+  // Worker class groups (cdk/workerClasses.ts): one per row of the class table. The row's
+  // min/max and NO desired count: the step policies in workerClasses.ts own the count, and a
+  // cdk deploy must never reset a running worker. No CPU target tracking: a busy worker uses
+  // one or two of eight vCPUs, so CPU tracking would scale it in mid-job.
+  const workerGroup = (name: string, id: string) => {
+    const spec = workers!.settings.classes.find((c) => c.name === name)!;
+    return new autoscaling.AutoScalingGroup(self, id, {
+      vpc,
+      launchTemplate: workers!.launchTemplates[name],
+      minCapacity: spec.minCapacity,
+      maxCapacity: spec.maxCapacity,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(10) }),
+      // GroupInServiceInstances feeds the LongRunning and MissingWorker alarms.
+      groupMetrics: [new autoscaling.GroupMetrics(autoscaling.GroupMetric.IN_SERVICE_INSTANCES)],
+    });
+  };
+
   // Delphi Large ASG
-  const asgDelphiLarge = new autoscaling.AutoScalingGroup(self, 'AsgDelphiLarge', {
-    vpc,
-    launchTemplate: delphiLargeLaunchTemplate,
-    minCapacity: 1,
-    desiredCapacity: 1,
-    maxCapacity: 3,
-    vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-    healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(5) }),
-  });
+  // With -c enableLargeClass=true this group is the math-large worker class: its boxes have
+  // service type `delphi-large` and run only the large worker. It is already in the CodeDeploy
+  // deployment group, the Postgres ingress, the log/secret/DB dependencies and the Delphi security
+  // group, and it has been at 0 since 2026-07-31, so repurposing it gives up nothing that runs:
+  // the large Delphi report tier (jobs job_poller.py routes to the `large` size) has had no box
+  // since then and keeps having none.
+  const asgDelphiLarge = workers
+    ? workerGroup(mathLargeRow(workers.settings).name, 'AsgDelphiLarge')
+    : new autoscaling.AutoScalingGroup(self, 'AsgDelphiLarge', {
+      vpc,
+      launchTemplate: delphiLargeLaunchTemplate,
+      // Set to 0 in the console on 2026-07-31 (c7i.8xlarge, ~$1,040/mo, was idle). Match it here so a
+      // cdk deploy does not bring it back. NOTE: delphi/scripts/job_poller.py still routes >5000-comment
+      // jobs to this class, so until that gate is removed such jobs will wait; tracked in P-004/P-003.
+      minCapacity: 0,
+      desiredCapacity: 0,
+      maxCapacity: 3,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      healthCheck: autoscaling.HealthCheck.ec2({ grace: cdk.Duration.minutes(5) }),
+    });
+  const workerGroups: ByClass<autoscaling.AutoScalingGroup> = {};
+  if (workers) {
+    const large = mathLargeRow(workers.settings);
+    workerGroups[large.name] = asgDelphiLarge;
+    for (const spec of workers.settings.classes) {
+      if (spec.name !== large.name) workerGroups[spec.name] = workerGroup(spec.name, `Asg${spec.id}`);
+    }
+  }
 
 
   // --- Scaling Policies & Alarms
@@ -96,7 +154,7 @@ export default (
   });
 
   // Add Delphi CPU Scaling Policies & Alarms
-  const createDelphiCpuScaling = (asg: autoscaling.AutoScalingGroup, name: string, target: number): cloudwatch.Metric => {
+  const createDelphiCpuScaling = (asg: autoscaling.AutoScalingGroup, name: string, target: number, track: boolean = true): cloudwatch.Metric => {
     const cpuMetric = new cloudwatch.Metric({
       namespace: 'AWS/EC2',
       metricName: 'CPUUtilization',
@@ -104,10 +162,12 @@ export default (
       statistic: 'Average',
       period: cdk.Duration.minutes(5),
     });
-    asg.scaleToTrackMetric(`${name}CpuTracking`, {
-      metric: cpuMetric,
-      targetValue: target
-    });
+    if (track) {
+      asg.scaleToTrackMetric(`${name}CpuTracking`, {
+        metric: cpuMetric,
+        targetValue: target
+      });
+    }
 
     // High CPU Alarm
     const alarm = new cloudwatch.Alarm(self, `${name}HighCpuAlarm`, {
@@ -124,23 +184,26 @@ export default (
     return cpuMetric;
   };
   const delphiSmallCpuMetric = createDelphiCpuScaling(asgDelphiSmall, 'DelphiSmall', 60); // Target 60% CPU
-  const delphiLargeCpuMetric = createDelphiCpuScaling(asgDelphiLarge, 'DelphiLarge', 60); // Target 60% CPU
+  // Target 60% CPU; no tracking for a worker class (see AsgDelphiLarge), the alarm stays.
+  const delphiLargeCpuMetric = createDelphiCpuScaling(asgDelphiLarge, 'DelphiLarge', 60, !workers);
 
-  // Add Ollama GPU Scaling Policy
-  const ollamaGpuMetric = new cloudwatch.Metric({
-    namespace: ollamaNamespace, // Custom namespace from CW Agent config
-    metricName: 'utilization_gpu', // GPU utilization metric name from CW Agent config
-    dimensionsMap: { AutoScalingGroupName: asgOllama.autoScalingGroupName },
-    statistic: 'Average',
-    period: cdk.Duration.minutes(1),
-  });
-  asgOllama.scaleToTrackMetric('OllamaGpuScaling', {
-    metric: ollamaGpuMetric,
-    targetValue: 75,
-    cooldown: cdk.Duration.minutes(5), // Prevent flapping
-    disableScaleIn: false, // Allow scaling down
-    estimatedInstanceWarmup: cdk.Duration.minutes(5), // Time until instance contributes metrics meaningfully
-  });
+  // Add Ollama GPU Scaling Policy (only when the GPU stack is enabled)
+  if (enableOllama && asgOllama) {
+    const ollamaGpuMetric = new cloudwatch.Metric({
+      namespace: ollamaNamespace, // Custom namespace from CW Agent config
+      metricName: 'utilization_gpu', // GPU utilization metric name from CW Agent config
+      dimensionsMap: { AutoScalingGroupName: asgOllama.autoScalingGroupName },
+      statistic: 'Average',
+      period: cdk.Duration.minutes(1),
+    });
+    asgOllama.scaleToTrackMetric('OllamaGpuScaling', {
+      metric: ollamaGpuMetric,
+      targetValue: 75,
+      cooldown: cdk.Duration.minutes(5), // Prevent flapping
+      disableScaleIn: false, // Allow scaling down
+      estimatedInstanceWarmup: cdk.Duration.minutes(5), // Time until instance contributes metrics meaningfully
+    });
+  }
 
   return {
     asgOllama,
@@ -148,6 +211,7 @@ export default (
     asgMathWorker,
     asgDelphiSmall,
     asgDelphiLarge,
+    workerGroups,
     commonAsgProps
   }
 }

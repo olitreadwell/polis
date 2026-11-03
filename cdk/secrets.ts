@@ -12,8 +12,12 @@ export default (
   asgMathWorker: cdk.aws_autoscaling.AutoScalingGroup,
   asgDelphiSmall: cdk.aws_autoscaling.AutoScalingGroup,
   asgDelphiLarge: cdk.aws_autoscaling.AutoScalingGroup,
-  asgOllama: cdk.aws_autoscaling.AutoScalingGroup,
-  fileSystem: cdk.aws_efs.FileSystem
+  asgOllama: cdk.aws_autoscaling.AutoScalingGroup | undefined,
+  fileSystem: cdk.aws_efs.FileSystem | undefined,
+  // Queue worker classes (cdk/workerClasses.ts): each class role reads the env
+  // document and the DB secret in after_install.sh (and nothing else here);
+  // every worker group besides asgDelphiLarge gets the same dependencies.
+  workers?: { roles: cdk.aws_iam.IRole[]; extraGroups: cdk.aws_autoscaling.AutoScalingGroup[] }
 ) => {
   const webAppEnvVarsSecret = new secretsmanager.Secret(self, 'WebAppEnvVarsSecret', {
     secretName: 'polis-web-app-env-vars',
@@ -31,6 +35,10 @@ export default (
   webAppEnvVarsSecret.grantRead(instanceRole);
   clientAdminEnvVarsSecret.grantRead(instanceRole);
   clientReportEnvVarsSecret.grantRead(instanceRole);
+  for (const role of workers?.roles ?? []) {
+    webAppEnvVarsSecret.grantRead(role);
+    db.secret!.grantRead(role);
+  }
 
   // Dependencies (Add ASGs to loops/lists)
   const addDbDependency = (asg: autoscaling.IAutoScalingGroup) => asg.node.addDependency(db);
@@ -38,13 +46,18 @@ export default (
   const addSecretDependency = (asg: autoscaling.IAutoScalingGroup) => asg.node.addDependency(webAppEnvVarsSecret);
 
   // Apply common dependencies to all ASGs
-  [asgWeb, asgMathWorker, asgDelphiSmall, asgDelphiLarge, asgOllama].forEach(asg => {
+  [asgWeb, asgMathWorker, asgDelphiSmall, asgDelphiLarge, ...(workers?.extraGroups ?? [])].forEach(asg => {
     addLogDependency(asg);
     addSecretDependency(asg);
-    // Only add DB dependency if the service needs it
-    if (asg !== asgOllama) {
-      addDbDependency(asg);
-    }
+    addDbDependency(asg);
   });
-  asgOllama.node.addDependency(fileSystem);
+
+  // Ollama dependencies (only when the GPU stack is enabled)
+  if (asgOllama) {
+    addLogDependency(asgOllama);
+    addSecretDependency(asgOllama);
+    if (fileSystem) {
+      asgOllama.node.addDependency(fileSystem);
+    }
+  }
 }

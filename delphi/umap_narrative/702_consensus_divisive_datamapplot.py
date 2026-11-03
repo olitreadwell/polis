@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json
 import boto3
+from polismath.delphi_storage.resource import result_resource
 import logging
 import traceback
 from decimal import Decimal
@@ -22,6 +23,7 @@ from typing import Dict, List, Tuple, Any, Optional, Union
 from datetime import datetime
 from polismath_commentgraph.utils.storage import PostgresClient
 from polismath_commentgraph.utils.group_data import GroupDataProcessor
+from polismath.components.config import ConfigManager
 
 # Configuration through environment variables with defaults
 DB_CONFIG = {
@@ -36,8 +38,8 @@ DB_CONFIG = {
 DYNAMODB_CONFIG = {
     'endpoint_url': os.environ.get('DYNAMODB_ENDPOINT'),
     'region': os.environ.get('AWS_REGION', 'us-east-1'),
-    'access_key': os.environ.get('AWS_ACCESS_KEY_ID', None),
-    'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY', None)
+    'access_key': os.environ.get('AWS_ACCESS_KEY_ID') or None,
+    'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY') or None
 }
 
 # Visualization settings - controls the extremity scale and color mapping
@@ -67,7 +69,7 @@ except ImportError:
             else:
                 self.endpoint_url = None
             self.region = DYNAMODB_CONFIG['region']
-            self.dynamodb = boto3.resource('dynamodb', 
+            self.dynamodb = result_resource('dynamodb', 
                                           endpoint_url=self.endpoint_url, 
                                           region_name=self.region,
                                           aws_access_key_id=DYNAMODB_CONFIG['access_key'],
@@ -107,11 +109,11 @@ def load_data_from_dynamodb(zid, layer_num=0):
     
     # Set up DynamoDB client
     endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
-    dynamodb = boto3.resource('dynamodb', 
+    dynamodb = result_resource('dynamodb', 
                              endpoint_url=endpoint_url,
                              region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-                             aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', 'fakeMyKeyId'),
-                             aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', 'fakeSecretAccessKey'))
+                             aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID') or None,
+                             aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY') or None)
     
     # Results dictionary
     data = {
@@ -237,6 +239,7 @@ def load_comment_texts_and_extremity(zid, layer_num=0):
         Tuple of (comment_texts, extremity_values)
     """
     logger.info(f'Loading comment texts and extremity data for conversation {zid}')
+    math_env = ConfigManager.get_config().get('math-env')
     
     # Initialize PostgreSQL client and GroupDataProcessor
     postgres_client = PostgresClient()
@@ -297,7 +300,10 @@ def load_comment_texts_and_extremity(zid, layer_num=0):
         # 2. Try to get extremity values from math_ptptstats
         try:
             # First try math_ptptstats
-            cursor.execute('SELECT data FROM math_ptptstats WHERE zid = %s LIMIT 1', (zid,))
+            cursor.execute(
+                'SELECT data FROM math_ptptstats WHERE zid = %s AND math_env = %s LIMIT 1',
+                (zid, math_env),
+            )
             ptptstats = cursor.fetchone()
             
             if ptptstats and ptptstats[0]:
@@ -382,7 +388,10 @@ def load_comment_texts_and_extremity(zid, layer_num=0):
             # If no values found, try math_main table
             if not extremity_values:
                 logger.info('Trying to extract extremity from math_main')
-                cursor.execute('SELECT data FROM math_main WHERE zid = %s LIMIT 1', (zid,))
+                cursor.execute(
+                    'SELECT data FROM math_main WHERE zid = %s AND math_env = %s LIMIT 1',
+                    (zid, math_env),
+                )
                 math_main = cursor.fetchone()
                 
                 if math_main and math_main[0]:
@@ -452,7 +461,10 @@ def load_comment_texts_and_extremity(zid, layer_num=0):
         math_cursor = math_conn.cursor()
         
         # Query the math_main table to get the PCA data
-        math_cursor.execute('SELECT data FROM math_main WHERE zid = %s LIMIT 1', (zid,))
+        math_cursor.execute(
+            'SELECT data FROM math_main WHERE zid = %s AND math_env = %s LIMIT 1',
+            (zid, math_env),
+        )
         math_main = math_cursor.fetchone()
         
         if math_main and math_main[0]:

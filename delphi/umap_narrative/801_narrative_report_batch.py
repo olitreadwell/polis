@@ -27,12 +27,13 @@ import uuid
 import logging
 import argparse
 import boto3
+from polismath.delphi_storage.resource import result_resource
 import asyncio
 import numpy as np
 import pandas as pd
 import re  # Added re import for regex operations
 import requests  # Added for HTTP error handling
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Tuple
 import xml.etree.ElementTree as ET
@@ -49,6 +50,8 @@ from umap_narrative.llm_factory_constructor.model_provider import AnthropicProvi
 # Import from local modules
 from polismath_commentgraph.utils.storage import PostgresClient, DynamoDBStorage
 from polismath_commentgraph.utils.group_data import GroupDataProcessor
+from polismath.components.config import ConfigManager
+from polismath.utils.cli_flags import parse_bool_flag
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,7 +67,7 @@ class NarrativeReportService:
             self.dynamodb = dynamodb_resource
         else:
             endpoint_url = os.environ.get('DYNAMODB_ENDPOINT') or None
-            self.dynamodb = boto3.resource(
+            self.dynamodb = result_resource(
                 'dynamodb',
                 endpoint_url=endpoint_url,
                 region_name=os.environ.get('AWS_REGION', 'us-east-1')
@@ -143,61 +146,10 @@ class NarrativeReportService:
             logger.error(f"Error getting report: {str(e)}")
             return None
 
-class PolisConverter:
-    """Convert between CSV and XML formats for Polis data."""
-    
-    @staticmethod
-    def convert_to_xml(comment_data):
-        """
-        Convert comment data to XML format.
-        
-        Args:
-            comment_data: List of dictionaries with comment data
-            
-        Returns:
-            String with XML representation of the comment data
-        """
-        # Create root element
-        root = ET.Element("polis-comments")
-        
-        # Process each comment
-        for record in comment_data:
-            # Extract base comment data
-            comment = ET.SubElement(root, "comment", {
-                "id": str(record.get("comment-id", "")),
-                "votes": str(record.get("total-votes", 0)),
-                "agrees": str(record.get("total-agrees", 0)),
-                "disagrees": str(record.get("total-disagrees", 0)),
-                "passes": str(record.get("total-passes", 0)),
-            })
-            
-            # Add comment text
-            text = ET.SubElement(comment, "text")
-            text.text = record.get("comment", "")
-            
-            # Process group data
-            group_keys = []
-            for key in record.keys():
-                if key.startswith("group-") and key.count("-") >= 2:
-                    group_id = key.split("-")[1]
-                    if group_id not in group_keys:
-                        group_keys.append(group_id)
-            
-            # Add data for each group
-            for group_id in group_keys:
-                group = ET.SubElement(comment, f"group-{group_id}", {
-                    "votes": str(record.get(f"group-{group_id}-votes", 0)),
-                    "agrees": str(record.get(f"group-{group_id}-agrees", 0)),
-                    "disagrees": str(record.get(f"group-{group_id}-disagrees", 0)),
-                    "passes": str(record.get(f"group-{group_id}-passes", 0)),
-                })
-        
-        # Convert to string with pretty formatting
-        rough_string = ET.tostring(root, 'utf-8')
-        reparsed = parseString(rough_string)
-        return reparsed.toprettyxml(indent="  ")
+from umap_narrative.narrative_data import PolisConverter, NarrativeSelection
 
-class BatchReportGenerator:
+
+class BatchReportGenerator(NarrativeSelection):
     """Generate batch reports for Polis conversations."""
 
     def __init__(self, conversation_id, model=None, no_cache=False, max_batch_size=20, job_id=None, layers=None, include_moderation=False, exclude_comment_selections=True):
@@ -216,12 +168,18 @@ class BatchReportGenerator:
         self.postgres_client = PostgresClient()
         self.include_moderation = include_moderation
         self.exclude_comment_selections = exclude_comment_selections
+        # Set by main() when the polis-jobs daemon runs this script (DELPHI_OUTPUT_MANIFEST).
+        # Then the queue row lives in Postgres, so nothing here writes Delphi_JobQueue,
+        # and the provider call waits for the daemon to record the intent first.
+        self.job = None
+        self.provider_refused = False
+        self.submitted_at = None
 
         logger.info(f"include_moderation: {include_moderation}")
         logger.info(f"exclude_comment_selections: {exclude_comment_selections}")
 
         endpoint_url = os.environ.get('DYNAMODB_ENDPOINT') or None
-        self.dynamodb = boto3.resource(
+        self.dynamodb = result_resource(
             'dynamodb',
             endpoint_url=endpoint_url,
             region_name=os.environ.get('AWS_REGION', 'us-east-1')
@@ -253,8 +211,7 @@ class BatchReportGenerator:
             LIMIT 1
             """
             
-            # Use 'prod' as the default math_env (matches the server behavior)
-            math_env = os.environ.get('MATH_ENV', 'prod')
+            math_env = ConfigManager.get_config().get('math-env')
             
             results = self.postgres_client.query(sql, {"zid": conversation_id, "math_env": math_env})
             
@@ -436,8 +393,11 @@ class BatchReportGenerator:
             logger.info(f"Loaded {len(cluster_map)} comment cluster assignments across {len(available_layers)} layers: {sorted(available_layers)}")
             return cluster_map
         except Exception as e:
+            # Raise, never return an empty map: with no assignments every topic
+            # section is dropped and the run still reports success. The callers
+            # turn this into an empty preparation, which fails the stage.
             logger.error(f"Error loading cluster assignments from DynamoDB: {e}")
-            return {}
+            raise
 
     async def get_topics(self):
         """
@@ -484,8 +444,10 @@ class BatchReportGenerator:
             keywords_lookup = {item['cluster_key']: item for item in keyword_items}
             logger.info(f"Created lookup map for {len(keywords_lookup)} keyword entries.")
             
-            # Load all cluster assignments for all comments
-            all_clusters = await asyncio.to_thread(self.load_comment_clusters_from_dynamodb, self.conversation_id)
+            # Load all cluster assignments for all comments, on this thread like
+            # every other read here: in Postgres mode the resource is the attempt
+            # writer, whose SQLite connection only the opening thread may use.
+            all_clusters = self.load_comment_clusters_from_dynamodb(self.conversation_id)
             
             # --- Step 2: Process the fetched data ---
             
@@ -565,328 +527,6 @@ class BatchReportGenerator:
             logger.error(f"A critical error occurred in get_topics: {str(e)}", exc_info=True)
             return []
         
-    def filter_topics(self, comment, topic_cluster_id=None, topic_layer_id=None, topic_citations=None, sample_comments=None, filter_type=None, filter_threshold=None):
-        """Filter for comments that are part of a specific topic or meet global section criteria."""
-        # Get comment ID
-        comment_id = comment.get('comment_id')
-        if not comment_id:
-            return False
-        
-        # Handle global section filtering
-        if filter_type is not None:
-            return self._apply_global_filter(comment, filter_type, filter_threshold)
-        
-        # Handle layer-specific topic filtering (existing logic)
-        if topic_cluster_id is not None and topic_layer_id is not None:
-            # Get the cluster ID for the specified layer
-            layer_cluster_key = f'layer{topic_layer_id}_cluster_id'
-            comment_cluster_id = comment.get(layer_cluster_key)
-            if comment_cluster_id is not None:
-                # Debug logging for cluster 0
-                if str(topic_cluster_id) == "0" and comment_id in [1, 2, 3]:  # Log first few comments
-                    logger.info(f"DEBUG: Checking comment {comment_id} - layer{topic_layer_id}_cluster_id={comment_cluster_id}, topic_cluster_id={topic_cluster_id}")
-                    logger.info(f"DEBUG: String comparison: '{str(comment_cluster_id)}' == '{str(topic_cluster_id)}' = {str(comment_cluster_id) == str(topic_cluster_id)}")
-                
-                # Simple string comparison is more reliable across different numeric types
-                if str(comment_cluster_id) == str(topic_cluster_id):
-                    return True
-                
-        # Check if this comment ID is in our topic citations
-        if topic_citations and str(comment_id) in [str(c) for c in topic_citations]:
-            return True
-            
-        # If we have sample comments and not enough filtered comments,
-        # try to match based on text similarity
-        if sample_comments and len(sample_comments) > 0:
-            comment_text = comment.get('comment', '')
-            if not comment_text:
-                return False
-                
-            # Check if this comment text matches any sample comment
-            for sample in sample_comments:
-                # Skip non-string samples
-                if not isinstance(sample, str) or not sample:
-                    continue
-                    
-                # Simple substring match rather than complex word comparison
-                if sample.lower() in comment_text.lower() or comment_text.lower() in sample.lower():
-                    return True
-        
-        return False
-    
-    def _apply_global_filter(self, comment, filter_type, filter_threshold):
-        """
-        Apply global section filtering based on Polis statistical metrics.
-        
-        Args:
-            comment: Comment data dictionary
-            filter_type: Type of filter ('comment_extremity', 'group_aware_consensus', 'uncertainty_ratio')
-            filter_threshold: Threshold value for filtering (or 'dynamic' for group_aware_consensus)
-            
-        Returns:
-            Boolean indicating whether comment passes the filter
-        """
-        try:
-            if filter_type == "comment_extremity":
-                # Filter for comments that divide opinion groups (extremity > 1.0)
-                extremity = comment.get('comment_extremity', 0)
-                return extremity > filter_threshold
-                
-            elif filter_type == "group_aware_consensus":
-                # Filter for comments with broad cross-group agreement
-                # Uses dynamic thresholds based on number of groups
-                consensus = comment.get('group_aware_consensus', 0)
-                num_groups = comment.get('num_groups', 2)
-                
-                # Get dynamic threshold based on group count (matches Node.js logic)
-                if filter_threshold == "dynamic":
-                    if num_groups == 2:
-                        threshold = 0.7
-                    elif num_groups == 3:
-                        threshold = 0.47
-                    elif num_groups == 4:
-                        threshold = 0.32
-                    else:  # 5+ groups
-                        threshold = 0.24
-                else:
-                    threshold = filter_threshold
-                    
-                return consensus > threshold
-                
-            elif filter_type == "uncertainty_ratio":
-                # Filter for comments with high uncertainty/unsure responses (>= 20% pass votes)
-                passes = comment.get('passes', 0)
-                votes = comment.get('votes', 0)
-                
-                if votes == 0:
-                    return False
-                    
-                uncertainty_ratio = passes / votes
-                return uncertainty_ratio >= filter_threshold
-                
-            else:
-                logger.warning(f"Unknown filter type: {filter_type}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error applying global filter {filter_type}: {str(e)}")
-            return False
-    
-    def _get_dynamic_comment_limit(self, layer_id=None, total_layers=None, comment_count=None, filter_type=None):
-        """
-        Calculate dynamic comment limit based on layer granularity and conversation size.
-        Implements the fractal approach where coarse layers get fewer, higher quality comments.
-        
-        Args:
-            layer_id: Current layer ID (None for global sections)
-            total_layers: Total number of available layers  
-            comment_count: Total number of comments in conversation
-            filter_type: Type of filter (for global sections)
-            
-        Returns:
-            Integer comment limit for this section
-        """
-        try:
-            # Base limits for different categories
-            base_limits = {
-                "global_sections": 50,   # Fixed limit for global sections
-                "fine_layers": 100,      # More comments for specific topics (layer 0)
-                "medium_layers": 75,     # Balanced approach (middle layers)
-                "coarse_layers": 50      # Fewer, highest quality comments (top layer)
-            }
-            
-            # Determine category
-            if filter_type is not None:
-                # This is a global section
-                category = "global_sections"
-            elif layer_id is not None and total_layers is not None:
-                # This is a layer-specific topic
-                if layer_id == 0:
-                    category = "fine_layers"  # Most specific layer
-                elif layer_id == total_layers - 1:
-                    category = "coarse_layers"  # Most general layer
-                else:
-                    category = "medium_layers"  # Middle layers
-            else:
-                # Fallback to medium limit
-                category = "medium_layers"
-            
-            # Get base limit
-            limit = base_limits[category]
-            
-            # Scale down for very large conversations to manage token usage
-            if comment_count is not None:
-                if comment_count > 10000:
-                    # Halve limits for huge conversations (>10k comments)
-                    limit = int(limit * 0.5)
-                elif comment_count > 5000:
-                    # Reduce by 25% for large conversations (5k-10k comments)
-                    limit = int(limit * 0.75)
-                elif comment_count > 2000:
-                    # Reduce by 10% for medium-large conversations (2k-5k comments)
-                    limit = int(limit * 0.9)
-            
-            # Ensure minimum limit
-            limit = max(limit, 10)
-            
-            logger.debug(f"Dynamic comment limit: category={category}, base={base_limits[category]}, "
-                        f"final={limit}, comment_count={comment_count}, layer_id={layer_id}")
-            
-            return limit
-            
-        except Exception as e:
-            logger.error(f"Error calculating dynamic comment limit: {str(e)}")
-            # Fallback to conservative limit
-            return 50
-    
-    def _select_high_quality_comments(self, comments, limit, filter_type=None):
-        """
-        Select the highest quality comments based on Polis statistical metrics.
-        
-        Args:
-            comments: List of comment dictionaries
-            limit: Maximum number of comments to select
-            filter_type: Type of filter being applied (affects sorting priority)
-            
-        Returns:
-            List of selected high-quality comments
-        """
-        if len(comments) <= limit:
-            return comments
-            
-        try:
-            # Create sorting key based on filter type and available metrics
-            def get_sort_key(comment):
-                # Base score starts with vote count (engagement indicator)
-                votes = comment.get('votes', 0)
-                vote_score = int(votes) if isinstance(votes, (int, float)) else 0
-                
-                # Add metric-specific scoring
-                if filter_type == "comment_extremity":
-                    # For extremity filtering, prioritize highly divisive comments
-                    extremity = comment.get('comment_extremity', 0)
-                    metric_score = extremity * 1000  # Scale up for sorting
-                elif filter_type == "group_aware_consensus":
-                    # For consensus filtering, prioritize high agreement comments
-                    consensus = comment.get('group_aware_consensus', 0)
-                    metric_score = consensus * 1000  # Scale up for sorting
-                elif filter_type == "uncertainty_ratio":
-                    # For uncertainty filtering, prioritize comments with high pass rates
-                    passes = comment.get('passes', 0)
-                    total_votes = comment.get('votes', 1)
-                    uncertainty = passes / max(total_votes, 1)
-                    metric_score = uncertainty * 1000  # Scale up for sorting
-                else:
-                    # For topic filtering, use a combination of votes and engagement
-                    agrees = comment.get('agrees', 0)
-                    disagrees = comment.get('disagrees', 0)
-                    total_engagement = int(agrees) + int(disagrees) if isinstance(agrees, (int, float)) and isinstance(disagrees, (int, float)) else 0
-                    metric_score = total_engagement
-                
-                # Combine scores (metric score is primary, vote count is secondary)
-                return (metric_score, vote_score)
-            
-            # Sort comments by quality score (descending)
-            sorted_comments = sorted(comments, key=get_sort_key, reverse=True)
-            
-            # Select top comments up to limit
-            selected = sorted_comments[:limit]
-            
-            logger.info(f"Selected {len(selected)} high-quality comments from {len(comments)} "
-                       f"(filter_type={filter_type}, limit={limit})")
-            
-            return selected
-            
-        except Exception as e:
-            logger.error(f"Error selecting high-quality comments: {str(e)}")
-            # Fallback to simple vote-based selection
-            try:
-                sorted_comments = sorted(comments, 
-                                       key=lambda c: int(c.get('votes', 0)) if isinstance(c.get('votes'), (int, float)) else 0, 
-                                       reverse=True)
-                return sorted_comments[:limit]
-            except Exception:
-                # Last resort: return first N comments
-                return comments[:limit]
-    
-    async def get_comments_as_xml(self, conversation_data: dict, filter_func=None, filter_args=None):
-        """Get comments as XML from pre-fetched data."""
-        try:
-            # Use the data passed as an argument
-            data = conversation_data
-            
-            if not data:
-                logger.error("Received empty conversation data.")
-                return ""
-            
-            # Apply filter if provided
-            filtered_comments = data["processed_comments"]
-            
-            if filter_func:
-                if filter_args:
-                    filtered_comments = [c for c in filtered_comments if filter_func(c, **filter_args)]
-                else:
-                    filtered_comments = [c for c in filtered_comments if filter_func(c)]
-            
-            # Apply dynamic comment limiting with intelligent selection
-            if filter_func == self.filter_topics and len(filtered_comments) > 0:
-                # Get context for dynamic limit calculation
-                total_comment_count = len(data["processed_comments"])
-                
-                # Extract layer and filter information from filter_args
-                layer_id = None
-                total_layers = None
-                filter_type = None
-                
-                if filter_args:
-                    layer_id = filter_args.get('topic_layer_id')
-                    filter_type = filter_args.get('filter_type')
-                    
-                    # Estimate total layers from conversation data (could be improved)
-                    # For now, we'll determine this dynamically or use a reasonable default
-                    if layer_id is not None:
-                        # Try to determine total layers from available cluster data
-                        # This is a heuristic - in practice you might want to pass this explicitly
-                        total_layers = max(layer_id + 1, 3)  # Assume at least 3 layers if we have layer data
-                
-                # Calculate dynamic limit
-                comment_limit = self._get_dynamic_comment_limit(
-                    layer_id=layer_id,
-                    total_layers=total_layers, 
-                    comment_count=total_comment_count,
-                    filter_type=filter_type
-                )
-                
-                # Apply intelligent comment selection if we exceed the limit
-                if len(filtered_comments) > comment_limit:
-                    logger.info(f"Applying dynamic comment limit: {len(filtered_comments)} -> {comment_limit} "
-                               f"(layer_id={layer_id}, filter_type={filter_type}, total_comments={total_comment_count})")
-                    
-                    # Use intelligent selection based on Polis metrics
-                    filtered_comments = self._select_high_quality_comments(
-                        filtered_comments, 
-                        comment_limit, 
-                        filter_type=filter_type
-                    )
-                else:
-                    logger.info(f"No limiting needed: {len(filtered_comments)} comments <= limit of {comment_limit}")
-            else:
-                # For non-topic filtering, use a conservative limit to avoid token issues
-                max_comments = 100
-                if len(filtered_comments) > max_comments:
-                    logger.info(f"Applying conservative limit: {len(filtered_comments)} -> {max_comments}")
-                    filtered_comments = self._select_high_quality_comments(filtered_comments, max_comments)
-            
-            # Convert to XML
-            xml = PolisConverter.convert_to_xml(filtered_comments)
-            
-            return xml
-        except Exception as e:
-            logger.error(f"Error in get_comments_as_xml: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return ""
-    
     async def prepare_batch_requests(self):
         """Prepare batch requests for all topics."""
         logger.info("Fetching all conversation data ONCE...")
@@ -1207,7 +847,7 @@ class BatchReportGenerator:
         anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not anthropic_api_key:
             logger.error("ERROR: ANTHROPIC_API_KEY environment variable is not set. Cannot submit batch.")
-            if self.job_id:
+            if self.job_id and self.job is None:
                 try:
                     job_table = self.dynamodb.Table('Delphi_JobQueue')
                     job_table.update_item(
@@ -1233,17 +873,12 @@ class BatchReportGenerator:
                 logger.info("Successfully imported Anthropic SDK")
             except ImportError as e:
                 logger.error(f"Failed to import Anthropic SDK: {str(e)}")
-                logger.error(f"System paths: {sys.path}")
-                logger.error("Attempting to install Anthropic SDK...")
-                try:
-                    import subprocess
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "anthropic"])
-                    from anthropic import Anthropic, APIError, APIConnectionError, APIResponseValidationError, APIStatusError
-                    logger.info("Successfully installed and imported Anthropic SDK")
-                except Exception as e:
-                    logger.error(f"Failed to install Anthropic SDK: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    return None
+                logger.error(
+                    "Anthropic SDK is required to submit batches. Install Delphi's "
+                    "pinned requirements.lock when building the environment; "
+                    "runtime dependency installation is disabled."
+                )
+                return None
 
             # Initialize Anthropic client
             logger.info("Initializing Anthropic client...")
@@ -1359,11 +994,40 @@ class BatchReportGenerator:
                 logger.error("No valid formatted batch requests to submit")
                 return None
 
+            if self.job is not None:
+                # Record before submit: the daemon records the intent and
+                # acknowledges it before any paid request leaves this process.
+                from polismath import job_child
+                try:
+                    job_child.request_provider_intent(
+                        self.job,
+                        provider="anthropic",
+                        model=self.model,
+                        batch={
+                            "api": "messages.batches",
+                            "conversation_id": self.conversation_id,
+                            "report_id": self.report_id,
+                            "request_count": len(formatted_batch_requests),
+                            "requests_sha256": job_child.requests_sha256(formatted_batch_requests),
+                            "max_batch_size": self.max_batch_size,
+                            "max_tokens": max(r["params"]["max_tokens"] for r in formatted_batch_requests),
+                        },
+                    )
+                except Exception as e:
+                    # Refused, timed out, or the intent could not even be written:
+                    # in every case no provider call was made (exit 6, "not submitted").
+                    logger.error(f"Provider intent not acknowledged; no batch submitted: {e}")
+                    self.provider_refused = True
+                    return None
+
             logger.info(f"Submitting {len(formatted_batch_requests)} requests to Anthropic Batch API")
 
             # Submit the batch to Anthropic with detailed error handling
             try:
                 batch = anthropic.beta.messages.batches.create(requests=formatted_batch_requests)
+                if self.job is not None:
+                    from polismath import job_child
+                    self.submitted_at = job_child.utc_now_iso()
                 logger.info("Successfully submitted batch to Anthropic API")
                 logger.info(f"Batch ID: {batch.id}")
                 logger.info(f"Batch status: {batch.processing_status}")
@@ -1389,7 +1053,7 @@ class BatchReportGenerator:
                 return None
 
             # Store batch information in DynamoDB if we have a job ID
-            if self.job_id:
+            if self.job_id and self.job is None:
                 logger.info(f"Updating job {self.job_id} with batch information in DynamoDB...")
                 try:
                     job_table = self.dynamodb.Table('Delphi_JobQueue') 
@@ -1476,6 +1140,19 @@ class BatchReportGenerator:
                     except Exception as e:
                         logger.error(f"Failed to schedule batch status check job: {str(e)}")
                         logger.error(traceback.format_exc())
+                        # The provider batch has already been submitted, so there
+                        # is outstanding paid work with no checker row to find.
+                        # Record that on the root: the server's submission guard
+                        # treats it as unresolved and refuses to release the
+                        # scope, rather than admitting a second paid run.
+                        try:
+                            job_table.update_item(
+                                Key={'job_id': self.job_id},
+                                UpdateExpression="SET checker_schedule_failed = :failed",
+                                ExpressionAttributeValues={':failed': True},
+                            )
+                        except Exception as flag_error:
+                            logger.error(f"Could not flag checker scheduling failure on job {self.job_id}: {flag_error}")
                         # Continue despite failure
                         logger.info("Continuing despite failure to schedule status check job")
 
@@ -1493,7 +1170,7 @@ class BatchReportGenerator:
             logger.error(traceback.format_exc())
 
             # Try to update job status in DynamoDB
-            if self.job_id:
+            if self.job_id and self.job is None:
                 try:
                     job_table = self.dynamodb.Table('Delphi_JobQueue')
                     job_table.update_item(
@@ -1511,6 +1188,59 @@ class BatchReportGenerator:
 
             return None
 
+# --- run by the polis-jobs daemon (P-077 P1) --------------------------------
+# Active only when DELPHI_OUTPUT_MANIFEST is set; the legacy poller never sets it.
+
+def _start_daemon_job(conversation_id):
+    """Check the daemon's environment and frame and observe the inputs before any work."""
+    from polismath import job_child
+    from polismath.job_child import census
+
+    try:
+        job = job_child.JobContext.from_env(
+            expected_stage=job_child.STAGE_NARRATIVE, zid=conversation_id,
+            allowed_phases={job_child.PHASE_SUBMIT}, default_phase=job_child.PHASE_SUBMIT,
+        )
+    except job_child.JobEnvError as e:
+        job_child.refuse(str(e))
+    if job.report_id and not os.environ.get('DELPHI_REPORT_ID'):
+        os.environ['DELPHI_REPORT_ID'] = job.report_id
+    try:
+        job.inputs = census.observe_inputs(conversation_id, job_child.effective_math_env(),
+                                           census.default_pg_query())
+    except census.CensusError as e:
+        print(f"polis-jobs child: {e}", file=sys.stderr, flush=True)
+        sys.exit(job_child.EXIT_MANIFEST_UNBUILDABLE)
+    return job
+
+
+def _finish_daemon_job(job, generator, batch_id):
+    """Write the parked manifest naming the submitted batch, or exit with the code that says why not."""
+    from polismath import job_child
+
+    if not batch_id:
+        sys.exit(job_child.EXIT_PROVIDER_INTENT_REFUSED if generator.provider_refused
+                 else job_child.EXIT_STAGE_FAILED)
+    try:
+        recheck_seconds = int(os.environ.get("DELPHI_RECHECK_SECONDS", "300"))
+        recheck_after = (datetime.now(timezone.utc) + timedelta(seconds=recheck_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+        manifest = job_child.build_manifest(
+            job, outcome="parked", inputs=job.inputs, outputs=[],
+            models={"embed": None, "topic": None, "narrative": generator.model},
+            cost={"llm_tokens_in": None, "llm_tokens_out": None,
+                  "provider_batches": [{"provider": "anthropic", "batch_id": str(batch_id),
+                                        "submitted_at": generator.submitted_at or job_child.utc_now_iso()}]},
+            recheck_after=recheck_after,
+        )
+        job_child.write_manifest(job, manifest)
+    except (job_child.ManifestError, OSError, ValueError) as e:
+        print(f"polis-jobs child: batch {batch_id} was submitted but the manifest could not be written: {e}",
+              file=sys.stderr, flush=True)
+        sys.exit(job_child.EXIT_MANIFEST_UNBUILDABLE)
+    sys.exit(job_child.EXIT_OK)
+
+
 async def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='Generate narrative reports for Polis conversations')
@@ -1524,8 +1254,8 @@ async def main():
                         help='Maximum number of topics to include in a single batch (default: 5)')
     parser.add_argument('--layers', type=int, nargs='+', default=None,
                         help='Specific layer numbers to process (e.g., --layers 0 1 2). If not specified, all layers will be processed.')
-    parser.add_argument('--include_moderation', type=bool, default=False, help='Whether or not to include moderated comments in reports. If false, moderated comments will appear.')
-    parser.add_argument('--exclude_comment_selections', type=bool, default=True, help='Whether to exclude comments with selection=-1 in report_comment_selections table.')
+    parser.add_argument('--include_moderation', type=parse_bool_flag, default=False, help='Whether or not to include moderated comments in reports. If false, moderated comments will appear.')
+    parser.add_argument('--exclude_comment_selections', type=parse_bool_flag, default=True, help='Whether to exclude comments with selection=-1 in report_comment_selections table.')
     args = parser.parse_args()
 
     # Get environment variables for job
@@ -1561,6 +1291,8 @@ async def main():
     if report_id:
         logger.info(f"- Report ID: {report_id}")
 
+    job = _start_daemon_job(args.conversation_id) if os.environ.get("DELPHI_OUTPUT_MANIFEST", "").strip() else None
+
     # Create batch report generator
     generator = BatchReportGenerator(
         conversation_id=args.conversation_id,
@@ -1572,9 +1304,13 @@ async def main():
         include_moderation=args.include_moderation,
         exclude_comment_selections=args.exclude_comment_selections
     )
+    generator.job = job
 
     # Process reports
     result = await generator.submit_batch()
+
+    if job is not None:
+        _finish_daemon_job(job, generator, result)
 
     if result:
         logger.info(f"Narrative reports generated successfully")

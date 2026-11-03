@@ -6,6 +6,7 @@
 .venv
 .vscode/settings.json
 *.dump
+/backups/
 **/CLAUDE.local.md
 build/
 delphi/umap_narrative/__init__.py
@@ -13,3 +14,23 @@ preprod.env
 prod.env
 scratch/
 xids.csv
+
+# Python bytecode caches anywhere in the tree
+__pycache__/
+*.pyc
+
+# two-convention gate outputs (ci/vote_convention/run.sh)
+.vote-gate/
+
+# Written into the CodeDeploy bundle by the deploy workflow; never committed.
+scripts/deploy-revision.txt
+
+# Results of ci/local/ check runs
+.ci-out/
+
+# Generated build identity
+server/src/generated/build-info.ts
+
+# Deploy transport and instance bookkeeping must not dirty source identity.
+/build-source.tar.gz
+/build-box-instances.txt

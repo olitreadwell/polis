@@ -1,6 +1,47 @@
 // Utility functions for generating test users for OIDC simulator integration tests.
 // The OIDC simulator must be running in Docker before running tests.
 
+/**
+ * Pooled-user indexes reserved for the exclusive use of a single suite.
+ *
+ * Indexes 0-3 are the shared pool: many suites authenticate as those users, and
+ * `setupAuthAndConvo()` defaults to pooled user 1. That is fine for state keyed
+ * by uid or by zid, but not for state keyed by the user's `site_id`
+ * (`site_domain_whitelist`), which every suite sharing a pooled user writes to
+ * as one row. A suite that reads back its own site-scoped write must therefore
+ * own its user outright.
+ *
+ * The OIDC simulator pre-registers test.user.0 through test.user.49
+ * (`oidc-simulator/src/index.ts`), so indexes in the reserved block below are
+ * available. Do not use these in any other suite.
+ */
+export const RESERVED_POOLED_USER_INDEXES = {
+  /** server/__tests__/integration/xid-list-moderators-only.test.ts (conversation owner) */
+  xidListOwner: 38,
+  /** server/__tests__/integration/xid-list-moderators-only.test.ts (site moderator; its site_id is aligned to the owner's) */
+  xidListModerator: 39,
+  /** server/__tests__/integration/domain-whitelist.test.ts */
+  domainWhitelist: 40,
+  /** server/__tests__/integration/vote-path-recordings.test.ts */
+  votePathRecordings: 41,
+  /** server/__tests__/integration/invite-admin-auth.test.ts (conversation owner) */
+  inviteAdminAuthOwner: 42,
+  /** server/__tests__/integration/invite-admin-auth.test.ts (site moderator; its site_id is aligned to the owner's) */
+  inviteAdminAuthModerator: 43,
+  /** server/__tests__/integration/conversations-xid-suzinvite.test.ts (conversation owner) */
+  conversationsXidSuzinvite: 44,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (conversation owner A) */
+  xidIdentityOwnerA: 45,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (conversation owner B) */
+  xidIdentityOwnerB: 46,
+  /** server/__tests__/integration/xid-identity-integrity.test.ts (site moderator; its site_id is aligned to owner A's) */
+  xidIdentityModerator: 47,
+  /** server/__tests__/integration/comment-seed-owner-bearer.test.ts (conversation owner) */
+  seedOwnerBearerOwner: 48,
+  /** server/__tests__/integration/comment-seed-owner-bearer.test.ts (second signed-in account; the suite moves it between a site of its own and the owner's) */
+  seedOwnerBearerOther: 49,
+} as const;
+
 export function getPooledTestUser(index: number): {
   email: string;
   name: string;

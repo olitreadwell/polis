@@ -1,0 +1,590 @@
+{
+  "pca2": {
+    "path": "/api/v3/math/pca2",
+    "minimum_rust_successes": 3,
+    "commands": [
+      "math view",
+      "math view subset",
+      "delphi show"
+    ],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 3,
+    "expected_node_handoffs": 0
+  },
+  "owner-conversations": {
+    "path": "/api/v3/owner/conversations",
+    "minimum_rust_successes": 2,
+    "commands": [],
+    "scope": "Rust-only owner-list contract; Node-off must return capability_unavailable, exit 8.",
+    "expected_requests": 2,
+    "expected_node_handoffs": 0
+  },
+  "comments": {
+    "path": "/api/v3/comments",
+    "minimum_rust_successes": 4,
+    "commands": [],
+    "expected_requests": 11,
+    "expected_node_handoffs": 4,
+    "scope": "Moderation reads use verified caller visibility. Plain OIDC, report enrichment and unsupported identities remain Node handoffs; non-read methods stay on Node."
+  },
+  "nextComment": {
+    "path": "/api/v3/nextComment",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "testConnection": {
+    "path": "/api/v3/testConnection",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "version": {
+    "path": "/api/v3/version",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "No CLI request reaches this route; the image differential checks the build identity bytes.",
+    "expected_requests": 0,
+    "expected_node_handoffs": 0
+  },
+  "robots": {
+    "path": "/robots.txt",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "No CLI request reaches this route; no serving coverage claimed.",
+    "expected_requests": 0,
+    "expected_node_handoffs": 0
+  },
+  "testDatabase": {
+    "path": "/api/v3/testDatabase",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "contexts": {
+    "path": "/api/v3/contexts",
+    "minimum_rust_successes": 2,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 3,
+    "expected_node_handoffs": 0
+  },
+  "domainWhitelist": {
+    "path": "/api/v3/domainWhitelist",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 2,
+    "expected_node_handoffs": 0
+  },
+  "metadataQuestions": {
+    "path": "/api/v3/metadata/questions",
+    "minimum_rust_successes": 2,
+    "commands": [],
+    "scope": "The staged route serves empty questions only; populated question sets remain Node.",
+    "expected_requests": 8,
+    "expected_node_handoffs": 5
+  },
+  "metadataAnswers": {
+    "path": "/api/v3/metadata/answers",
+    "minimum_rust_successes": 5,
+    "commands": [],
+    "scope": "The staged route serves empty answers only; populated answer sets remain Node.",
+    "expected_requests": 8,
+    "expected_node_handoffs": 2
+  },
+  "metadataRead": {
+    "path": "/api/v3/metadata",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "metadataChoices": {
+    "path": "/api/v3/metadata/choices",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "recentStarted": {
+    "path": "/api/v3/conversations/recently_started",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Populated developer results remain Node; staged Rust serves empty results and refusals.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 1
+  },
+  "recentActivity": {
+    "path": "/api/v3/conversations/recent_activity",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Populated developer results remain Node; staged Rust serves empty results and refusals.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 1
+  },
+  "treeviteWaves": {
+    "path": "/api/v3/treevite/waves",
+    "minimum_rust_successes": 3,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 4,
+    "expected_node_handoffs": 0
+  },
+  "treeviteInvites": {
+    "path": "/api/v3/treevite/invites",
+    "minimum_rust_successes": 5,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 5,
+    "expected_node_handoffs": 0
+  },
+  "treeviteCsv": {
+    "path": "/api/v3/treevite/invites/csv",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Authorized CSV remains Node; the Rust slice implements moderator refusals only.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 1
+  },
+  "conversationPreload": {
+    "path": "/api/v3/conversations/preload",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "participationRead": {
+    "path": "/api/v3/participation",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "allConversations": {
+    "path": "/api/v3/all_conversations",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "The generated operator fixture has populated results; only empty lists and refusals are staged.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 1
+  },
+  "reportsRead": {
+    "path": "/api/v3/reports",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Populated report results and capability requests remain Node; staged Rust serves empty scoped lists/refusals.",
+    "expected_requests": 11,
+    "expected_node_handoffs": 9
+  },
+  "bidToPid": {
+    "path": "/api/v3/bidToPid",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "conversationStats": {
+    "path": "/api/v3/conversationStats",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Authorized statistics remain Node; the staged Rust slice implements moderator refusals.",
+    "expected_requests": 2,
+    "expected_node_handoffs": 2
+  },
+  "topicSelections": {
+    "path": "/api/v3/topicAgenda/selections",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 5,
+    "expected_node_handoffs": 0
+  },
+  "treeviteMyInvites": {
+    "path": "/api/v3/treevite/myInvites",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "topicPrioritize": {
+    "path": "/api/v3/participation/topicPrioritize",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Authenticated or cookie-bearing requests remain Node; the staged route admits unauthenticated requests only.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 1
+  },
+  "legacyConversations": {
+    "path": "/api/v3/conversations",
+    "minimum_rust_successes": 0,
+    "commands": [],
+    "scope": "Populated listings and unsupported filters remain Node; staged Rust serves empty matching sets.",
+    "expected_requests": 16,
+    "expected_node_handoffs": 11
+  },
+  "treeviteMe": {
+    "path": "/api/v3/treevite/me",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "xidReport": {
+    "path": "^/api/v3/xid/[^/]+$",
+    "minimum_rust_successes": 1,
+    "commands": [
+      "participant xid export"
+    ],
+    "scope": "The CLI sends its required account bearer; the existing owner fixture export must be served by Rust under the current moderator rule.",
+    "expected_requests": 1,
+    "expected_node_handoffs": 0
+  },
+  "einvitesRead": {
+    "path": "/api/v3/einvites",
+    "minimum_rust_successes": 1,
+    "commands": [],
+    "scope": "Generated CLI requests exercise the admitted staged route; refusals and non-read methods are counted separately from Rust HTTP200.",
+    "expected_requests": 2,
+    "expected_node_handoffs": 0
+  },
+  "adminPage": {
+    "path": "^/m/[0-9][0-9A-Za-z]+",
+    "minimum_rust_successes": 0,
+    "expected_requests": 0,
+    "expected_node_handoffs": 0,
+    "commands": [],
+    "scope": "Browser-only HTML route; no CLI serving coverage. Raw replay and nginx gates supply positive serving proof."
+  },
+  "integratePage": {
+    "path": "^/integrate",
+    "minimum_rust_successes": 0,
+    "expected_requests": 0,
+    "expected_node_handoffs": 0,
+    "commands": [],
+    "scope": "Browser-only HTML route; no CLI serving coverage. Raw replay and nginx gates supply positive serving proof."
+  },
+  "delphiRead": {
+    "path": "/api/v3/delphi",
+    "minimum_rust_successes": 0,
+    "expected_requests": 2,
+    "expected_node_handoffs": 2,
+    "commands": [
+      "delphi overview",
+      "delphi show"
+    ],
+    "scope": "Shared DynamoDB fixture retains two Node handoffs. Dedicated PostgreSQL topics replay proves successful result serving and bounded handback; validation-only behavior remains in DynamoDB mode."
+  },
+  "delphiReports": {
+    "path": "/api/v3/delphi/reports",
+    "minimum_rust_successes": 0,
+    "expected_requests": 2,
+    "expected_node_handoffs": 2,
+    "commands": [
+      "delphi results",
+      "delphi narrative view"
+    ],
+    "scope": "Shared DynamoDB fixture retains two Node handoffs. Dedicated PostgreSQL topics replay proves successful result serving and bounded handback; validation-only behavior remains in DynamoDB mode."
+  },
+  "delphiVisualizations": {
+    "path": "/api/v3/delphi/visualizations",
+    "minimum_rust_successes": 0,
+    "expected_requests": 2,
+    "expected_node_handoffs": 2,
+    "commands": [
+      "delphi status",
+      "delphi visualization view"
+    ],
+    "scope": "The shared fixture uses DynamoDB, so existing reports and S3 results hand to Node. Dedicated Postgres conformance proves archived/native job metadata, filtering, liveness and serving counts."
+  },
+  "topicStats": {
+    "path": "/api/v3/topicStats",
+    "minimum_rust_successes": 0,
+    "expected_requests": 1,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "report topic-stats"
+    ],
+    "scope": "Existing-report topic statistics and DynamoDB/Postgres results remain Node; only missing/unknown report validation is staged. Raw replay provides positive serving proof."
+  },
+  "collectiveStatement": {
+    "path": "/api/v3/collectiveStatement",
+    "minimum_rust_successes": 0,
+    "expected_requests": 4,
+    "expected_node_handoffs": 3,
+    "commands": [
+      "collective statements",
+      "collective list",
+      "collective view",
+      "collective generate"
+    ],
+    "scope": "Existing-report list, statements and statement-ID GETs hand to Node three times; collective generate POST bypasses Rust. Only missing/unknown report validation is staged; raw replay provides positive serving proof."
+  },
+  "opsWhoami": {
+    "path": "/api/v3/ops/whoami",
+    "minimum_rust_successes": 0,
+    "expected_requests": 1,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "ops status"
+    ],
+    "scope": "Disabled operations 404 only with matching explicit OPS_ENABLED=false. CLI sends account authorization and hands to Node; raw replay proves anonymous serving."
+  },
+  "opsPage": {
+    "path": "^/api/v3/ops/page/",
+    "minimum_rust_successes": 0,
+    "expected_requests": 1,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "ops page"
+    ],
+    "scope": "Disabled operations 404 only with matching explicit OPS_ENABLED=false. CLI sends account authorization and hands to Node; raw replay proves anonymous serving."
+  },
+  "opsCatchall": {
+    "path": "/api/v3/ops/unknown",
+    "minimum_rust_successes": 0,
+    "expected_requests": 0,
+    "expected_node_handoffs": 0,
+    "commands": [],
+    "scope": "Unmatched operations GET/HEAD 404 with explicit OPS_ENABLED=false. No CLI command targets the catch-all; direct wire replay proves serving. Registered whoami/page paths preserve independent switches."
+  },
+  "delphiRun": {
+    "path": "/api/v3/delphi/run",
+    "minimum_rust_successes": 0,
+    "expected_requests": 0,
+    "expected_node_handoffs": 0,
+    "commands": [],
+    "scope": "Rust-only: Node has no handler, so a hand-back is Node's 404. No CLI command reaches this route yet; the raw replay against real local runs (delphi-run-run.sh) and the nginx switch test provide serving proof."
+  },
+  "delphiResult": {
+    "path": "/api/v3/delphi/runs/00000000-0000-4000-8000-000000000001?families=assignments",
+    "minimum_rust_successes": 0,
+    "expected_requests": 0,
+    "expected_node_handoffs": 0,
+    "commands": [],
+    "scope": "Rust-only typed assignments read. No CLI command targets this route; delphi-result-run.sh proves contract bytes against immutable results from real local runs."
+  },
+  "statementImportance": {
+    "path": "/api/v3/statements/importance",
+    "minimum_rust_successes": 1,
+    "commands": [
+      "report comments list"
+    ],
+    "expected_requests": 1,
+    "expected_node_handoffs": 0,
+    "scope": "Rust-only public importance counts. The generated report case precedes all votes: both participant-visible comments must have zero counts. Node-off display retains statements with explicitly unavailable null counts; the named contract check preserves every other field."
+  },
+  "votesRead": {
+    "path": "^/api/v3/votes(/me)?$",
+    "minimum_rust_successes": 4,
+    "expected_requests": 8,
+    "expected_node_handoffs": 2,
+    "commands": ["vote list", "vote mine", "vote"],
+    "scope": "Empty and single-row reads serve from Rust. Each path hands its multi-row read to Node because the source query promises no row order. The two vote POSTs bypass Rust.",
+    "paths": [
+      {
+        "path": "/api/v3/votes",
+        "minimum_rust_successes": 2,
+        "expected_requests": 5,
+        "expected_node_handoffs": 1,
+        "commands": ["vote list", "vote list single", "vote list multiple", "vote", "vote important"],
+        "scope": "The original owner read is empty; account-authenticated reads target the PID returned by the participant's vote after one and two votes. Empty and single-row latest reads serve from Rust; the multi-row read hands to Node. Both POSTs stay on Node."
+      },
+      {
+        "path": "/api/v3/votes/me",
+        "minimum_rust_successes": 2,
+        "expected_requests": 3,
+        "expected_node_handoffs": 1,
+        "commands": ["vote mine empty", "vote mine single", "vote mine"],
+        "scope": "The owner's empty history and the participant's single-row history serve from Rust. The existing later participant history scenario has two rows and must hand to Node without inventing an order."
+      }
+    ]
+  },
+  "delphiLogs": {
+    "path": "/api/v3/delphi/logs",
+    "minimum_rust_successes": 0,
+    "expected_requests": 1,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "delphi logs"
+    ],
+    "scope": "The shared differential uses DynamoDB job fixtures, so this Postgres-only route remains disabled and the request hands back to Node. Dedicated Postgres conformance proves archived and native authorized logs and counts every Rust-served case."
+  },
+  "perfStats": {
+    "path": "/perfStats_9182738127",
+    "minimum_rust_successes": 3,
+    "expected_requests": 4,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "ops performance"
+    ],
+    "scope": "The public CLI read and supplemental GET/HEAD serve the disabled collector empty object. The query-bearing GET hands back to Node."
+  },
+  "metadataQuery": {
+    "path": "/api/v3/query_participants_by_metadata",
+    "minimum_rust_successes": 2,
+    "expected_requests": 3,
+    "expected_node_handoffs": 1,
+    "commands": [
+      "participant query"
+    ],
+    "scope": "The real account-authenticated CLI POST selects participants. Supplemental authenticated empty selection serves from Rust; query-bearing POST hands back. This selector is a read despite its POST method."
+  },
+  "reportExportPg": {
+    "path": "^/api/v3/reportExport/[^/]+/(?:format\\.json|summary\\.csv|comments\\.csv|votes\\.csv|participant-votes\\.csv|participant-importance\\.csv|comment-groups\\.csv)$",
+    "minimum_rust_successes": 23,
+    "expected_requests": 31,
+    "expected_node_handoffs": 8,
+    "commands": [
+      "report export"
+    ],
+    "scope": "Each Postgres subtype has independent counts and anonymous CLI file/body equality. The original signed-in format download and query-bearing requests hand back. A generated report has no stored math; populated comment/vote exports retain real CLI-written votes. External subtypes are outside this selector.",
+    "paths": [
+      {
+        "path": "^/api/v3/reportExport/[^/]+/format\\.json$",
+        "minimum_rust_successes": 3,
+        "expected_requests": 5,
+        "expected_node_handoffs": 2,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve. The original signed-in CLI download and the query-bearing GET hand back to Node."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/summary\\.csv$",
+        "minimum_rust_successes": 3,
+        "expected_requests": 4,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/comments\\.csv$",
+        "minimum_rust_successes": 4,
+        "expected_requests": 5,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/votes\\.csv$",
+        "minimum_rust_successes": 4,
+        "expected_requests": 5,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/participant-votes\\.csv$",
+        "minimum_rust_successes": 3,
+        "expected_requests": 4,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/participant-importance\\.csv$",
+        "minimum_rust_successes": 3,
+        "expected_requests": 4,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      },
+      {
+        "path": "^/api/v3/reportExport/[^/]+/comment-groups\\.csv$",
+        "minimum_rust_successes": 3,
+        "expected_requests": 4,
+        "expected_node_handoffs": 1,
+        "commands": [
+          "report export"
+        ],
+        "scope": "Anonymous CLI download and supplemental GET/HEAD must serve; query-bearing GET hands back. Comments and votes also download populated exports through the CLI."
+      }
+    ]
+  },
+  "participantsRead": {
+    "path": "/api/v3/participants",
+    "minimum_rust_successes": 3,
+    "expected_requests": 3,
+    "expected_node_handoffs": 0,
+    "commands": [
+      "participant list",
+      "participant status",
+      "participant status missing"
+    ],
+    "scope": "Existing owner membership and missing membership both serve from Rust."
+  },
+  "ptptois": {
+    "path": "/api/v3/ptptois",
+    "minimum_rust_successes": 2,
+    "expected_requests": 3,
+    "expected_node_handoffs": 0,
+    "commands": [
+      "participant highlight list",
+      "participant highlight list filtered",
+      "participant highlight set"
+    ],
+    "scope": "Empty social rows with and without a moderation filter serve from Rust; the moderation PUT stays on Node."
+  },
+  "bid": {
+    "path": "/api/v3/bid",
+    "minimum_rust_successes": 2,
+    "expected_requests": 2,
+    "expected_node_handoffs": 0,
+    "commands": [
+      "participant group",
+      "participant group owner"
+    ],
+    "scope": "Participant and owner reads preserve the missing-bundle null bucket."
+  },
+  "locations": {
+    "path": "/api/v3/locations",
+    "minimum_rust_successes": 2,
+    "expected_requests": 2,
+    "expected_node_handoffs": 0,
+    "commands": [
+      "participant locations",
+      "participant locations missing group"
+    ],
+    "scope": "Empty location arrays for the generated group and an absent group serve from Rust."
+  },
+  "myInvitesCsv": {
+    "path": "/api/v3/treevite/myInvites/csv",
+    "minimum_rust_successes": 1,
+    "expected_requests": 2,
+    "expected_node_handoffs": 1,
+    "commands": ["invite mine export empty", "invite mine export"],
+    "scope": "Before another conversation code is created, the participant's empty CSV serves from Rust. The later download hands to Node because multiple reverse codes are ambiguous. Both file hashes must match across phases."
+  },
+  "conversationPage": {
+    "path": "^/[0-9][0-9A-Za-z]+",
+    "minimum_rust_successes": 2,
+    "expected_requests": 3,
+    "expected_node_handoffs": 1,
+    "commands": [],
+    "scope": "Supplemental page requests compare status, content type and full body bytes for GET, HEAD and an unsupported-query Node handoff. These are HTTP scenarios, not CLI commands."
+  }
+}

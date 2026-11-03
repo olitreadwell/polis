@@ -9,9 +9,9 @@ import Config from "./config";
 import pg from "./db/pg-query";
 import SQL from "./db/sql";
 import Utils from "./utils/common";
-import { isProConvo } from "./routes/comments";
 import { UUID } from "crypto";
 import logger from "./utils/logger";
+import { storageToSemantic } from "./votes/convention";
 
 export type CommentRow = {
   tid: number;
@@ -64,6 +64,22 @@ function getComment(zid: number, tid: number): Promise<CommentRow | null> {
     });
 }
 
+/**
+ * The statements a participant can see, as a condition on `comments` to add to
+ * a moderation-list query: the same predicate the plain list applies
+ * (`_getCommentsList` and the plain branch of `getCommentsCount`). Active, not
+ * muted (velocity above 0), and accepted under strict moderation or not
+ * rejected otherwise.
+ */
+function participantVisibleClause(strictModeration: boolean): string {
+  return (
+    " and comments.active = true and comments.velocity > 0" +
+    (strictModeration
+      ? ` and comments.mod = ${Utils.polisTypes.mod.ok}`
+      : ` and comments.mod != ${Utils.polisTypes.mod.ban}`)
+  );
+}
+
 function getCommentsCount(o: GetCommentsParams): Promise<number> {
   return getConversationInfo(o.zid).then(function (conv: ConversationInfo) {
     let query = "";
@@ -92,6 +108,9 @@ function getCommentsCount(o: GetCommentsParams): Promise<number> {
             modClause = " and comments.mod < 0";
           }
         }
+      }
+      if (o.participantVisibleOnly) {
+        modClause += participantVisibleClause(conv.strict_moderation);
       }
       query =
         "select count(*) from comments where comments.zid = ($1)" + modClause;
@@ -149,6 +168,21 @@ function getCommentsCount(o: GetCommentsParams): Promise<number> {
   });
 }
 
+// The columns a plain (non-moderation) comment list returns, in response
+// order. uid is read here and removed before anything is returned.
+const PLAIN_LIST_COLUMNS = [
+  "txt",
+  "tid",
+  "created",
+  "uid",
+  "quote_src_url",
+  "is_seed",
+  "is_meta",
+  "lang",
+  "pid",
+  "original_id",
+];
+
 function getComments(o: GetCommentsParams): Promise<CommentRow[]> {
   const commentListPromise = o.moderation
     ? _getCommentsForModerationList(o as any)
@@ -157,23 +191,14 @@ function getComments(o: GetCommentsParams): Promise<CommentRow[]> {
   return Promise.all([convPromise, commentListPromise])
     .then(function (a: [any, CommentRow[]]) {
       let rows: CommentRow[] = a[1];
-      const cols = [
-        "txt",
-        "tid",
-        "created",
-        "uid",
-        "quote_src_url",
-        "is_seed",
-        "is_meta",
-        "lang",
-        "pid",
-        "original_id",
-      ];
+      const cols = [...PLAIN_LIST_COLUMNS];
       if (o.moderation) {
-        cols.push("velocity");
-        cols.push("zid");
-        cols.push("mod");
-        cols.push("active");
+        if (!o.participantVisibleOnly) {
+          cols.push("velocity");
+          cols.push("zid");
+          cols.push("mod");
+          cols.push("active");
+        }
         cols.push("agree_count"); //  in  moderation queries, we join in the vote count
         cols.push("disagree_count"); //  in  moderation queries, we join in the vote count
         cols.push("pass_count"); //  in  moderation queries, we join in the vote count
@@ -205,10 +230,11 @@ function _getCommentsForModerationList(o: {
   mod_gt: any;
   limit?: any;
   offset?: any;
+  participantVisibleOnly?: boolean;
 }): Promise<CommentRow[]> {
   let strictCheck: Promise<any> = Promise.resolve(null);
   const include_voting_patterns = o.include_voting_patterns;
-  let isProOwner = false;
+  let conversationStrict = false;
 
   if (o.modIn) {
     strictCheck = pg
@@ -221,12 +247,11 @@ function _getCommentsForModerationList(o: {
   }
 
   return pg
-    .queryP("select owner from conversations where zid = ($1);", [o.zid])
-    .then(async (z: { owner: number }[]) => {
-      isProOwner =
-        o.mod_gt && Number(o.mod_gt) > -2
-          ? await isProConvo(z[0].owner)
-          : false;
+    .queryP("select strict_moderation from conversations where zid = ($1);", [
+      o.zid,
+    ])
+    .then((z: { strict_moderation: boolean }[]) => {
+      conversationStrict = Boolean(z[0]?.strict_moderation);
     })
     .then(() =>
       strictCheck.then((strict_moderation): Promise<CommentRow[]> => {
@@ -235,7 +260,11 @@ function _getCommentsForModerationList(o: {
         if (!_.isUndefined(o.mod)) {
           modClause = " and comments.mod = ($2)";
           params.push(o.mod);
-        } else if (isProOwner) {
+        } else if (!_.isUndefined(o.mod_gt) && Number(o.mod_gt) > -2) {
+          // The report's moderation level selector. It used to apply only when
+          // the conversation owner's account carried a paid role, looked up at
+          // the identity provider on every read; the filter now applies for
+          // every conversation and no account is looked up.
           modClause = " and comments.mod > ($2)";
           params.push(o.mod_gt);
         } else if (!_.isUndefined(o.modIn)) {
@@ -252,6 +281,12 @@ function _getCommentsForModerationList(o: {
               modClause = " and comments.mod < 0";
             }
           }
+        }
+        // A caller who does not moderate the conversation sees only what
+        // participants see. The filters above still apply, so they can only
+        // narrow that set further, never widen it.
+        if (o.participantVisibleOnly) {
+          modClause += participantVisibleClause(conversationStrict);
         }
         if (!include_voting_patterns) {
           let query =
@@ -305,11 +340,12 @@ function _getCommentsForModerationList(o: {
                 disagree_count: 0,
                 pass_count: 0,
               });
-              if (row.vote === Utils.polisTypes.reactions.pull) {
+              const vote = storageToSemantic(row.vote, { onInvalid: "skip" });
+              if (vote === "agree") {
                 o.agree_count = Number(row.count);
-              } else if (row.vote === Utils.polisTypes.reactions.push) {
+              } else if (vote === "disagree") {
                 o.disagree_count = Number(row.count);
-              } else if (row.vote === Utils.polisTypes.reactions.pass) {
+              } else if (vote === "pass") {
                 o.pass_count = Number(row.count);
               }
             }
@@ -341,6 +377,9 @@ function _getCommentsList(o: {
   random: any;
   limit: any;
   offset?: any;
+  // Next-comment routing (getNextCommentCandidates): read only tid, and every
+  // matching comment rather than the default first 999.
+  candidateIdsOnly?: boolean;
 }): Promise<CommentRow[]> {
   return MPromise(
     "_getCommentsList",
@@ -350,7 +389,9 @@ function _getCommentsList(o: {
     ) {
       getConversationInfo(o.zid).then(function (conv: ConversationInfo) {
         let q = SQL.sql_comments
-          .select(SQL.sql_comments.star())
+          .select(
+            o.candidateIdsOnly ? SQL.sql_comments.tid : SQL.sql_comments.star()
+          )
           .where(SQL.sql_comments.zid.equals(o.zid));
         if (!_.isUndefined(o.tids)) {
           q = q.and(SQL.sql_comments.tid.in(o.tids));
@@ -395,7 +436,7 @@ function _getCommentsList(o: {
         }
         if (!_.isUndefined(o.limit)) {
           q = q.limit(o.limit);
-        } else {
+        } else if (!o.candidateIdsOnly) {
           q = q.limit(999); // Default limit for backward compatibility
         }
         if (!_.isUndefined(o.offset)) {
@@ -415,6 +456,38 @@ function _getCommentsList(o: {
       });
     }
   ) as Promise<CommentRow[]>;
+}
+
+/**
+ * Next-comment routing's candidates: the id of every comment the plain list
+ * would offer this participant (the same moderation, vote, `without`, active
+ * and velocity filters, in the same created order), with no row limit. Only
+ * ids are read: the weighted draw needs nothing else, and the chosen comment's
+ * row is read afterwards with getNextCommentRow. The plain list keeps its
+ * default of 999 rows.
+ */
+function getNextCommentCandidates(o: {
+  zid: number;
+  not_voted_by_pid: number;
+  withoutTids?: Array<number | string>;
+}): Promise<Array<{ tid: number }>> {
+  return _getCommentsList({ ...o, candidateIdsOnly: true } as any);
+}
+
+/** One comment's row, with the columns and key order of the plain list. */
+async function getNextCommentRow(
+  zid: number,
+  tid: number
+): Promise<CommentRow | undefined> {
+  const rows = (await pg.queryP(
+    "select * from comments where zid = ($1) and tid = ($2);",
+    [zid, tid]
+  )) as CommentRow[];
+  if (!rows.length) return undefined;
+  return _.pick(
+    rows[0],
+    PLAIN_LIST_COLUMNS.filter((c) => c !== "uid")
+  ) as CommentRow;
 }
 
 function getNumberOfCommentsRemaining(zid: number, pid: number): Promise<any> {
@@ -437,7 +510,10 @@ function translateAndStoreComment(
 ): Promise<CommentTranslationRow | null> {
   logger.debug("polis_debug_translateAndStoreComment", { zid, tid, txt, lang });
   if (useTranslateApi) {
-    return translateString(txt, lang).then((results: any[]) => {
+    return translateString(txt, lang).then((results: any[] | null) => {
+      if (!results) {
+        return null;
+      }
       const translation = results[0];
       const src = -1; // Google Translate of txt with no added context
       return pg
@@ -457,25 +533,104 @@ function translateAndStoreComment(
   return Promise.resolve(null);
 }
 
-function translateString(txt: any, target_lang: any): Promise<any[] | null> {
-  if (useTranslateApi) {
-    return translateClient.translate(txt, target_lang);
-  }
-  return Promise.resolve(null);
+// Language metadata is optional. Bound our wait for the provider, including its
+// retries, so an outage cannot hold comment creation indefinitely. This does not
+// cancel the SDK request; Promise.race also observes any late rejection.
+const TRANSLATION_TIMEOUT_MS = 5000;
+
+function logTranslationFailure(event: string, err: unknown): void {
+  const error = err as {
+    name?: unknown;
+    message?: unknown;
+    code?: unknown;
+    errors?: Array<{ reason?: unknown }>;
+  } | null;
+  const bounded = (value: unknown) =>
+    typeof value === "string" ? value.slice(0, 256) : undefined;
+  // Google ApiError also carries the full response (including headers). Keep
+  // only diagnostic scalars, once per failed call; never log that response.
+  logger.warn(event, {
+    name: bounded(error?.name),
+    message: bounded(error?.message),
+    code: typeof error?.code === "number" ? error.code : bounded(error?.code),
+    reason: bounded(error?.errors?.[0]?.reason),
+  });
 }
 
-function detectLanguage(
+async function withTranslationTimeout<T>(call: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Translation provider timed out")),
+          TRANSLATION_TIMEOUT_MS
+        );
+      }),
+      Promise.resolve().then(call),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function translateString(
+  txt: any,
+  target_lang: any
+): Promise<any[] | null> {
+  if (useTranslateApi) {
+    try {
+      const results = await withTranslationTimeout<any[]>(() =>
+        translateClient.translate(txt, target_lang)
+      );
+      if (
+        !Array.isArray(results) ||
+        typeof results[0] !== "string" ||
+        results[0].length === 0
+      ) {
+        throw new Error("Translation provider returned an invalid translation");
+      }
+      return results;
+    } catch (err) {
+      logTranslationFailure("polis_warn_translation_failed", err);
+    }
+  }
+  return null;
+}
+
+async function detectLanguage(
   txt: any
 ): Promise<Array<{ confidence: any; language: any }>> {
   if (useTranslateApi) {
-    return translateClient.detect(txt);
+    try {
+      const results = await withTranslationTimeout<any[]>(() =>
+        translateClient.detect(txt)
+      );
+      const detection = Array.isArray(results) ? results[0] : null;
+      if (
+        !detection ||
+        typeof detection.language !== "string" ||
+        detection.language.trim().length === 0 ||
+        detection.language.length > 10 ||
+        detection.language.includes("\0") ||
+        typeof detection.confidence !== "number" ||
+        !Number.isFinite(detection.confidence) ||
+        detection.confidence < 0 ||
+        detection.confidence > 1
+      ) {
+        throw new Error("Translation provider returned an invalid detection");
+      }
+      return results;
+    } catch (err) {
+      logTranslationFailure("polis_warn_language_detection_failed", err);
+    }
   }
-  return Promise.resolve([
+  return [
     {
       confidence: null,
       language: null,
     },
-  ]);
+  ];
 }
 
 export {
@@ -483,6 +638,8 @@ export {
   getComment,
   getComments,
   getCommentsCount,
+  getNextCommentCandidates,
+  getNextCommentRow,
   getNumberOfCommentsRemaining,
   translateAndStoreComment,
 };

@@ -1,33 +1,39 @@
 import _ from "underscore";
-import { getPca, PcaCacheItem } from "../utils/pca";
+import {
+  getLatestPcaTick,
+  getPca,
+  isSynthesizedPca,
+  PcaCacheItem,
+} from "../utils/pca";
+import { presentPca } from "../utils/pcaPresentation";
 import { failJson } from "../utils/fail";
-import pg from "../db/pg-query";
-import Utils from "../utils/common";
-import { getZidForRid } from "../utils/zinvite";
 import { getBidIndexToPidMapping } from "../utils/participants";
+import {
+  bidsForPids,
+  getMathBundle,
+  MathBundleRead,
+} from "../utils/mathBundle";
 import Config from "../config";
-import logger from "../utils/logger";
 import { getPidPromise } from "../user";
-
-function handle_GET_math_pca(
-  req: any,
-  res: {
-    status: (arg0: number) => {
-      (): any;
-      new (): any;
-      end: { (): void; new (): any };
-    };
-  }
-) {
-  // migrated off this path, old clients were causing timeout issues by polling
-  // repeatedly without waiting for a result for a previous poll.
-  res.status(304).end();
-}
 
 // Cache the knowledge of whether there are any pca results for a given zid.
 // Needed to determine whether to return a 404 or a 304.
-// zid -> boolean
-const pcaResultsExistForZid: Record<number, boolean> = {};
+// [math_env, zid] -> boolean
+const pcaResultsExistForZid: Record<string, boolean> = {};
+
+/**
+ * The pca2 entity tag: the served label and the generation, e.g. `"python-57"`.
+ *
+ * math_tick is allocated per (zid, math_env), so the generation alone does not
+ * identify a representation once the served label can change (the switch to
+ * the Python engine, or a rollback). The label is percent-encoded so any
+ * configured value stays a valid entity tag. JSON `math_tick` stays numeric; only
+ * the validator carries the label.
+ */
+export function pca2EntityTag(mathTick: number | string): string {
+  const label = encodeURIComponent(String(Config.mathEnv));
+  return '"' + label + "-" + Number(mathTick) + '"';
+}
 
 function handle_GET_math_pca2(
   req: {
@@ -54,10 +60,22 @@ function handle_GET_math_pca2(
   }
 ) {
   const zid = req.p.zid;
+  const cacheKey = JSON.stringify([Config.mathEnv, zid]);
   let math_tick = req.p.math_tick;
   const keys = req.p.keys;
 
   const ifNoneMatch = req.p.ifNoneMatch;
+  // The entity tags named by If-None-Match. A tag names a representation, not a
+  // position in an ordering: math_tick is allocated per (zid, math_env), so
+  // prod tick 57 and python tick 57 are unrelated bodies, and a bare number
+  // cannot say which label it came from. The served tag therefore binds the
+  // label and the generation (pca2EntityTag), and a held tag is compared as an
+  // opaque value (weak comparison, since this is a GET). A legacy numeric tag
+  // (`"57"`, which client-participation builds from the JSON math_tick) never
+  // matches, so it always gets the current body: a 200 instead of a 304 costs a
+  // response, a wrong 304 keeps another label's result on screen, possibly for
+  // the rest of a dormant conversation's life. `*` keeps its existing handling.
+  let heldTags: string[] | undefined;
   if (ifNoneMatch) {
     if (math_tick !== undefined) {
       return failJson(
@@ -69,22 +87,19 @@ function handle_GET_math_pca2(
     if (ifNoneMatch.includes("*")) {
       math_tick = 0;
     } else {
-      const entries = ifNoneMatch.split(/ *, */).map((x: string) => {
-        return Number(
-          x
-            .replace(/^[wW]\//, "")
-            .replace(/^"/, "")
-            .replace(/"$/, "")
-        );
-      });
-      math_tick = Math.min(...entries);
+      heldTags = String(ifNoneMatch)
+        .split(",")
+        .map((x: string) => x.trim().replace(/^[wW]\//, ""))
+        .filter((x: string) => x.length > 0);
+      // Fetch the latest generation; the 304 decision is made against heldTags.
+      math_tick = -1;
     }
   } else if (math_tick === undefined) {
     math_tick = -1;
   }
 
   function finishWith304or404() {
-    if (pcaResultsExistForZid[zid]) {
+    if (pcaResultsExistForZid[cacheKey]) {
       res.status(304).end();
     } else {
       // Technically, this should probably be a 404, but
@@ -95,176 +110,95 @@ function handle_GET_math_pca2(
     }
   }
 
-  getPca(zid, math_tick)
-    .then(function (data: PcaCacheItem | undefined) {
-      if (data) {
-        // If keys are specified and non-empty, filter the response
-        if (keys && keys.length > 0) {
-          // Filter to only include requested keys that exist in the POJO
-          // _.pick will gracefully ignore keys that don't exist
-          const filtered = _.pick(data.asPOJO, keys);
-          res.set({
-            "Content-Type": "application/json",
-            Etag: '"' + data.asPOJO.math_tick + '"',
-          });
-          res.json(filtered);
+  // The client already holds exactly this label's generation.
+  function finishWith304ForTag(etag: string) {
+    res.set({ "Content-Type": "application/json", Etag: etag });
+    res.status(304).end();
+  }
+
+  // Whether the served entry is the empty presentation synthesized for a
+  // conversation with no committed row. It gets no generation tag: its
+  // math_tick 0 is a placeholder, and giving it the tag of a real generation 0
+  // would answer 304 to the first real publication. Without an explicit tag,
+  // express derives a weak validator from the body itself.
+  let synthesized = false;
+  function serveCurrentGeneration() {
+    return getPca(zid, math_tick)
+      .then((data: PcaCacheItem | undefined) => {
+        synthesized = isSynthesizedPca(data);
+        // Serve the presentation, not the raw blob: an empty math result still puts
+        // the conversation's comment defaults on the wire (see utils/pcaPresentation).
+        return presentPca(zid, data);
+      })
+      .then(function (data: PcaCacheItem | undefined) {
+        const etag =
+          data && !synthesized
+            ? pca2EntityTag(data.asPOJO.math_tick)
+            : undefined;
+        if (
+          etag !== undefined &&
+          heldTags !== undefined &&
+          heldTags.includes(etag)
+        ) {
+          finishWith304ForTag(etag);
           return;
         }
-        // The buffer is gzipped beforehand to cut down on server effort in re-gzipping
-        // the same json string for each response.
-        // We can't cache this endpoint on Cloudflare because the response changes too freqently,
-        // so it seems like the best way is to cache the gzipped json'd buffer here on the server.
-        res.set({
-          "Content-Type": "application/json",
-          "Content-Encoding": "gzip",
-          Etag: '"' + data.asPOJO.math_tick + '"',
-        });
-        res.send(data.asBufferOfGzippedJson);
-      } else {
-        // check whether we should return a 304 or a 404
-        if (pcaResultsExistForZid[zid] === undefined) {
-          // This server doesn't know yet if there are any PCA results in the DB
-          // So try querying from -1
-          return getPca(zid, -1).then(function (data: any) {
-            const exists = !!data;
-            pcaResultsExistForZid[zid] = exists;
-            finishWith304or404();
+        if (data) {
+          // If keys are specified and non-empty, filter the response
+          if (keys && keys.length > 0) {
+            // Filter to only include requested keys that exist in the POJO
+            // _.pick will gracefully ignore keys that don't exist
+            const filtered = _.pick(data.asPOJO, keys);
+            res.set({
+              "Content-Type": "application/json",
+              ...(etag !== undefined ? { Etag: etag } : {}),
+            });
+            res.json(filtered);
+            return;
+          }
+          // The buffer is gzipped beforehand to cut down on server effort in re-gzipping
+          // the same json string for each response.
+          // We can't cache this endpoint on Cloudflare because the response changes too freqently,
+          // so it seems like the best way is to cache the gzipped json'd buffer here on the server.
+          res.set({
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            ...(etag !== undefined ? { Etag: etag } : {}),
           });
+          res.send(data.asBufferOfGzippedJson);
         } else {
-          finishWith304or404();
+          // check whether we should return a 304 or a 404
+          if (pcaResultsExistForZid[cacheKey] === undefined) {
+            // This server doesn't know yet if there are any PCA results in the DB
+            // So try querying from -1
+            return getPca(zid, -1).then(function (data: any) {
+              const exists = !!data;
+              pcaResultsExistForZid[cacheKey] = exists;
+              finishWith304or404();
+            });
+          } else {
+            finishWith304or404();
+          }
         }
+      });
+  }
+
+  // A held tag is compared first, with the generation getPca would serve,
+  // learned without reading or compressing the blob (getLatestPcaTick). A
+  // match answers exactly the 304 above; anything else is served as before.
+  const heldTick: Promise<number | undefined> =
+    heldTags === undefined ? Promise.resolve(undefined) : getLatestPcaTick(zid);
+  heldTick
+    .then((tick) => {
+      const etag = tick === undefined ? undefined : pca2EntityTag(tick);
+      if (etag !== undefined && heldTags.includes(etag)) {
+        finishWith304ForTag(etag);
+        return;
       }
+      return serveCurrentGeneration();
     })
     .catch(function (err: any) {
       failJson(res, 500, err);
-    });
-}
-
-function handle_POST_math_update(
-  req: { p: { zid: number; uid?: number; math_update_type: any } },
-  res: {
-    status: (arg0: number) => {
-      (): any;
-      new (): any;
-      json: { (arg0: {}): void; new (): any };
-    };
-  }
-) {
-  const zid = req.p.zid;
-  const uid = req.p.uid;
-  const math_env = Config.mathEnv;
-  const math_update_type = req.p.math_update_type;
-
-  Utils.isModerator(zid, uid).then((hasPermission: any) => {
-    if (!hasPermission) {
-      return failJson(res, 500, "handle_POST_math_update_permission");
-    }
-    return pg
-      .queryP(
-        "insert into worker_tasks (task_type, task_data, task_bucket, math_env) values ('update_math', $1, $2, $3);",
-        [
-          JSON.stringify({
-            zid: zid,
-            math_update_type: math_update_type,
-          }),
-          zid,
-          math_env,
-        ]
-      )
-      .then(() => {
-        res.status(200).json({});
-      })
-      .catch((err: any) => {
-        return failJson(res, 500, "polis_err_POST_math_update", err);
-      });
-  });
-}
-
-function handle_GET_math_correlationMatrix(
-  req: { p: { rid: any; math_tick: any } },
-  res: {
-    status: (arg0: number) => {
-      (): any;
-      new (): any;
-      json: { (arg0: { status: string }): void; new (): any };
-    };
-    json: (arg0: any) => void;
-  }
-) {
-  const rid = req.p.rid;
-  const math_env = Config.mathEnv;
-  const math_tick = req.p.math_tick;
-
-  function finishAsPending() {
-    res.status(202).json({
-      status: "pending",
-    });
-  }
-
-  function hasCommentSelections() {
-    return pg
-      .queryP(
-        "select * from report_comment_selections where rid = ($1) and selection = 1;",
-        [rid]
-      )
-      .then((rows: string | any[]) => {
-        return rows.length > 0;
-      });
-  }
-
-  const requestExistsPromise = pg.queryP(
-    "select * from worker_tasks where task_type = 'generate_report_data' and math_env=($2) " +
-      "and task_bucket = ($1) " +
-      // "and attempts < 3 " +
-      "and (task_data->>'math_tick')::int >= ($3) " +
-      "and finished_time is NULL;",
-    [rid, math_env, math_tick]
-  );
-
-  const resultExistsPromise = pg.queryP(
-    "select * from math_report_correlationmatrix where rid = ($1) and math_env = ($2) and math_tick >= ($3);",
-    [rid, math_env, math_tick]
-  );
-
-  Promise.all([resultExistsPromise, getZidForRid(rid)])
-    .then((a: any[]) => {
-      const rows = a[0];
-      const zid = a[1];
-      if (!rows || !rows.length) {
-        return requestExistsPromise.then((requests_rows: string | any[]) => {
-          const shouldAddTask = !requests_rows || !requests_rows.length;
-          // const shouldAddTask = true;
-
-          if (shouldAddTask) {
-            return hasCommentSelections().then((hasSelections: any) => {
-              if (!hasSelections) {
-                return res.status(202).json({
-                  status: "polis_report_needs_comment_selection",
-                });
-              }
-              return pg
-                .queryP(
-                  "insert into worker_tasks (task_type, task_data, task_bucket, math_env) values ('generate_report_data', $1, $2, $3);",
-                  [
-                    JSON.stringify({
-                      rid: rid,
-                      zid: zid,
-                      math_tick: math_tick,
-                    }),
-                    rid,
-                    math_env,
-                  ]
-                )
-                .then(finishAsPending);
-            });
-          }
-          finishAsPending();
-        });
-      }
-      res.json(rows[0].data);
-    })
-    .catch((err: any) => {
-      return failJson(res, 500, "polis_err_GET_math_correlationMatrix", err);
     });
 }
 
@@ -282,7 +216,11 @@ function handle_GET_bidToPid(
   const zid = req.p.zid;
   const math_tick = req.p.math_tick;
   getBidIndexToPidMapping(zid, math_tick).then(
-    function (doc: { bidToPid: any }) {
+    function (doc: { bidToPid: any } | Error) {
+      if (doc instanceof Error) {
+        res.status(304).end();
+        return;
+      }
       const b2p = doc.bidToPid;
       res.json({
         bidToPid: b2p,
@@ -294,42 +232,40 @@ function handle_GET_bidToPid(
   );
 }
 
-function getBidsForPids(zid: number, math_tick: number, pids: number[]) {
-  const dataPromise = getBidIndexToPidMapping(zid, math_tick);
-  const mathResultsPromise = getPca(zid, math_tick);
-
-  return Promise.all([dataPromise, mathResultsPromise]).then(function (
-    items: { asPOJO: any; bidToPid: any }[]
-  ) {
-    const b2p = items[0].bidToPid || []; // not sure yet if "|| []" is right here.
-    const mathResults = items[1].asPOJO;
-    function findBidForPid(pid: number) {
-      let yourBidi = -1;
-      // if (!b2p) {
-      //     return yourBidi;
-      // }
-      for (let bidi = 0; bidi < b2p.length; bidi++) {
-        const pids = b2p[bidi];
-        if (pids.indexOf(pid) !== -1) {
-          yourBidi = bidi;
-          break;
-        }
-      }
-
-      let yourBid = indexToBid[yourBidi];
-
-      if (yourBidi >= 0 && _.isUndefined(yourBid)) {
-        logger.error("polis_err_math_index_mapping_mismatch", { pid, b2p });
-        yourBid = -1;
-      }
-      return yourBid;
+/**
+ * pid -> base-cluster id, for `doFamousQuery`'s featured-participant join.
+ *
+ * This used to issue `getBidIndexToPidMapping` and `getPca` in parallel and
+ * index one generation's `base-clusters.id` with another generation's
+ * `bidToPid` whenever a publication landed between them. It now joins inside
+ * one immutable Bundle. Each pre-Bundle outcome is preserved exactly:
+ *
+ *  - no coherent generation -> every pid maps to `undefined`, which is what
+ *    `getBidIndexToPidMapping`'s Error sentinel produced via `|| []`, and what
+ *    `doFamousQuery` reads as "not bucketized yet";
+ *  - a main row that is not newer than the requested tick -> a rejection,
+ *    which is what dereferencing `getPca`'s `undefined` result produced, and
+ *    which `doFamousQuery`'s failure branch turns into an empty map.
+ */
+async function getBidsForPids(
+  zid: number,
+  math_tick: number,
+  pids: number[],
+  ownedRead?: MathBundleRead
+): Promise<Record<number, number | undefined>> {
+  const requested = typeof math_tick === "number" ? math_tick : -1;
+  const read = ownedRead ?? (await getMathBundle(zid));
+  if (read.present && read.mathTick <= requested) {
+    throw new Error("polis_err_math_bundle_not_new");
+  }
+  if (!read.present || !read.admitted) {
+    const unplaced: Record<number, number | undefined> = {};
+    for (const pid of pids) {
+      unplaced[pid] = undefined;
     }
-
-    const indexToBid = mathResults["base-clusters"].id;
-    const bids = pids.map(findBidForPid);
-    const pidToBid = _.object(pids, bids);
-    return pidToBid;
-  });
+    return unplaced;
+  }
+  return bidsForPids(read.bundle, pids);
 }
 
 function handle_GET_bid(
@@ -347,43 +283,23 @@ function handle_GET_bid(
   const zid = req.p.zid;
   const math_tick = req.p.math_tick;
 
-  const dataPromise = getBidIndexToPidMapping(zid, math_tick);
-  const pidPromise = getPidPromise(zid, uid);
-  const mathResultsPromise = getPca(zid, math_tick);
-
-  Promise.all([dataPromise, pidPromise, mathResultsPromise])
+  // Main's cluster IDs and the participant mapping must share one snapshot.
+  // A rejected Bundle leaves the participant unplaced instead of joining rows.
+  Promise.all([getMathBundle(zid), getPidPromise(zid, uid)])
     .then(
-      function (items: { asPOJO: any; bidToPid: any }[]) {
-        const b2p = items[0].bidToPid || []; // not sure yet if "|| []" is right here.
-        const pid = items[1];
-        const mathResults = items[2].asPOJO;
-        if ((pid as unknown as number) < 0) {
-          // NOTE: this API should not be called in /demo mode
+      function ([read, pid]) {
+        if (pid < 0) {
           failJson(res, 500, "polis_err_get_bid_bad_pid");
           return;
         }
-
-        const indexToBid = mathResults["base-clusters"].id;
-
-        let yourBidi = -1;
-        for (let bidi = 0; bidi < b2p.length; bidi++) {
-          const pids = b2p[bidi];
-          if (pids.indexOf(pid) !== -1) {
-            yourBidi = bidi;
-            break;
-          }
+        if ((read.present ? read.mathTick : 0) <= math_tick) {
+          throw new Error("polis_err_math_bundle_not_new");
         }
-
-        let yourBid = indexToBid[yourBidi];
-
-        if (yourBidi >= 0 && _.isUndefined(yourBid)) {
-          logger.error("polis_err_math_index_mapping_mismatch", { pid, b2p });
-          yourBid = -1;
-        }
-
-        res.json({
-          bid: yourBid, // The user's current bid
-        });
+        const bid =
+          read.present && read.admitted
+            ? bidsForPids(read.bundle, [pid])[pid]
+            : undefined;
+        res.json({ bid });
       },
       function () {
         res.status(304).end();
@@ -398,8 +314,5 @@ export {
   getBidsForPids,
   handle_GET_bid,
   handle_GET_bidToPid,
-  handle_GET_math_correlationMatrix,
-  handle_GET_math_pca,
   handle_GET_math_pca2,
-  handle_POST_math_update,
 };

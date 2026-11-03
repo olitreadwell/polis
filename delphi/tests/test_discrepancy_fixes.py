@@ -240,7 +240,7 @@ def _build_conv_with_moderation(
     mod_out_tids: list | None = None,
     participant_votes: dict | None = None,
 ) -> Conversation:
-    """Build a synthetic Conversation with moderation applied.
+    """Build a public-fixture Conversation with moderation applied.
 
     Args:
         n_comments: Total number of comments (tids 0..n_comments-1).
@@ -316,20 +316,23 @@ class TestD2cVoteCountSource:
         assert n_cmts_filtered == 10, f"rating_mat should keep all 10 columns (zeroed, not removed), got {n_cmts_filtered}"
 
         # The threshold used by _get_in_conv_participants should be min(7, 10) = 7,
-        # not min(7, 5) = 5. Verify indirectly: participant with exactly 6 votes
-        # should NOT be in-conv (threshold=7), but would be if n_cmts=5 (threshold=5).
+        # not min(7, 5) = 5. Since the mode collapse the greedy floor admits
+        # below-threshold participants whenever in-conv < 15, so satisfy the
+        # floor with 16 over-threshold participants first — then a 6-vote
+        # participant is excluded iff the threshold is really 7 (it would be
+        # admitted if n_cmts wrongly used the filtered count 5).
         conv2 = _build_conv_with_moderation(
             n_comments=10,
             mod_out_tids=[0, 1, 2, 3, 4],
             participant_votes={
-                0: list(range(10)),    # 10 raw votes → in-conv
-                1: list(range(4, 10)), # 6 raw votes (tids 4..9; tid=4 moderated-out) → NOT in-conv
+                **{p: list(range(10)) for p in range(16)},  # 16 over threshold
+                16: list(range(4, 10)),  # 6 raw votes -> below threshold=7
             },
         )
         in_conv = conv2._get_in_conv_participants()
         assert 0 in in_conv, "P0 (10 raw votes) should be in-conv"
-        assert 1 not in in_conv, (
-            "P1 (6 raw votes) should NOT be in-conv with threshold=7, "
+        assert 16 not in in_conv, (
+            "P16 (6 raw votes) should NOT be in-conv with threshold=7, "
             "but would be if n_cmts wrongly used filtered count (5)"
         )
 
@@ -1074,12 +1077,19 @@ class TestD8FinalizeStats:
     def test_repful_matches_clojure_blob(self, request, conv, clojure_blob, dataset_name):
         """repful-for (Clojure) vs repful (Python) for shared rep comments.
 
-        Gates on 9/11 variants since the gid label-swap fix (2026-07-05
+        Gates on most variants since the gid label-swap fix (2026-07-05
         removal of the group size re-sort). Residual known-bad: two
         incremental variants with deeper trajectory divergence
         (pakistan-incremental: Clojure blob PCA computed on a comment
         subset; vw-incremental: in-conv trajectory divergence) — deferred
-        to the sequential-parity work.
+        to the sequential-parity work — plus FLI-cold_start since the mode
+        collapse (2026-07-27): the PROD blob carries Clojure's UNSEEDED
+        cold-start PCA (Q12, #2661) and the collapse made the
+        Clojure-faithful legacy kmeans the only cold-tick path, so the
+        selection sets no longer intersect that particular random draw.
+        The battery certifies FLI end-to-end against pinned-cold-start
+        Clojure recordings (20/20 MATCH), which supersedes this prod-blob
+        comparison for that variant.
         """
         if request.node.callspec.id in ('vw-incremental', 'pakistan-incremental'):
             request.applymarker(pytest.mark.xfail(
@@ -1088,6 +1098,13 @@ class TestD8FinalizeStats:
                 reason="residual incremental trajectory divergence (gid "
                        "label swap fixed 2026-07-05; sequential-parity "
                        "work)"))
+        if request.node.callspec.id == 'FLI-cold_start':
+            request.applymarker(pytest.mark.xfail(
+                strict=False,
+                reason="prod blob Q12 unseeded cold-start PCA (#2661) vs "
+                       "the collapse's legacy-kmeans cold tick — zero "
+                       "shared selections; battery certifies FLI against "
+                       "pinned-cold-start recordings instead"))
         clojure_repness = clojure_blob.get('repness', {})
         if not clojure_repness:
             pytest.skip("No repness in Clojure blob")
@@ -1179,11 +1196,11 @@ class TestD10RepCommentSelection:
 
 
 # ----------------------------------------------------------------------------
-# D10 — Synthetic unit tests for the new selection helpers
+# D10 — Public-fixture unit tests for the new selection helpers
 # ----------------------------------------------------------------------------
 #
 # Pin the Clojure-parity semantics of `passes_by_test`, `beats_best_by_test`,
-# `beats_best_agr`, and `select_rep_comments_df`. Synthetic 1-group fixtures
+# `beats_best_agr`, and `select_rep_comments_df`. Public-fixture 1-group fixtures
 # only — no real datasets, no Clojure blob dependency.
 #
 # References:
@@ -1949,35 +1966,18 @@ class TestD12CommentPriorities:
     """
 
     def test_comment_priorities_exist(self, request, conv, clojure_blob, dataset_name):
-        """Python should produce comment-priorities matching Clojure.
+        """Python produces REAL (varied) comment-priorities; blob coverage holds.
 
-        Per D12.6: Clojure's `(if 0 ...)` truthiness quirk means every tid
-        takes the meta branch, so Clojure cold_start priorities are all
-        META_PRIORITY^2 = 49.0 for vw/biodiversity. Python now mirrors this
-        bug
-        (priority_metric returns META_PRIORITY**2 unconditionally), so both
-        sides should yield identical all-constant 49.0. Spearman is not
-        meaningful when both sides have zero variance — we instead verify
-        the constant-value parity directly.
+        History: until 2026-07-22 this asserted the all-49 signature on both
+        sides (Python mirrored Clojure's #1961 truthy-0 bug, #2571). Clojure
+        HEAD is fixed (#2611) and Python is un-mirrored, so the pins here are
+        now: (a) priorities exist and cover the blob's tids; (b) Python's
+        values are NOT the all-constant bug signature. VALUE parity vs
+        Clojure is no longer checkable against these stale pre-#2611 blobs —
+        it is validated by the H-B replay battery against Clojure HEAD
+        (scripts/certify.py); see also the xfail in
+        test_legacy_clojure_regression.py::test_comment_priorities.
         """
-        # Per-variant xfail (g5, refined 2026-07-05): known-bad only where
-        # the Clojure incremental blob has VARIED priorities (no truthy-0
-        # bug there), so Python's all-49 mirror can't match. FLI and bg2050
-        # incremental blobs carry the all-49 signature and DO match — they
-        # gate. All cold_start variants gate. Once the Clojure bug (#2571)
-        # is fixed upstream, drop the Python mirror and this xfail.
-        _varied_priority_incrementals = (
-            'vw-incremental', 'biodiversity-incremental',
-            'bg2018-incremental', 'engage-incremental',
-            'pakistan-incremental')
-        if request.node.callspec.id in _varied_priority_incrementals:
-            request.applymarker(pytest.mark.xfail(
-                raises=AssertionError,
-                strict=False,
-                reason="D12.6: this Clojure incremental blob has varied "
-                       "priorities (no truthy-0 bug there); Python's "
-                       "all-49 mirror cannot match. See issue #2571."))
-
         clj_priorities = clojure_blob.get('comment-priorities', {})
         check.greater(len(clj_priorities), 0,
                        f"Clojure has {len(clj_priorities)} comment priorities")
@@ -1998,32 +1998,17 @@ class TestD12CommentPriorities:
         check.greater(len(common_tids), 0, "Should have common priority tids")
 
         tids_sorted = sorted(common_tids)
-        clj_vals = [clj_p[t] for t in tids_sorted]
         py_vals = [py_p[t] for t in tids_sorted]
-        clj_unique = set(clj_vals)
         py_unique = set(py_vals)
-        print(f"[{dataset_name}] clj_vals sample: {clj_vals[:5]}, "
-              f"min={min(clj_vals)}, max={max(clj_vals)}, "
-              f"unique={len(clj_unique)}")
         print(f"[{dataset_name}] py_vals  sample: {py_vals[:5]}, "
               f"min={min(py_vals)}, max={max(py_vals)}, "
               f"unique={len(py_unique)}")
 
-        # D12.6 Clojure-parity-bug mirror: both sides should return
-        # META_PRIORITY**2 = 49.0 for every tid.
-        META_PRIORITY_SQ = META_PRIORITY ** 2
-        check.equal(len(clj_unique), 1,
-                    f"Clojure priorities should be all-constant (bug); got {len(clj_unique)} unique")
-        check.equal(len(py_unique), 1,
-                    f"Python priorities should be all-constant (bug mirror); got {len(py_unique)} unique")
-        if len(clj_unique) == 1:
-            (clj_const,) = clj_unique
-            check.almost_equal(clj_const, META_PRIORITY_SQ, abs=1e-9,
-                               msg=f"Clojure constant priority should be META_PRIORITY**2={META_PRIORITY_SQ}")
-        if len(py_unique) == 1:
-            (py_const,) = py_unique
-            check.almost_equal(py_const, META_PRIORITY_SQ, abs=1e-9,
-                               msg=f"Python constant priority should be META_PRIORITY**2={META_PRIORITY_SQ}")
+        # Un-mirrored formula: real data always yields varied priorities.
+        # All-constant output would mean the #2571 mirror crept back in.
+        check.greater(len(py_unique), 1,
+                      "Python priorities must be varied (real formula), not "
+                      "the all-constant #2571 mirror signature")
 
 
 class TestD12PriorityExtremityAlignment:
@@ -2069,6 +2054,60 @@ class TestD12PriorityExtremityAlignment:
                    for r in caplog.records), \
             "expected an ERROR log naming the priorities/extremity desync"
 
+    def test_extremity_sign_reaches_priority_metric(self, monkeypatch):
+        """End-to-end sign check through `_compute_comment_priorities`.
+
+        `priority_metric` currently short-circuits to `META_PRIORITY**2` (the
+        #2571 Clojure-bug mirror), so we can't assert on its RETURN value. But
+        the extremity `E` it is CALLED with is exactly what the pca sign bug
+        corrupts. We spy on that argument (independent of the mirror) and pin
+        it to a hand-derived value.
+
+        Setup: two comments, one near-unanimous AGREE (center +1), one
+        near-unanimous DISAGREE (center -1), with pc1 = 1 / pc2 = 0 so
+        extremity == |coef|. Correct convention translation ⇒ agree extremity 0,
+        disagree extremity 2·sqrt(2). The pre-fix untranslated `-1` inverts them.
+
+        `group_clusters` is left empty on purpose: A/P/S collapse to 0 for every
+        tid, so the only quantity varying between the two calls is `E` — no
+        confound from vote aggregation.
+        """
+        import polismath.conversation.conversation as convmod
+
+        conv = Conversation(conversation_id='ztest-extremity-sign')
+        conv.rating_mat = pd.DataFrame(
+            [[1.0, -1.0], [1.0, -1.0], [1.0, -1.0]],   # 3 ptpts; col 10 agree, col 11 disagree
+            index=[0, 1, 2], columns=[10, 11],
+        )
+        conv.raw_rating_mat = conv.rating_mat.copy()
+        conv.pca = {
+            'center': np.array([1.0, -1.0]),
+            'comps': np.array([[1.0, 1.0], [0.0, 0.0]]),
+        }
+        conv.group_clusters = []
+        conv.meta_tids = set()
+
+        captured_E = []
+        real_priority_metric = convmod.priority_metric
+
+        def spy(is_meta, A, P, S, E):
+            captured_E.append(E)
+            return real_priority_metric(is_meta, A, P, S, E)
+
+        monkeypatch.setattr(convmod, 'priority_metric', spy)
+        conv._compute_comment_priorities()
+
+        # Call order follows rating_mat.columns == [10 (agree), 11 (disagree)].
+        assert len(captured_E) == 2, f"expected one priority_metric call per tid, got {captured_E}"
+        e_agree, e_disagree = captured_E
+        scale = np.sqrt(2)
+        assert e_agree == pytest.approx(0.0, abs=1e-9), \
+            "unanimous-agree comment must reach priority_metric with extremity ~0"
+        assert e_disagree == pytest.approx(2.0 * scale), \
+            "unanimous-disagree comment must reach priority_metric with maximal extremity"
+        assert e_agree < e_disagree, \
+            "extremity sign inverted: agree must be less extreme than disagree"
+
 
 class TestD12PCAProjectComments:
     """`pca_project_cmnts` and `compute_comment_extremity` — Clojure parity."""
@@ -2082,7 +2121,18 @@ class TestD12PCAProjectComments:
         assert proj.shape == (4, 2)
 
     def test_pca_project_cmnts_formula(self):
-        """For comment i: proj[i] = -sqrt(n_cmnts) * (1 + center[i]) * [pc1[i], pc2[i]]."""
+        """Clojure-parity: proj[i] = sqrt(n_cmnts) * (AGREE - center[i]) * [pc1[i], pc2[i]].
+
+        Clojure (`pca-project-cmnts`, pca.clj:167-178) projects a unit vote
+        of `-1` because Clojure stays in raw-Postgres convention where AGREE = -1.
+        Delphi fits PCA in its OWN convention (AGREE = +1, via the
+        `postgres_vote_to_delphi` ingress flip), so the faithful port projects
+        the Delphi `AGREE` constant, not the literal -1.
+
+        Expected is derived from the `AGREE` constant (NOT copied from the
+        implementation), so this catches a convention/sign regression instead of
+        rubber-stamping whatever the code currently computes.
+        """
         center = np.array([0.1, 0.2, 0.3, 0.4])
         comps = np.array([[1.0, 0.5, -0.5, 0.0],
                           [0.0, 0.5, 0.5, 1.0]])
@@ -2090,7 +2140,7 @@ class TestD12PCAProjectComments:
         n_cmnts = 4
         scale = np.sqrt(n_cmnts)
         for i in range(n_cmnts):
-            expected = -scale * (1 + center[i]) * comps[:, i]
+            expected = scale * (AGREE - center[i]) * comps[:, i]
             assert np.allclose(proj[i], expected), \
                 f"proj[{i}] = {proj[i]} vs expected {expected}"
 
@@ -2113,6 +2163,33 @@ class TestD12PCAProjectComments:
         """Empty input → empty output."""
         ext = compute_comment_extremity(np.zeros((0, 2)))
         assert ext.shape == (0,)
+
+    def test_extremity_sign_agree_low_disagree_high(self):
+        """Semantic guard on the convention translation (not the formula itself).
+
+        In Delphi convention (AGREE = +1) the PCA center of a near-unanimous
+        AGREE comment → +1, and of a near-unanimous DISAGREE comment → -1.
+        Clojure-parity extremity is the L2 norm of `(AGREE - center) * pc`:
+
+            unanimous AGREE    (center → +1) ⇒ |AGREE - center| → 0  ⇒ extremity → 0
+            unanimous DISAGREE (center → -1) ⇒ |AGREE - center| → 2  ⇒ extremity → max
+
+        The pre-fix code used the untranslated Clojure literal `-1`
+        (`-scale*(1+center)`), which INVERTS this — a comment everyone agrees on
+        would read as maximally extreme. This test pins the direction and would
+        fail (agree > disagree) under that bug.
+        """
+        # comps: pc1 = 1 for both comments, pc2 = 0 ⇒ extremity == |coef|.
+        center = np.array([1.0, -1.0])            # col 0 = agree pole, col 1 = disagree pole
+        comps = np.array([[1.0, 1.0],
+                          [0.0, 0.0]])
+        ext = compute_comment_extremity(pca_project_cmnts(center, comps))
+        scale = np.sqrt(2)
+        assert ext[0] == pytest.approx(0.0, abs=1e-9), \
+            "unanimous-agree comment must have extremity ~0"
+        assert ext[1] == pytest.approx(2.0 * scale), \
+            "unanimous-disagree comment must have maximal extremity"
+        assert ext[0] < ext[1], "agree must be LESS extreme than disagree (sign check)"
 
 
 class TestD12PriorityMetrics:
@@ -2137,10 +2214,6 @@ class TestD12PriorityMetrics:
         assert priority_metric(True, 5, 2, 10, 1.5) == META_PRIORITY ** 2
         assert priority_metric(True, 0, 0, 0, 0) == META_PRIORITY ** 2
 
-    @pytest.mark.xfail(reason="Clojure parity bug mirror (D12.6): priority_metric always "
-                              "returns META_PRIORITY**2 until upstream Clojure bug resolves. "
-                              "Tests pin the semantically-correct formula and will pass again "
-                              "when we revert the mirror.")
     def test_priority_metric_non_meta_squared(self):
         """Non-meta: return = (importance * (1 + 8*2^(-S/5)))^2."""
         # A=20, P=3, S=20, E=0 — ref from conversation.clj:337
@@ -2248,9 +2321,9 @@ class TestD15ModerationHandling:
                 )
 
 
-class TestD15SyntheticModeration:
+class TestD15PublicFixtureModeration:
     """
-    Synthetic tests for D15 moderation handling.
+    Public-fixture tests for D15 moderation handling.
 
     Clojure zeros out moderated columns (named_matrix.clj:214-230).
     Python must match: _apply_moderation() zeros columns, not removes them.
@@ -2269,7 +2342,7 @@ class TestD15SyntheticModeration:
         }
         votes_df = pd.DataFrame(data, index=[0, 1, 2, 3, 4])
 
-        conv = Conversation("synthetic_d15")
+        conv = Conversation("public_fixture_d15")
         conv.raw_rating_mat = votes_df.copy()
         conv.rating_mat = votes_df.copy()
         conv.participant_count, conv.comment_count = votes_df.shape
@@ -2333,7 +2406,7 @@ class TestD15SyntheticModeration:
     def test_user_vote_counts_uses_raw_rating_mat(self):
         """user-vote-counts must reflect actual votes, not the post-D15 zeros.
 
-        Synthetic conv has pid 3 with raw NaN on tid 0 (didn't vote). After
+        Public-fixture conv has pid 3 with raw NaN on tid 0 (didn't vote). After
         moderating tid 0, the OLD bug (reading from rating_mat) counts the
         zeroed cell as a vote → pid 3 inflates from 3 to 4. The fix routes
         through raw_rating_mat to match Clojure (conversation.clj:220-228).
@@ -2384,15 +2457,14 @@ class TestD15SyntheticModeration:
             f"n_votes must count raw votes only; got {conv.vote_stats['n_votes']}, expected 18"
         )
 
-    def test_vote_counts_exclude_moderated_out_participants(self):
-        """Moderated-out *participants* (mod_out_ptpts) must NOT appear in vote stats.
+    def test_banned_participants_are_ingested_but_inert(self):
+        """mod_out_ptpts is ingested but NEVER applied to the matrix.
 
-        D15 fixed moderated comment *columns* (zeroed, not removed). Polis also
-        supports moderated-out *participants* via `mod_out_ptpts`, which
-        `_apply_moderation` drops from `rating_mat.index`. The raw_rating_mat
-        routing for vote counting must NOT leak these participants — otherwise
-        excluded users' votes would still show up in `user-vote-counts`,
-        `votes-base`, and `_compute_vote_stats`.
+        Participant bans are not a Polis feature (mode collapse 2026-07-27,
+        POST_CUTOVER_IMPROVEMENTS.md item 1 dropped): no engine has ever
+        honored them — the Clojure worker's ingest path has no
+        participants.mod filter (CLOJURE_QUIRKS Q1). `_apply_moderation`
+        must keep banned rows in `rating_mat`.
         """
         import pandas as pd
 
@@ -2404,37 +2476,38 @@ class TestD15SyntheticModeration:
             3: [np.nan, 0.0, 1.0, 1.0, -1.0],
         }
         votes_df = pd.DataFrame(data, index=[0, 1, 2, 3, 4])
-        conv = Conversation("synthetic_d15_mod_ptpts")
+        conv = Conversation("public_fixture_d15_mod_ptpts")
         conv.raw_rating_mat = votes_df.copy()
         conv.rating_mat = votes_df.copy()
         conv.participant_count, conv.comment_count = votes_df.shape
         conv.mod_out_ptpts = {3}  # ban pid 3
         conv._apply_moderation()
 
-        # rating_mat should have dropped pid 3
-        assert 3 not in conv.rating_mat.index, "_apply_moderation should drop mod_out_ptpts"
+        # rating_mat KEEPS pid 3 — the ban set is stored but never applied.
+        assert 3 in conv.rating_mat.index, "bans must be inert (Q1: never applied)"
+        assert conv.mod_out_ptpts == {3}, "the set itself is still ingested"
 
-        # user-vote-counts must not include pid 3
+        # Banned pid 3's votes stay in every downstream stat — exactly like
+        # the Clojure worker (Q1: the ban never reaches the math).
         counts = conv._compute_user_vote_counts()
-        assert 3 not in counts, (
-            f"moderated-out pid 3 leaked into user-vote-counts: {sorted(counts.keys())}"
+        assert 3 in counts, (
+            f"banned pid 3 must still be counted (Q1): {sorted(counts.keys())}"
         )
 
-        # votes-base counts must reflect 4 participants (0,1,2,4), not 5.
-        # tid 1 (not moderated): pid 0=-1 (D), pid 1=1 (A), pid 2=0 (pass),
-        #                        pid 3 dropped, pid 4=-1 (D)  → A=1, D=2, S=4
+        # votes-base counts reflect ALL 5 participants.
+        # tid 1: pid 0=-1 (D), pid 1=1 (A), pid 2=0 (pass), pid 3=1 (A),
+        #        pid 4=-1 (D)  → A=2, D=2, S=5
         vb = conv._compute_votes_base()
-        assert vb[1] == {'A': 1, 'D': 2, 'S': 4}, (
-            f"tid 1 votes-base must exclude moderated-out pid 3; "
-            f"got {vb[1]}, expected {{A:1, D:2, S:4}}"
+        assert vb[1] == {'A': 2, 'D': 2, 'S': 5}, (
+            f"tid 1 votes-base must include banned pid 3 (Q1); got {vb[1]}"
         )
 
-        # vote_stats global n_votes: only count over the 4 remaining participants.
-        # pid 0: 3, pid 1: 4, pid 2: 4, pid 4: 4 → total 15 (not 18).
+        # vote_stats global n_votes counts all 5 participants:
+        # pid 0: 3, pid 1: 4, pid 2: 4, pid 3: 3, pid 4: 4 → total 18.
         conv._compute_vote_stats()
-        assert conv.vote_stats['n_votes'] == 15, (
-            f"n_votes must exclude moderated-out participants: got "
-            f"{conv.vote_stats['n_votes']}, expected 15"
+        assert conv.vote_stats['n_votes'] == 18, (
+            f"n_votes must include banned participants (Q1): got "
+            f"{conv.vote_stats['n_votes']}, expected 18"
         )
 
     def test_to_dict_and_to_dynamo_dict_serialize_user_vote_counts_and_votes_base(self):
@@ -2472,7 +2545,7 @@ class TestD15SyntheticModeration:
         try:
             blob = conv.to_dict()
         except Exception as e:  # pragma: no cover
-            pytest.fail(f"to_dict() raised on synthetic conv: {e!r}")
+            pytest.fail(f"to_dict() raised on public-fixture conv: {e!r}")
 
         assert 'user-vote-counts' in blob, "to_dict must produce 'user-vote-counts' (hyphen) key"
         assert 'votes-base' in blob, "to_dict must produce 'votes-base' (hyphen) key"
@@ -2494,15 +2567,20 @@ class TestD15SyntheticModeration:
                 f"to_dict votes-base tid must be int (numpy-safe), got {type(tid)}")
             assert set(entry.keys()) == {'A', 'D', 'S'}, (
                 f"to_dict votes-base entry must have Clojure-style A/D/S keys, got {set(entry.keys())}")
+            # Since the mode collapse, values are Clojure-exact per-base-
+            # cluster bucket VECTORS (agg-bucket-votes-for-tid parity),
+            # not scalar totals.
             for k, v in entry.items():
-                assert isinstance(v, int) and not isinstance(v, bool), (
-                    f"to_dict votes-base {k} must be int, got {type(v)}")
+                assert isinstance(v, list), (
+                    f"to_dict votes-base {k} must be a bucket list, got {type(v)}")
+                assert all(isinstance(x, int) and not isinstance(x, bool) for x in v), (
+                    f"to_dict votes-base {k} bucket values must be ints")
 
         # ---- to_dynamo_dict ----
         try:
             dyn = conv.to_dynamo_dict()
         except Exception as e:  # pragma: no cover
-            pytest.fail(f"to_dynamo_dict() raised on synthetic conv: {e!r}")
+            pytest.fail(f"to_dynamo_dict() raised on public-fixture conv: {e!r}")
 
         assert 'user_vote_counts' in dyn, "to_dynamo_dict must produce 'user_vote_counts' (underscore)"
         assert 'votes_base' in dyn, "to_dynamo_dict must produce 'votes_base' (underscore)"
@@ -2542,18 +2620,22 @@ class TestD15SyntheticModeration:
 
         # And A/D/S vs agree/disagree/total must agree per-tid.
         for tid in vb:
-            assert vb[tid]['A'] == dyn_vb[tid]['agree']
-            assert vb[tid]['D'] == dyn_vb[tid]['disagree']
-            assert vb[tid]['S'] == dyn_vb[tid]['total']
+            # to_dict carries per-base-cluster bucket vectors whose domain
+            # is CLUSTERED participants only (FP-81fda13ef6); this bare conv
+            # has no base clusters, so buckets are empty while the dynamo int
+            # totals still count every vote. Bucket sum can never exceed it.
+            assert sum(vb[tid]['A']) <= dyn_vb[tid]['agree']
+            assert sum(vb[tid]['D']) <= dyn_vb[tid]['disagree']
+            assert sum(vb[tid]['S']) <= dyn_vb[tid]['total']
 
 
 # ============================================================================
-# Synthetic edge-case tests (not dataset-dependent)
+# Public-fixture edge-case tests (not dataset-dependent)
 # ============================================================================
 
-class TestSyntheticEdgeCases:
+class TestPublicFixtureEdgeCases:
     """
-    Synthetic tests with made-up data to verify specific formulas
+    Public-fixture tests with made-up data to verify specific formulas
     independently of any real dataset. These document intent clearly
     and prevent regressions.
     """
@@ -2732,6 +2814,11 @@ class TestD11D12Serialization:
         while the consensus + priorities fields still flow through end-to-end.
         """
         conv = Conversation(conversation_id='ztest-serialization')
+        # One vote: a conversation with an empty rating matrix now serializes
+        # the committed empty-output contract, which is not what this test is
+        # about. A single cell keeps the rest of to_dict cheap.
+        import pandas as pd
+        conv.raw_rating_mat = pd.DataFrame({0: [1]}, index=[0])
         conv.repness = {
             'comment_ids': [],
             'group_repness': {},
@@ -2775,13 +2862,14 @@ class TestD11D12Serialization:
 
         result = conv.to_dict()
 
-        # The to_dict key uses underscore form (see line ~1706); no rename
-        # happens on the way out, unlike most Clojure-format fields.
-        assert 'comment_priorities' in result, (
-            "to_dict() must emit 'comment_priorities' when "
+        # The legacy engine's key, which the server's next-statement draw
+        # reads; one spelling only (no underscore twin).
+        assert 'comment-priorities' in result, (
+            "to_dict() must emit 'comment-priorities' when "
             "self.comment_priorities is populated; keys = "
             + repr(sorted(result.keys())))
-        assert result['comment_priorities'] == priorities
+        assert 'comment_priorities' not in result
+        assert result['comment-priorities'] == priorities
 
     def test_to_dynamo_dict_surfaces_both(self):
         """``to_dynamo_dict()`` must surface BOTH consensus comments (D11) and

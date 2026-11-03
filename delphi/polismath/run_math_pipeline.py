@@ -11,15 +11,38 @@ import argparse
 import json
 import decimal
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Optional
 
-from polismath.utils.general import postgres_vote_to_delphi
+from polismath.types import (
+    CommentRecord,
+    CommentsPayload,
+    ModerationPayload,
+    VoteRecord,
+    VotesPayload,
+)
+from polismath.utils.vote_convention import (
+    CONVENTION_JOIN_SQL,
+    ROW_AGREE_KEY,
+    RowConventionSource,
+    StorageConvention,
+    database_row_fetcher,
+    load_semantic_votes,
+)
+
+if TYPE_CHECKING:  # psycopg2 stays a lazy, in-function import at runtime
+    from psycopg2.extensions import connection as PgConnection
+
+#: Exit code for "the math was computed but its DynamoDB export failed".
+#: run_delphi.py (MATH_EXPORT_FAILED_EXIT_CODE) records it as a failed stage and
+#: still runs the later stages, as it did when this case exited 0.
+MATH_EXPORT_FAILED_EXIT_CODE = 4
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def prepare_for_json(obj):
+def prepare_for_json(obj: Any) -> Any:
     import numpy as np
 
     if isinstance(obj, decimal.Decimal):
@@ -42,7 +65,7 @@ def prepare_for_json(obj):
         return obj
 
 
-def connect_to_db():
+def connect_to_db() -> Optional["PgConnection"]:
     """Connect to PostgreSQL database using environment variables or defaults."""
     import psycopg2
     import urllib.parse
@@ -76,13 +99,36 @@ def connect_to_db():
         return None
 
 
-def fetch_votes(conn, conversation_id):
+def database_convention(conn: "PgConnection") -> StorageConvention:
+    """This database's storage convention (its ``vote_convention`` row, or
+    version 0 at the code fallback when it has none), read once per job."""
+
+    def query(sql: str) -> list:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql)
+            names = [d[0] for d in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+
+    return RowConventionSource(database_row_fetcher(query)).current()
+
+
+def fetch_votes(
+    conn: "PgConnection",
+    conversation_id: int,
+    storage_agree_value: Optional[int] = None,
+) -> VotesPayload:
     """
     Fetch votes for a specific conversation from PostgreSQL.
     Returns a dictionary containing votes in the format expected by Conversation.
 
-    Vote signs are flipped at this PostgreSQL boundary:
-    - PostgreSQL stores: AGREE=-1, DISAGREE=+1
+    Vote signs are converted at this PostgreSQL boundary, through the DECLARED
+    storage convention (``storage_agree_value``, an admissible sign; omitted, the
+    installed ConventionSource's — polismath.utils.vote_convention), never a
+    literal. A NULL vote raises (``float(None)``), as before the chokepoint:
+    - PostgreSQL stores: AGREE=storage_agree_value (today -1)
     - Delphi expects:    AGREE=+1, DISAGREE=-1
     """
     import time
@@ -103,7 +149,7 @@ def fetch_votes(conn, conversation_id):
         logger.error(f"Error fetching votes: {e}")
         cursor.close()
         return {"votes": []}
-    votes_list = []
+    raw_votes = []
     for vote in votes:
         if vote["timestamp"]:
             try:
@@ -112,20 +158,22 @@ def fetch_votes(conn, conversation_id):
                 created_time = None
         else:
             created_time = None
-        votes_list.append(
+        raw_votes.append(
             {
                 "pid": str(vote["voter_id"]),
                 "tid": str(vote["comment_id"]),
-                "vote": postgres_vote_to_delphi(
-                    float(vote["vote"])
-                ),  # Flip at boundary
+                "vote": float(vote["vote"]),
                 "created": created_time,
             }
         )
+    # Declared-convention conversion at the boundary (the one vote convention).
+    votes_list: list[VoteRecord] = load_semantic_votes(
+        raw_votes, storage_agree_value=storage_agree_value
+    )
     return {"votes": votes_list}
 
 
-def fetch_comments(conn, conversation_id):
+def fetch_comments(conn: "PgConnection", conversation_id: int) -> CommentsPayload:
     """
     Fetch comments for a specific conversation from PostgreSQL.
     Returns a dictionary containing comments in the format expected by Conversation.
@@ -148,7 +196,7 @@ def fetch_comments(conn, conversation_id):
         logger.error(f"Error fetching comments: {e}")
         cursor.close()
         return {'comments': []}
-    comments_list = []
+    comments_list: list[CommentRecord] = []
     for comment in comments:
         if comment['moderated'] == '-1':
             continue
@@ -167,7 +215,9 @@ def fetch_comments(conn, conversation_id):
         })
     return {'comments': comments_list}
 
-def fetch_moderation(conn, conversation_id):
+def fetch_moderation(
+    conn: "PgConnection", conversation_id: int
+) -> ModerationPayload:
     """
     Fetch moderation data for a specific conversation from PostgreSQL.
     Returns a dictionary containing moderation data in the format expected by Conversation.
@@ -221,11 +271,11 @@ def fetch_moderation(conn, conversation_id):
 import sys
 
 
-def memory_usage_mb(obj, seen=None):
+def memory_usage_mb(obj: Any, seen: Optional[set[int]] = None) -> float:
     return memory_usage(obj) / (1024 * 1024)
 
 
-def memory_usage(obj, seen=None):
+def memory_usage(obj: Any, seen: Optional[set[int]] = None) -> int:
     """Recursively calculate size of objects"""
     size = sys.getsizeof(obj)
     if seen is None:
@@ -250,7 +300,7 @@ def memory_usage(obj, seen=None):
     return size
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description='Run math pipeline for a Polis conversation')
     parser.add_argument('--zid', type=int, required=True, help='Conversation ID to process')
     parser.add_argument('--max-votes', type=int, default=None, 
@@ -288,6 +338,10 @@ def main():
         conv = conv.update_moderation(moderation, recompute=False)
         logger.info(f"[{time.time() - start_time:.2f}s] Moderation applied")
 
+        convention = database_convention(conn)
+        joined = convention.origin == "database"
+        logger.info(f"[{time.time() - start_time:.2f}s] Vote storage convention: {convention}")
+
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM votes WHERE zid = %s", (zid,))
         total_votes = cursor.fetchone()[0]
@@ -311,9 +365,13 @@ def main():
             logger.info(f"[{time.time() - start_time:.2f}s] Processing votes {offset+1} to {end_idx} of {total_votes}")
             
             cursor = conn.cursor()
-            batch_query = """
-            SELECT v.created, v.tid, v.pid, v.vote FROM votes v WHERE v.zid = %s ORDER BY v.created LIMIT %s OFFSET %s
-            """
+            # With a vote_convention row, each page reads it in the same
+            # statement as its votes, and each row is converted by its own.
+            batch_query = (
+                "SELECT v.created, v.tid, v.pid, v.vote"
+                + (", vc.agree_value FROM votes v " + CONVENTION_JOIN_SQL if joined else " FROM votes v")
+                + " WHERE v.zid = %s ORDER BY v.created LIMIT %s OFFSET %s"
+            )
             cursor.execute(batch_query, (zid, batch_size, offset))
             vote_batch = cursor.fetchall()
             cursor.close()
@@ -321,15 +379,25 @@ def main():
             db_fetch_time = time.time()
             logger.info(f"[{time.time() - start_time:.2f}s] Database fetch completed in {db_fetch_time - batch_start_time:.2f}s")
             
-            votes_list = []
+            raw_votes = []
             for vote in vote_batch:
                 created_time = int(float(vote[0]) * 1000) if vote[0] else None
-                votes_list.append({
+                row = {
                     'pid': str(vote[2]),
                     'tid': str(vote[1]),
                     'vote': float(vote[3]),
                     'created': created_time
-                })
+                }
+                if joined:
+                    row[ROW_AGREE_KEY] = vote[4]
+                raw_votes.append(row)
+            # votes.vote is the raw storage sign; the engine counts +1 as agree.
+            # Convert through the one vote convention. A NULL vote has already
+            # raised in float() above and fails the job, as before.
+            votes_list = load_semantic_votes(
+                raw_votes,
+                storage_agree_value=None if joined else convention.agree_value,
+            )
             
             transform_time = time.time()
             logger.info(f"[{time.time() - start_time:.2f}s] Data transformation completed in {transform_time - db_fetch_time:.2f}s")
@@ -390,11 +458,11 @@ def main():
             logger.info(f"[{time.time() - start_time:.2f}s] Initializing DynamoDB client...")
             from polismath.database.dynamodb import DynamoDBClient
 
-            # Use environment variables or sensible defaults for local/test
+            # Use explicit environment keys when supplied; otherwise use the SDK chain
             endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
             region_name = os.environ.get('AWS_REGION', 'us-east-1')
-            aws_access_key_id = os.environ.get('AWS_ACCESS_KEY_ID', 'dummy')
-            aws_secret_access_key = os.environ.get('AWS_SECRET_ACCESS_KEY', 'dummy')
+            aws_access_key_id = os.environ.get('AWS_ACCESS_KEY_ID')
+            aws_secret_access_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
             dynamodb_client = DynamoDBClient(
                 endpoint_url=endpoint_url,
                 region_name=region_name,
@@ -411,6 +479,12 @@ def main():
             import traceback
 
             traceback.print_exc()
+            success = False
+
+        if not success:
+            # The math was computed but not published. Say so in the exit code;
+            # run_delphi.py records it as a failed stage and carries on.
+            sys.exit(MATH_EXPORT_FAILED_EXIT_CODE)
 
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")

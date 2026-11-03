@@ -1,0 +1,158 @@
+{
+  "compared_fields": [
+    "asJSON_sha256",
+    "asJSON_bytes",
+    "gzip_sha256",
+    "gzip_bytes",
+    "keys_projection_sha256",
+    "tids",
+    "n",
+    "n_cmts",
+    "pca_center",
+    "comment_extremity",
+    "repness_keys",
+    "consensus_shape",
+    "mapping_sha256",
+    "bid_to_pid",
+    "pids_for_gid",
+    "mapping_is_error"
+  ],
+  "differences": {},
+  "math_tick": 1,
+  "profile": "real getPca + presentPca + participants.ts, in-process, one Node process",
+  "served": {
+    "python": {
+      "asJSON_bytes": 6476,
+      "asJSON_sha256": "8be0d0d8366017a6a432a5627bc4f12e8ed9067f0520c838e16d63810a1c529a",
+      "bid_to_pid": [
+        [
+          0
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          3
+        ]
+      ],
+      "comment_extremity": [
+        1.4280971859724134,
+        1.632993161855452,
+        1.4467439654036442,
+        1.4467439639839224
+      ],
+      "consensus_shape": {
+        "agree": 0,
+        "disagree": 0
+      },
+      "etag_math_tick": 1,
+      "gzip_bytes": 1756,
+      "gzip_sha256": "a7ef00bd57dbe30a9b4e1088e8caff27121f8825be47e3f60969b97d54732244",
+      "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+      "mapping_is_error": false,
+      "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+      "n": 6,
+      "n_cmts": 4,
+      "pca_center": [
+        0.3333333333333333,
+        0,
+        0,
+        0
+      ],
+      "pids_for_gid": {
+        "0": [
+          0,
+          2,
+          3,
+          5
+        ],
+        "1": [
+          1,
+          4
+        ]
+      },
+      "repness_keys": [
+        "0",
+        "1"
+      ],
+      "tids": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "rustproto": {
+      "asJSON_bytes": 6476,
+      "asJSON_sha256": "8be0d0d8366017a6a432a5627bc4f12e8ed9067f0520c838e16d63810a1c529a",
+      "bid_to_pid": [
+        [
+          0
+        ],
+        [
+          1,
+          4
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          3
+        ]
+      ],
+      "comment_extremity": [
+        1.4280971859724134,
+        1.632993161855452,
+        1.4467439654036442,
+        1.4467439639839224
+      ],
+      "consensus_shape": {
+        "agree": 0,
+        "disagree": 0
+      },
+      "etag_math_tick": 1,
+      "gzip_bytes": 1756,
+      "gzip_sha256": "a7ef00bd57dbe30a9b4e1088e8caff27121f8825be47e3f60969b97d54732244",
+      "keys_projection_sha256": "02de433e7970e77c3569cd225d9e48b2944bdb217c561e1c275674eb126713b1",
+      "mapping_is_error": false,
+      "mapping_sha256": "9a6fbcea6bfcd81da7c209e594312ba9860280003a57dd122943ca009253dedd",
+      "n": 6,
+      "n_cmts": 4,
+      "pca_center": [
+        0.3333333333333333,
+        0,
+        0,
+        0
+      ],
+      "pids_for_gid": {
+        "0": [
+          0,
+          2,
+          3,
+          5
+        ],
+        "1": [
+          1,
+          4
+        ]
+      },
+      "repness_keys": [
+        "0",
+        "1"
+      ],
+      "tids": [
+        0,
+        1,
+        2,
+        3
+      ]
+    }
+  },
+  "zid": 1
+}

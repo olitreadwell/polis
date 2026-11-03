@@ -2,8 +2,6 @@
 
 "use strict";
 
-import akismetLib from "akismet";
-import AWS from "aws-sdk";
 import { Promise as BluebirdPromise } from "bluebird";
 import _ from "underscore";
 import { METRICS_IN_RAM } from "./utils/metered";
@@ -11,25 +9,13 @@ import { generateAndRegisterZinvite } from "./auth";
 import pg from "./db/pg-query";
 import Config from "./config";
 import { failJson } from "./utils/fail";
-import { fetchAndCacheLatestPcaData } from "./utils/pca";
 import { getPidsForGid } from "./utils/participants";
-import { fetchIndex, makeFileFetcher } from "./utils/file-fetcher";
+import { makeFileFetcher } from "./utils/file-fetcher";
 import { browserSupportsPushState } from "./server-helpers";
-import {
-  DetectLanguageResult,
-  UserType,
-  ExpressRequest,
-  ExpressResponse,
-} from "./d";
-import { detectLanguage } from "./comment";
+import { UserType, ExpressRequest, ExpressResponse } from "./d";
 import logger from "./utils/logger";
-import {
-  emailTeam,
-  sendMultipleTextEmails,
-  sendTextEmail,
-} from "./email/senders";
+import { sendTextEmail } from "./email/senders";
 
-AWS.config.update({ region: Config.awsRegion });
 const devMode = Config.isDevMode;
 
 if (devMode) {
@@ -42,22 +28,7 @@ BluebirdPromise.onPossiblyUnhandledRejection(function (err: any) {
   // throw err; // not throwing since we're printing stack traces anyway
 });
 
-const adminEmails = Config.adminEmails ? JSON.parse(Config.adminEmails) : [];
-
 const polisFromAddress = Config.polisFromAddress;
-
-const serverUrl = Config.getServerUrl(); // typically https://pol.is or http://localhost:5000
-
-const akismet = akismetLib.client({
-  blog: serverUrl,
-  apiKey: Config.akismetAntispamApiKey,
-});
-
-akismet.verifyKey(function (err: any, verified: any) {
-  if (verified) {
-    logger.debug("Akismet: API key successfully verified.");
-  }
-});
 
 function haltOnTimeout(req: { timedout: any }, res: any, next: () => void) {
   if (req.timedout) {
@@ -68,51 +39,7 @@ function haltOnTimeout(req: { timedout: any }, res: any, next: () => void) {
 }
 
 function initializePolisHelpers() {
-  if (Config.backfillCommentLangDetection) {
-    pg.queryP(
-      "select tid, txt, zid from comments where lang is null;",
-      []
-    ).then((comments: string | any[]) => {
-      let i = 0;
-      function doNext() {
-        if (i < comments.length) {
-          const c = comments[i];
-          i += 1;
-          detectLanguage(c.txt).then((x: DetectLanguageResult[]) => {
-            const firstResult = x[0];
-            logger.debug("backfill " + firstResult.language + "\t\t" + c.txt);
-            pg.queryP(
-              "update comments set lang = ($1), lang_confidence = ($2) where zid = ($3) and tid = ($4)",
-              [firstResult.language, firstResult.confidence, c.zid, c.tid]
-            ).then(() => {
-              doNext();
-            });
-          });
-        }
-      }
-      doNext();
-    });
-  }
-
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  //
-  //             BEGIN ROUTES
-  //
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-  ////////////////////////////////////////////
-
-  // don't start immediately, let other things load first.
-  // setTimeout(fetchAndCacheLatestPcaData, 5000);
-  fetchAndCacheLatestPcaData; // TODO_DELETE
+  // TODO_DELETE
 
   function redirectIfHasZidButNoConversationId(
     req: { body: { zid: number; conversation_id: string }; headers?: any },
@@ -136,141 +63,7 @@ function initializePolisHelpers() {
     return next();
   }
 
-  function doAddDataExportTask(
-    math_env: string | undefined,
-    email: string,
-    zid: number,
-    atDate: number,
-    format: string,
-    task_bucket: number
-  ) {
-    return pg.queryP(
-      "insert into worker_tasks (math_env, task_data, task_type, task_bucket) values ($1, $2, 'generate_export_data', $3);",
-      [
-        math_env,
-        {
-          email: email,
-          zid: zid,
-          "at-date": atDate,
-          format: format,
-        },
-        task_bucket, // TODO hash the params to get a consistent number?
-      ]
-    );
-  }
-  if (
-    Config.runPeriodicExportTests &&
-    !devMode &&
-    Config.mathEnv === "preprod"
-  ) {
-    const runExportTest = () => {
-      const math_env = "prod";
-      const email = Config.adminEmailDataExportTest;
-      const zid = 12480;
-      const atDate = Date.now();
-      const format = "csv";
-      const task_bucket = Math.abs((Math.random() * 999999999999) >> 0);
-      doAddDataExportTask(
-        math_env,
-        email,
-        zid,
-        atDate,
-        format,
-        task_bucket
-      ).then(() => {
-        setTimeout(() => {
-          pg.queryP(
-            "select * from worker_tasks where task_type = 'generate_export_data' and task_bucket = ($1);",
-            [task_bucket]
-          ).then((rows: string | any[]) => {
-            const ok = rows && rows.length;
-            let newOk;
-            if (ok) {
-              newOk = rows[0].finished_time > 0;
-            }
-            if (ok && newOk) {
-              logger.info("runExportTest success");
-            } else {
-              logger.error("runExportTest failed");
-              emailBadProblemTime("Math export didn't finish.");
-            }
-          });
-        }, 10 * 60 * 1000); // wait 10 minutes before verifying
-      });
-    };
-    setInterval(runExportTest, 6 * 60 * 60 * 1000); // every 6 hours
-  }
-
   const getServerNameWithProtocol = Config.getServerNameWithProtocol;
-
-  function handle_POST_metrics(
-    req: {
-      p: {
-        uid: null;
-        durs: any[];
-        clientTimestamp: any;
-        times: any[];
-        types: any[];
-      };
-    },
-    res: {
-      status: (arg0: number) => {
-        (): any;
-        new (): any;
-        json: { (arg0: {}): any; new (): any };
-      };
-      json: (arg0: {}) => void;
-    }
-  ) {
-    const enabled = false;
-    if (!enabled) {
-      return res.status(200).json({});
-    }
-
-    const uid = req.p.uid || null;
-    const durs = req.p.durs.map(function (dur: number | null) {
-      if (dur === -1) {
-        dur = null;
-      }
-      return dur;
-    });
-    const clientTimestamp = req.p.clientTimestamp;
-    const ages = req.p.times.map(function (t: number) {
-      return clientTimestamp - t;
-    });
-    const now = Date.now();
-    const timesInTermsOfServerTime = ages.map(function (a: number) {
-      return now - a;
-    });
-    const len = timesInTermsOfServerTime.length;
-    const entries = [];
-    for (let i = 0; i < len; i++) {
-      entries.push(
-        "(" +
-          [
-            uid || "null",
-            req.p.types[i],
-            durs[i],
-            undefined,
-            timesInTermsOfServerTime[i],
-          ].join(",") +
-          ")"
-      );
-    }
-
-    pg.queryP(
-      "insert into metrics (uid, type, dur, hashedPc, created) values " +
-        entries.join(",") +
-        ";",
-      []
-    )
-      .then(function () {
-        res.json({});
-      })
-      .catch(function (err: any) {
-        failJson(res, 500, "polis_err_metrics_post", err);
-      });
-  }
 
   function handle_GET_zinvites(
     req: { p: { zid: number; uid?: number } },
@@ -284,7 +77,8 @@ function initializePolisHelpers() {
       };
     }
   ) {
-    // if uid is not conversation owner, fail
+    // Only the conversation's owner may read its zinvites: the owner probe
+    // returns no rows for anyone else, so an empty result must be refused.
     pg.query_readOnly(
       "SELECT * FROM conversations WHERE zid = ($1) AND owner = ($2);",
       [req.p.zid, req.p.uid],
@@ -298,15 +92,17 @@ function initializePolisHelpers() {
           );
           return;
         }
-        if (!results || !results.rows) {
-          res.writeHead(404);
-          res.json({
-            status: 404,
-          });
+        if (!results || !results.rows || !results.rows.length) {
+          failJson(
+            res,
+            403,
+            "polis_err_fetching_zinvite_not_conversation_owner"
+          );
           return;
         }
+        // Return only the columns clients read; never the uuid column.
         pg.query_readOnly(
-          "SELECT * FROM zinvites WHERE zid = ($1);",
+          "SELECT zid, zinvite, created FROM zinvites WHERE zid = ($1);",
           [req.p.zid],
           function (err: any, results: { rows: any }) {
             if (err) {
@@ -349,13 +145,23 @@ function initializePolisHelpers() {
     pg.query(
       "SELECT * FROM conversations WHERE zid = ($1) AND owner = ($2);",
       [req.p.zid, req.p.uid],
-      function (err: any) {
+      function (err: any, results: { rows: any }) {
         if (err) {
           failJson(
             res,
             500,
             "polis_err_creating_zinvite_invalid_conversation_or_owner",
             err
+          );
+          return;
+        }
+        // Only the conversation's owner may create a zinvite: the owner probe
+        // returns no rows for anyone else, so an empty result must be refused.
+        if (!results || !results.rows || !results.rows.length) {
+          failJson(
+            res,
+            403,
+            "polis_err_creating_zinvite_not_conversation_owner"
           );
           return;
         }
@@ -373,31 +179,9 @@ function initializePolisHelpers() {
     );
   }
 
-  function emailFeatureRequest(message: string) {
-    const body = `Somebody clicked a dummy button!
-
-${message}`;
-
-    return sendMultipleTextEmails(
-      polisFromAddress,
-      adminEmails,
-      "Dummy button clicked!!!",
-      body
-    ).catch(function (err: any) {
-      logger.error("polis_err_failed_to_email_for_dummy_button", {
-        message,
-        err,
-      });
-    });
-  }
-
-  function emailBadProblemTime(message: string) {
-    const body = `Yo, there was a serious problem. Here's the message:
-
-${message}`;
-
-    return emailTeam("Polis Bad Problems!!!", body);
-  }
+  // Sentinel used to leave the verification chain without letting the
+  // success continuation run and write a second response.
+  const VERIFICATION_MISSING = "polis_err_verification_missing";
 
   function handle_GET_verification(
     req: { p: { e: any } },
@@ -410,7 +194,12 @@ ${message}`;
     pg.queryP("select * from einvites where einvite = ($1);", [einvite])
       .then(function (rows: string | any[]) {
         if (!rows.length) {
-          failJson(res, 500, "polis_err_verification_missing");
+          // Without this the chain continued: rows[0].email threw, the catch
+          // below sent a second response, and Express raised
+          // ERR_HTTP_HEADERS_SENT. Reject instead, so exactly one response is
+          // written and it is the same 500 polis_err_verification_missing the
+          // route already produced.
+          throw VERIFICATION_MISSING;
         }
         const email = rows[0].email;
         return pg
@@ -438,57 +227,18 @@ Email verified! You can close this tab or hit the back button.
         );
       })
       .catch(function (err: any) {
+        if (err === VERIFICATION_MISSING) {
+          failJson(res, 500, "polis_err_verification_missing");
+          return;
+        }
         failJson(res, 500, "polis_err_verification", err);
       });
-  }
-
-  function handle_GET_dummyButton(
-    req: { p: { button: string; uid: string } },
-    res: {
-      status: (arg0: number) => {
-        (): any;
-        new (): any;
-        end: { (): void; new (): any };
-      };
-    }
-  ) {
-    const message = req.p.button + " " + req.p.uid;
-    emailFeatureRequest(message);
-    res.status(200).end();
   }
 
   function handle_GET_perfStats(req: ExpressRequest, res: ExpressResponse) {
     res.json(METRICS_IN_RAM);
   }
 
-  function handle_GET_snapshot() {
-    if (true) {
-      throw new Error(
-        "TODO Needs to clone participants_extended and any other new tables as well."
-      );
-    }
-  }
-
-  function handle_POST_tutorial(
-    req: { p: { uid?: any; step: any } },
-    res: {
-      status: (arg0: number) => {
-        (): any;
-        new (): any;
-        json: { (arg0: {}): void; new (): any };
-      };
-    }
-  ) {
-    const uid = req.p.uid;
-    const step = req.p.step;
-    pg.queryP("update users set tut = ($1) where uid = ($2);", [step, uid])
-      .then(function () {
-        res.status(200).json({});
-      })
-      .catch(function (err: any) {
-        failJson(res, 500, "polis_err_saving_tutorial_state", err);
-      });
-  }
 
   function handle_GET_contexts(req: ExpressRequest, res: ExpressResponse) {
     pg.queryP_readOnly(
@@ -564,6 +314,13 @@ Email verified! You can close this tab or hit the back button.
           failJson(res, 500, "polis_err_get_email_db", err);
           return;
         }
+        // Same hazard as POST /api/v3/trashes: this callback runs outside any
+        // Express or promise boundary, so dereferencing a missing row here
+        // would surface as an uncaughtException and kill the web process.
+        if (!results?.rows?.length) {
+          failJson(res, 500, "polis_err_get_email_db");
+          return;
+        }
         const email = results.rows[0].email;
         const fullname = results.rows[0].hname;
 
@@ -601,56 +358,6 @@ Email verified! You can close this tab or hit the back button.
           });
       }
     );
-  }
-
-  function handle_POST_sendEmailExportReady(
-    req: {
-      p: {
-        webserver_pass: string | undefined;
-        webserver_username: string | undefined;
-        email: any;
-        conversation_id: string;
-        filename: any;
-      };
-    },
-    res: {
-      status: (arg0: number) => {
-        (): any;
-        new (): any;
-        json: { (arg0: {}): void; new (): any };
-      };
-    }
-  ) {
-    if (
-      req.p.webserver_pass !== Config.webserverPass ||
-      req.p.webserver_username !== Config.webserverUsername
-    ) {
-      return failJson(res, 403, "polis_err_sending_export_link_to_email_auth");
-    }
-
-    const serverUrl = Config.getServerUrl();
-    const email = req.p.email;
-    const subject =
-      "Polis data export for conversation pol.is/" + req.p.conversation_id;
-    const fromAddress = `Polis Team <${Config.adminEmailDataExport}>`;
-    const body = `Greetings
-
-You created a data export for conversation ${serverUrl}/${req.p.conversation_id} that has just completed. You can download the results for this conversation at the following url:
-
-${serverUrl}/api/v3/dataExport/results?filename=${req.p.filename}&conversation_id=${req.p.conversation_id}
-
-Please let us know if you have any questions about the data.
-
-Thanks for using Polis!
-`;
-
-    sendTextEmail(fromAddress, email, subject, body)
-      .then(function () {
-        res.status(200).json({});
-      })
-      .catch(function (err: any) {
-        failJson(res, 500, "polis_err_sending_export_link_to_email", err);
-      });
   }
 
   function getLocationsForParticipants(zid: number) {
@@ -695,47 +402,6 @@ Thanks for using Polis!
       });
   }
 
-  function handle_POST_contributors(
-    req: {
-      p: {
-        uid: null;
-        agreement_version: any;
-        name: any;
-        email: any;
-        github_id: any;
-        company_name: any;
-      };
-    },
-    res: { json: (arg0: {}) => void }
-  ) {
-    const uid = req.p.uid || null;
-    const agreement_version = req.p.agreement_version;
-    const name = req.p.name;
-    const email = req.p.email;
-    const github_id = req.p.github_id;
-    const company_name = req.p.company_name;
-
-    pg.queryP(
-      "insert into contributor_agreement_signatures (uid, agreement_version, github_id, name, email, company_name) " +
-        "values ($1, $2, $3, $4, $5, $6);",
-      [uid, agreement_version, github_id, name, email, company_name]
-    ).then(
-      () => {
-        emailTeam(
-          "contributer agreement signed",
-          [uid, agreement_version, github_id, name, email, company_name].join(
-            "\n"
-          )
-        );
-
-        res.json({});
-      },
-      (err: any) => {
-        failJson(res, 500, "polis_err_POST_contributors_misc", err);
-      }
-    );
-  }
-
   function handle_GET_testConnection(
     req: ExpressRequest,
     res: ExpressResponse
@@ -761,10 +427,6 @@ Thanks for using Polis!
   // serve up index.html in response to anything starting with a number
   const hostname: string = Config.staticFilesHost;
   const staticFilesAdminPort: number = Config.staticFilesAdminPort;
-
-  function fetchIndexWithoutPreloadData(req: any, res: any, port: any) {
-    return fetchIndex(req, res, {}, port);
-  }
 
   const fetchIndexForAdminPage = makeFileFetcher(
     hostname,
@@ -813,26 +475,19 @@ Thanks for using Polis!
     // app helpers
     fetchIndexForAdminPage,
     fetchIndexForReportPage,
-    fetchIndexWithoutPreloadData,
     haltOnTimeout,
     redirectIfHasZidButNoConversationId,
     // handlers
     handle_GET_conditionalIndexFetcher,
     handle_GET_contexts,
-    handle_GET_dummyButton,
     handle_GET_locations,
     handle_GET_perfStats,
-    handle_GET_snapshot,
     handle_GET_testConnection,
     handle_GET_testDatabase,
     handle_GET_verification,
     handle_GET_zinvites,
     handle_POST_contexts,
-    handle_POST_contributors,
-    handle_POST_metrics,
     handle_POST_sendCreatedLinkToEmail,
-    handle_POST_sendEmailExportReady,
-    handle_POST_tutorial,
     handle_POST_zinvites,
   };
   return returnObject;

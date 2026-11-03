@@ -1,10 +1,15 @@
+import {
+  assertImportTargetEmpty,
+  ImportTargetNotEmptyError,
+  IMPORT_TARGET_MESSAGE,
+} from "../utils/import-target";
 import _ from "underscore";
 
 import { ConversationInfo, PidReadyResult, RequestWithP } from "../d";
 import { failJson } from "../utils/fail";
 import { getNextComment } from "../nextComment";
 import { getPid } from "../user";
-import { isDuplicateKey, polisTypes } from "../utils/common";
+import { isDuplicateKey } from "../utils/common";
 import logger from "../utils/logger";
 import pg from "../db/pg-query";
 import SQL from "../db/sql";
@@ -16,23 +21,32 @@ import {
   finishArray,
   finishOne,
   safeTimestampToMillis,
-  updateConversationModifiedTime,
   updateLastInteractionTimeForConversation,
-  updateVoteCount,
 } from "../server-helpers";
 import Config from "../config";
 import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import { sqsClient } from "../utils/sqs";
+import {
+  checkImportDeclaration,
+  storageRowToWire,
+  VoteDeclarationError,
+  wireToSemantic,
+  wireToStorage,
+} from "../votes/convention";
 
 const sql_votes_latest_unique = SQL.sql_votes_latest_unique;
 
 const s3Config: any = {
   region: Config.AWS_REGION || "us-east-1",
   endpoint: Config.AWS_S3_ENDPOINT,
-  credentials: {
-    accessKeyId: Config.AWS_ACCESS_KEY_ID || "minioadmin",
-    secretAccessKey: Config.AWS_SECRET_ACCESS_KEY || "minioadmin",
-  },
+  ...(Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: Config.AWS_ACCESS_KEY_ID,
+          secretAccessKey: Config.AWS_SECRET_ACCESS_KEY,
+        },
+      }
+    : {}),
   forcePathStyle: true, // Required for MinIO
 };
 
@@ -60,16 +74,19 @@ async function doVotesPost(
   tid?: number,
   voteType?: number,
   weight?: number,
-  high_priority?: boolean
+  high_priority?: boolean,
 ): Promise<VoteResult> {
   const zid = conv?.zid;
+  // voteType is a wire value (range-checked by the route's parser); the row
+  // stores the storage convention's value.
+  const storageVote = wireToStorage(voteType);
   weight = weight || 0;
   const weight_x_32767 = Math.trunc(weight * 32767); // weight is stored as a SMALLINT, so convert from a [-1,1] float to [-32767,32767] int
 
   return new Promise((resolve, reject) => {
     const query =
       "INSERT INTO votes (pid, zid, tid, vote, weight_x_32767, high_priority, created) VALUES ($1, $2, $3, $4, $5, $6, default) RETURNING *;";
-    const params = [pid, zid, tid, voteType, weight_x_32767, high_priority];
+    const params = [pid, zid, tid, storageVote, weight_x_32767, high_priority];
 
     pg.query(query, params, function (err: any, result: { rows: any[] }) {
       if (err) {
@@ -98,11 +115,11 @@ async function votesPost(
   tid?: number,
   voteType?: number,
   weight?: number,
-  high_priority?: boolean
+  high_priority?: boolean,
 ): Promise<VoteResult> {
   const rows = (await pg.queryP_readOnly(
     "select * from conversations where zid = ($1);",
-    [zid]
+    [zid],
   )) as ConversationInfo[];
 
   if (!rows || !rows.length) {
@@ -153,16 +170,16 @@ async function votesGet(p: {
         if (err) {
           reject(err);
         } else {
-          resolve(results.rows);
+          resolve(results.rows.map((row) => storageRowToWire(row)));
         }
-      }
+      },
     );
   });
 }
 
 function handle_GET_votes_me(
   req: { p: { zid: number; uid?: number; pid: number } },
-  res: any
+  res: any,
 ) {
   getPid(req.p.zid, req.p.uid, function (err: any, pid: number) {
     if (err || pid < 0) {
@@ -180,8 +197,11 @@ function handle_GET_votes_me(
         for (let i = 0; i < docs.rows.length; i++) {
           docs.rows[i].weight = docs.rows[i].weight / 32767;
         }
-        finishArray(res, docs.rows);
-      }
+        finishArray(
+          res,
+          docs.rows.map((row) => storageRowToWire(row)),
+        );
+      },
     );
   });
 }
@@ -211,18 +231,14 @@ async function handle_POST_votes(req: RequestWithP, res: any) {
       tid,
       vote,
       weight,
-      high_priority
+      high_priority,
     );
 
     const voteRecord = voteResult.vote;
     const createdTimeMillis = safeTimestampToMillis(voteRecord.created);
 
-    // 2. Async updates (don't wait for them)
-    setTimeout(() => {
-      updateConversationModifiedTime(zid, createdTimeMillis);
-      updateLastInteractionTimeForConversation(zid, uid);
-      updateVoteCount(zid, pid);
-    }, 100);
+    // Notification state uses its own bounded lane; counts/activity are reads.
+    void updateLastInteractionTimeForConversation(zid, uid);
 
     // 3. Handle star if present
     if (!_.isUndefined(starred)) {
@@ -246,15 +262,16 @@ async function handle_POST_votes(req: RequestWithP, res: any) {
     // 6. Handle moderation options
     if (result.shouldMod) {
       result.modOptions = {};
-      if (req.p.vote === polisTypes.reactions.pull) {
+      const vote = wireToSemantic(req.p.vote, { onInvalid: "skip" });
+      if (vote === "agree") {
         result.modOptions.as_important = true;
         result.modOptions.as_factual = true;
         result.modOptions.as_feeling = true;
-      } else if (req.p.vote === polisTypes.reactions.push) {
+      } else if (vote === "disagree") {
         result.modOptions.as_notmyfeeling = true;
         result.modOptions.as_notgoodidea = true;
         result.modOptions.as_abusive = true;
-      } else if (req.p.vote === polisTypes.reactions.pass) {
+      } else if (vote === "pass") {
         result.modOptions.as_unsure = true;
         result.modOptions.as_spam = true;
         result.modOptions.as_abusive = true;
@@ -298,7 +315,7 @@ async function markJobAsFailedInDb(jobId: number, errorMessage: string) {
   } catch (dbErr) {
     logger.error(
       `CRITICAL: Failed to update job status for job ${jobId}`,
-      dbErr
+      dbErr,
     );
   }
 }
@@ -356,8 +373,14 @@ async function handle_POST_votes_bulk(
   req: RequestWithP,
   res: Response & { json: (data: any) => void }
 ): Promise<void> {
+  // Express 3.21.2 invokes a route callback and moves on
+  // (express/lib/router/index.js:164): it neither awaits the returned promise
+  // nor attaches a catch. Throwing here — outside the try below — produced no
+  // response at all, so the request hung until the client gave up and the
+  // rejection surfaced as an unhandled rejection on the process. Answer.
   if (!req.p.delphiEnabled) {
-    throw new Error("Unauthorized");
+    failJson(res, 403, "polis_err_votes_bulk_delphi_disabled");
+    return;
   }
   const { zid, uid } = req.p;
   const csv = req.body.csv;
@@ -367,7 +390,28 @@ async function handle_POST_votes_bulk(
     return;
   }
 
+  // The optional declared sign: a `# vote-convention:` first line in the CSV.
+  // Absent, the file is read in the export convention as it always has been.
+  // A malformed or mismatched declaration is refused here with its closed
+  // code; the worker checks the stored file's first line again before it reads
+  // a row. Other body fields (a `format` field among them) are ignored, as
+  // everywhere in the API.
   try {
+    checkImportDeclaration(
+      typeof csv === "string" ? csv.split("\n", 1)[0] : null
+    );
+  } catch (err) {
+    if (err instanceof VoteDeclarationError) {
+      failJson(res, 400, err.code, err);
+      return;
+    }
+    failJson(res, 500, "polis_err_post_votes_bulk", err);
+    return;
+  }
+
+  try {
+    await assertImportTargetEmpty(zid);
+
     // Validation Check: Ensure this conversation supports external mapping.
     // We check for the existence of AT LEAST ONE comment with a non-null original_id.
     // We do not fetch all IDs here; the Mapping Service handles the heavy lifting later.
@@ -404,6 +448,13 @@ async function handle_POST_votes_bulk(
       message: "Vote import started. This may take a few minutes.",
     });
   } catch (err: any) {
+    if (err instanceof ImportTargetNotEmptyError) {
+      failJson(res, 409, err.code, err, {
+        code: err.code,
+        message: IMPORT_TARGET_MESSAGE,
+      });
+      return;
+    }
     logger.error("polis_err_post_votes_bulk", err);
     failJson(res, 500, "polis_err_post_votes_bulk", err);
   }

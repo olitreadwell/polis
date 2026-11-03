@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+
 from polismath.utils.general import AGREE, DISAGREE
 
 
@@ -175,13 +176,21 @@ def two_prop_test_vectorized(succ_in: pd.Series, succ_out: pd.Series,
 
 
 def compute_group_comment_stats_df(votes_long: pd.DataFrame,
-                                   group_clusters: List[Dict[str, Any]]) -> pd.DataFrame:
+                                   group_clusters: List[Dict[str, Any]],
+                                   tid_order: Optional[List[Any]] = None) -> pd.DataFrame:
     """
     Compute vote counts and probabilities for all (group, comment) pairs.
 
     Vectorized port of Clojure's per-(group, comment) `comment-stats` recipe
     (math/src/polismath/math/repness.clj:64-100). Operates on all groups and
-    comments simultaneously.
+    comments simultaneously, in two phases:
+
+    1. :func:`_group_comment_vote_counts` — the DataFrame plumbing that
+       reduces (votes, group memberships) to one row of raw counts per
+       (group, comment): ``na``/``nd``/``ns`` for the group and
+       ``other_agree``/``other_disagree``/``other_votes`` for everyone else.
+    2. :func:`_comment_stats_from_counts` — the statistics recipe, reading
+       like Clojure's scalar comment-stats/finalize-cmt-stats chain.
 
     Args:
         votes_long: Long-format DataFrame with columns:
@@ -208,6 +217,25 @@ def compute_group_comment_stats_df(votes_long: pd.DataFrame,
             - disagree_metric: metric for disagree representativeness
             - repful: 'agree' or 'disagree' based on which is more representative
     """
+    counts_df = _group_comment_vote_counts(votes_long, group_clusters, tid_order)
+    if counts_df.empty:
+        return counts_df
+    return _comment_stats_from_counts(counts_df)
+
+
+def _group_comment_vote_counts(votes_long: pd.DataFrame,
+                               group_clusters: List[Dict[str, Any]],
+                               tid_order: Optional[List[Any]] = None) -> pd.DataFrame:
+    """Phase 1 — the plumbing: reduce (votes, group memberships) to raw
+    per-(group, comment) counts.
+
+    Returns a DataFrame indexed by (group_id, comment) with the group's
+    ``na``/``nd``/``ns``, the clustered-voter totals ``total_agree``/
+    ``total_disagree``/``total_votes``, and the derived ``other_*`` columns
+    (everyone not in this group) — the exact inputs Clojure's comment-stats
+    recipe consumes. Empty result (correct schema) when there are no votes
+    or no clustered voters.
+    """
     # Build participant -> group mapping
     ptpt_to_group = {}
     for group in group_clusters:
@@ -221,34 +249,52 @@ def compute_group_comment_stats_df(votes_long: pd.DataFrame,
         # Return empty DataFrame with correct schema
         return pd.DataFrame(columns=['na', 'nd', 'ns', 'pa', 'pd', 'pat', 'pdt'])
 
-    # Compute total counts per comment BEFORE filtering to group members
-    # This matches the old behavior where "other" included ALL participants
-    # not in the current group (even those not in any cluster)
-    #
-    # total_votes counts agree + disagree + PASS, matching Clojure's
-    # `count-votes` (math/src/polismath/math/repness.clj:56-61, :70).
-    # `count-votes` called with no `vote` arg uses `identity` as the filter
-    # predicate; in Clojure 0 is truthy, so PASS (0) votes are kept. NaN
-    # entries are already dropped above. Use size() to count non-NaN rows.
-    total_counts = votes_only.groupby('comment').agg(
-        total_agree=('vote', lambda x: (x == AGREE).sum()),
-        total_disagree=('vote', lambda x: (x == DISAGREE).sum()),
-        total_votes=('vote', 'size'),
-    )
-
-    # Now add group column and filter to only group members
+    # Add group column and identify votes from clustered participants
     votes_with_group = votes_only.copy()
     votes_with_group['group_id'] = votes_with_group['participant'].map(ptpt_to_group)
 
     # Keep only votes from participants in some group (for group-specific counts)
     votes_in_groups = votes_with_group.dropna(subset=['group_id'])
 
+    # Totals feed the "other" (rest) side of the comparison below.
+    #
+    # Clojure's rest-stats sum per-group comment-stats over the OTHER GROUPS
+    # only (utils/mapv-rest, repness.clj:125-131), and group membership is
+    # unfolded through base clusters — so votes from participants in NO
+    # cluster never enter the comparison. Totals must therefore come from
+    # clustered voters only (FP-69c7a13580/FP-faac8c6125).
+    #
+    # total_votes counts agree + disagree + PASS, matching Clojure's
+    # `count-votes` (math/src/polismath/math/repness.clj:56-61, :70).
+    # `count-votes` called with no `vote` arg uses `identity` as the filter
+    # predicate; in Clojure 0 is truthy, so PASS (0) votes are kept. NaN
+    # entries are already dropped above. Use size() to count non-NaN rows.
+    total_counts = votes_in_groups.groupby('comment').agg(
+        total_agree=('vote', lambda x: (x == AGREE).sum()),
+        total_disagree=('vote', lambda x: (x == DISAGREE).sum()),
+        total_votes=('vote', 'size'),
+    )
+    # The comment universe stays votes_only-based (Clojure
+    # iterates every matrix column; a comment voted on only by unclustered
+    # participants still gets an all-zero stats row).
+    all_voted_comments = votes_only['comment'].unique()
+    total_counts = total_counts.reindex(all_voted_comments, fill_value=0)
+
     if votes_in_groups.empty:
         # Return empty DataFrame with correct schema
         return pd.DataFrame(columns=['na', 'nd', 'ns', 'pa', 'pd', 'pat', 'pdt'])
 
-    # Get all unique comments that have at least one vote (from anyone)
+    # Get all unique comments that have at least one vote (from anyone).
+    # With tid_order (clojure-legacy), rows follow Clojure's named-matrix
+    # column order (first-vote arrival) so downstream stable sorts break
+    # exact-score ties identically; unknown comments keep their default
+    # position at the tail (defensive — tid_order normally covers all).
     all_comments = total_counts.index.tolist()
+    if tid_order is not None:
+        known = set(all_comments)
+        ordered = [t for t in tid_order if t in known]
+        ordered_set = set(ordered)
+        all_comments = ordered + [t for t in all_comments if t not in ordered_set]
 
     # Get all group IDs
     all_group_ids = [group['id'] for group in group_clusters]
@@ -284,6 +330,19 @@ def compute_group_comment_stats_df(votes_long: pd.DataFrame,
     stats_df['other_disagree'] = stats_df['total_disagree'] - stats_df['nd']
     stats_df['other_votes'] = stats_df['total_votes'] - stats_df['ns']
 
+    return stats_df
+
+
+def _comment_stats_from_counts(stats_df: pd.DataFrame) -> pd.DataFrame:
+    """Phase 2 — the statistics recipe, on clean per-(group, comment) counts.
+
+    Reads like Clojure's scalar chain (comment-stats -> add-comparative-stats
+    -> finalize-cmt-stats, repness.clj:64-100/:97-100/:178/:191-193):
+    probabilities with pseudocounts, proportion tests on raw counts,
+    representativeness ratios group-vs-other, two-proportion tests, the
+    signed metric products, and the repful side pick. Adds the stat columns
+    to ``stats_df`` (same frame, mutated in place) and returns it.
+    """
     # Compute probabilities with pseudocounts (Bayesian smoothing)
     # For group
     stats_df['pa'] = (stats_df['na'] + PSEUDO_COUNT/2) / (stats_df['ns'] + PSEUDO_COUNT)
@@ -474,7 +533,8 @@ def _finalize_row_for_output(row: Dict[str, Any], *,
 
 
 def select_rep_comments_df(stats_df: pd.DataFrame,
-                           mod_out: Optional[Iterable[int]] = None
+                           mod_out: Optional[Iterable[int]] = None,
+                           preserve_order: bool = False
                            ) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
     """
     Select representative comments for a single group (Clojure parity).
@@ -527,20 +587,30 @@ def select_rep_comments_df(stats_df: pd.DataFrame,
     sufficient: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
     # Track best's max(rat, rdt) as a sidecar scalar so we never have to mutate
-    # `best` itself with synthetic comparison keys. Avoids the leak/pop dance
+    # `best` itself with constructed comparison keys. Avoids the leak/pop dance
     # of stashing a `_max_rt` inside the finalized dict (decision D10.8.4).
     best_max_rt: Optional[float] = None
     best_agree: Optional[Dict[str, Any]] = None
 
-    # Sort by `comment` (tid) ascending BEFORE iterating, so ties in
-    # `beats_best_by_test` (max(rat, rdt) tied) and in `beats_best_agr`
-    # (Branch 2/3 product tied) resolve deterministically. The chosen order
-    # matches Clojure's named-matrix column iteration: after normalization
-    # the columns are insertion-ordered, and for cold-start that's tid
-    # ascending (see Clojure named_matrix.clj:130-131 — insertion order).
-    # All Clojure beats-*? predicates use strict `>` so the FIRST row at a
-    # tied score wins; sorting ascending here mirrors that (decision D10.8.1).
-    iter_df = stats_df.sort_values('comment', kind='mergesort')
+    # Iteration order matters: fallback compares the next raw score against
+    # the previous winner's finalized float32 score (repness.clj:187,245).
+    # Equal raw scores can replace a winner when that prior score rounded down.
+    # Other beats-*? predicates use raw strict `>`; repness-sort is stable.
+    #
+    # preserve_order=True (clojure-legacy via conv_repness's tid_order): rows
+    # already follow Clojure's named-matrix column order — first-vote ARRIVAL
+    # order, which is NOT tid-ascending in general (verified on the vw replay:
+    # clj tids open [24, 19, 47, …]) — so iterate as-given.
+    #
+    # preserve_order=False (improved / direct callers): sort by `comment`
+    # ascending for deterministic ties (decision D10.8.1; its "insertion
+    # order == ascending" cold-start assumption holds only for tid-ordered
+    # vote streams, hence the legacy path above).
+    iter_df = (
+        stats_df
+        if preserve_order
+        else stats_df.sort_values('comment', kind='mergesort')
+    )
 
     for row in iter_df.to_dict('records'):
         if row['comment'] in mod_out_set:
@@ -551,7 +621,8 @@ def select_rep_comments_df(stats_df: pd.DataFrame,
         if not sufficient:
             if beats_best_by_test(row, best_max_rt):
                 best = _finalize_row_for_output(row)
-                best_max_rt = max(row['rat'], row['rdt'])
+                best_max_rt = float(np.float32(
+                    row['rat'] if row['rat'] > row['rdt'] else row['rdt']))
         # `best_agree` stores RAW row (Clojure repness.clj:250) so subsequent
         # `beats_best_agr` calls keep the ra/rat/pa/pat surface.
         if beats_best_agr(row, best_agree):
@@ -605,7 +676,8 @@ def select_rep_comments_df(stats_df: pd.DataFrame,
 
 
 def _assemble_rep_comments(stats_df: pd.DataFrame,
-                           mod_out: Optional[Iterable[int]] = None
+                           mod_out: Optional[Iterable[int]] = None,
+                           preserve_order: bool = False
                            ) -> List[Dict[str, Any]]:
     """Thin wrapper around `select_rep_comments_df` that returns the flat
     output list (best-agree slot prepended, then the DataFrame's rows,
@@ -614,11 +686,12 @@ def _assemble_rep_comments(stats_df: pd.DataFrame,
 
     Decision S2: `select_rep_comments_df` returns a `(rep_df, best_agree_dict)`
     tuple so the DataFrame stays clean (no NaN extra-key columns). Most
-    callers — including `conv_repness` and the D10 synthetic tests — want
+    callers — including `conv_repness` and the D10 public-fixture tests — want
     the flat List[Dict] form, so we keep one place that does the prepend
     and the final agrees-before-disagrees stable partition.
     """
-    rep_df, best_agree_dict = select_rep_comments_df(stats_df, mod_out=mod_out)
+    rep_df, best_agree_dict = select_rep_comments_df(
+        stats_df, mod_out=mod_out, preserve_order=preserve_order)
     head: List[Dict[str, Any]] = [best_agree_dict] if best_agree_dict is not None else []
     tail: List[Dict[str, Any]] = (
         rep_df.to_dict('records') if not rep_df.empty else []
@@ -772,6 +845,7 @@ def select_consensus_comments_df(
 def conv_repness(vote_matrix_df: pd.DataFrame,
                  group_clusters: List[Dict[str, Any]],
                  mod_out: Optional[Iterable[int]] = None,
+                 tid_order: Optional[List[Any]] = None,
                  ) -> Dict[str, Any]:
     """
     Calculate representativeness for all comments and groups.
@@ -785,6 +859,11 @@ def conv_repness(vote_matrix_df: pd.DataFrame,
         mod_out: Optional iterable of tids to exclude (moderated-out comments).
             Forwarded to `select_rep_comments_df` and `consensus_stats_df`.
             See `Conversation.mod_out_tids`.
+        tid_order: Optional comment order for tie-breaking (clojure-legacy:
+            first-vote arrival order == Clojure's named-matrix column order).
+            When given, stats rows and consensus stats follow it and the
+            selectors iterate as-given instead of tid-ascending, so
+            exact-score ties resolve like Clojure's stable sorts.
 
     Returns:
         Dictionary with representativeness data for each group:
@@ -802,9 +881,12 @@ def conv_repness(vote_matrix_df: pd.DataFrame,
         'comment_repness': []
     }
 
-    # Check if we have enough data
-    if vote_matrix_df.shape[0] < 2 or vote_matrix_df.shape[1] < 2:
-        return empty_result
+    # Clojure computes repness/consensus for ANY matrix (its best-agree
+    # guarantee produces an entry even for a single-vote 1x1 conversation;
+    # rest-stats over zero other groups fall back to the (0+1)/(0+2) prior —
+    # every-vote step-0 oracle, journal 2026-07-22), so no size guard here.
+    # (The former improved-mode <2 guard is parked:
+    # POST_CUTOVER_IMPROVEMENTS.md item 2.)
 
     # Convert wide-format to long-format DataFrame
     # Wide: participants × comments (values = votes)
@@ -819,7 +901,8 @@ def conv_repness(vote_matrix_df: pd.DataFrame,
     votes_long['vote'] = pd.to_numeric(votes_long['vote'], errors='coerce')
 
     # Compute all stats using vectorized function
-    stats_df = compute_group_comment_stats_df(votes_long, group_clusters)
+    stats_df = compute_group_comment_stats_df(votes_long, group_clusters,
+                                              tid_order=tid_order)
 
     if stats_df.empty:
         return empty_result
@@ -870,7 +953,8 @@ def conv_repness(vote_matrix_df: pd.DataFrame,
             # partition applied). Forward `mod_out` from conv_repness (D11
             # added this kwarg).
             result['group_repness'][group_id] = _assemble_rep_comments(
-                group_stats, mod_out=mod_out)
+                group_stats, mod_out=mod_out,
+                preserve_order=tid_order is not None)
         except Exception as e:
             print(f"Error selecting representative comments for group {group_id}: {e}")
             result['group_repness'][group_id] = []
@@ -880,6 +964,14 @@ def conv_repness(vote_matrix_df: pd.DataFrame,
     # `len(group_clusters) > 1` guard.
     try:
         cons_stats = consensus_stats_df(vote_matrix_df, mod_out=mod_out)
+        if tid_order is not None and not cons_stats.empty:
+            # Rank ties resolve by row order (nlargest keep='first'): follow
+            # Clojure's column (arrival) order, unknown tids at the tail.
+            known = set(cons_stats.index)
+            ordered = [t for t in tid_order if t in known]
+            ordered_set = set(ordered)
+            ordered += [t for t in cons_stats.index if t not in ordered_set]
+            cons_stats = cons_stats.reindex(ordered)
         result['consensus_comments'] = select_consensus_comments_df(cons_stats)
     except Exception as e:
         print(f"Error selecting consensus comments: {e}")

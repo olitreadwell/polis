@@ -2,6 +2,7 @@ import * as globals from "../components/globals";
 import _ from "lodash";
 import createHull from "hull.js";
 import * as d3 from "../../js/3rdparty/d3.v4.min.js";
+import { COMMENT_PLACEMENT_SIGN } from "../../js/util/voteConvention";
 
 import { forceSimulation, forceCollide, forceX, forceY } from "d3-force";
 
@@ -38,7 +39,7 @@ function getGroupCornerAssignments(math) {
     se: null
   };
 
-  const clusters = math["group-clusters"];
+  const clusters = math["group-clusters"] || [];
 
   let candidate = {
     nw: null,
@@ -173,7 +174,7 @@ const graphUtil = (comments, math, badTids, ptptois) => {
   }
 
   const baseClusterIdToGid = (baseClusterId) => {
-    var clusters = math["group-clusters"];
+    var clusters = math["group-clusters"] || [];
     for (let i = 0; i < clusters.length; i++) {
       if (clusters[i].members.indexOf(baseClusterId) >= 0) {
         return clusters[i].id;
@@ -278,12 +279,13 @@ const graphUtil = (comments, math, badTids, ptptois) => {
   var xScaleCandidateForLeftSide = (border - xCenter) / minCommentX;
   var yScaleCandidateForTopSide = (border - yCenter) / minCommentY;
 
-  // TODO_VOTE_FLIP: we can probably remove the -1 below if we flip the vote values.
+  // Comments sit where their agreers project: the scale carries the wire's agree
+  // sign (voteConvention.COMMENT_PLACEMENT_SIGN), which never flips (P-078 R-wire).
   var commentScaleupFactorX =
-    -1 * Math.min(Math.abs(xScaleCandidateForRightSide), Math.abs(xScaleCandidateForLeftSide));
+    COMMENT_PLACEMENT_SIGN * Math.min(Math.abs(xScaleCandidateForRightSide), Math.abs(xScaleCandidateForLeftSide));
 
   var commentScaleupFactorY =
-    -1 * Math.min(Math.abs(yScaleCandidateForBottomSide), Math.abs(yScaleCandidateForTopSide));
+    COMMENT_PLACEMENT_SIGN * Math.min(Math.abs(yScaleCandidateForBottomSide), Math.abs(yScaleCandidateForTopSide));
 
   const baseClustersScaled = baseClusters.map((p) => {
     return _.assign({}, p, {
@@ -299,7 +301,7 @@ const graphUtil = (comments, math, badTids, ptptois) => {
     commentsPoints[i].y = yCenter + commentsPoints[i].y * commentScaleupFactorY;
   }
 
-  let groupCentroids = math["group-clusters"].map((group) => {
+  let groupCentroids = (math["group-clusters"] || []).map((group) => {
     return {
       x: xx(group.center[0]),
       y: yy(group.center[1]),

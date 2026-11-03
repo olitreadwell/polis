@@ -1,0 +1,55 @@
+{
+  "checkpoints": [
+    {
+      "cut": 1170,
+      "tick": 0,
+      "rust": "154d89e90169055464da0692401812250596d025c7592c2c2fb111e8686ddbde",
+      "python": "154d89e90169055464da0692401812250596d025c7592c2c2fb111e8686ddbde",
+      "deltas": [],
+      "fold_errors": {
+        "rustproto": [],
+        "python": []
+      },
+      "unclustered_participants": {
+        "rustproto": 1,
+        "python": 1
+      },
+      "fold_scope": "all-voter counts/timestamps/events plus independent latest-cell A/D/S per emitted bucket; no independent eligibility certificate"
+    },
+    {
+      "cut": 2341,
+      "tick": 1,
+      "rust": "e8a88a190ce8cd83fd82aa9de024cfb5eed7a02d217c371eec8b90bd16a2a173",
+      "python": "e8a88a190ce8cd83fd82aa9de024cfb5eed7a02d217c371eec8b90bd16a2a173",
+      "deltas": [],
+      "fold_errors": {
+        "rustproto": [],
+        "python": []
+      },
+      "unclustered_participants": {
+        "rustproto": 9,
+        "python": 9
+      },
+      "fold_scope": "all-voter counts/timestamps/events plus independent latest-cell A/D/S per emitted bucket; no independent eligibility certificate"
+    },
+    {
+      "cut": 4683,
+      "tick": 2,
+      "rust": "5c320c5eea1d574071fc5e35272b968462d91acfc51f0bbc8a816e6747f424f5",
+      "python": "5c320c5eea1d574071fc5e35272b968462d91acfc51f0bbc8a816e6747f424f5",
+      "deltas": [],
+      "fold_errors": {
+        "rustproto": [],
+        "python": []
+      },
+      "unclustered_participants": {
+        "rustproto": 2,
+        "python": 2
+      },
+      "fold_scope": "all-voter counts/timestamps/events plus independent latest-cell A/D/S per emitted bucket; no independent eligibility certificate"
+    }
+  ],
+  "observer_errors": [],
+  "observations": 189,
+  "profile": "rebuild-prefix at each checkpoint; static unmoderated comment snapshot"
+}

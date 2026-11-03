@@ -1,38 +1,24 @@
 import { v4 as uuidv4 } from "uuid";
 import { Request, Response } from "express";
-import { DynamoDB } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocument } from "@aws-sdk/lib-dynamodb";
 import logger from "../../utils/logger";
 import { getZidFromReport } from "../../utils/parameter";
+import { failJson } from "../../utils/fail";
 import Config from "../../config";
 import pg from "../../db/pg-query";
+import {
+  admitDelphiJob,
+  JobAdmissionUnavailableError,
+  JOB_QUEUE_TABLE,
+} from "./jobGuard";
 
-// Initialize DynamoDB client
-const dynamoDbConfig: any = {
-  region: Config.AWS_REGION || "us-east-1",
-};
-
-// If dynamoDbEndpoint is set, we're running locally (e.g., with Docker)
-if (Config.dynamoDbEndpoint) {
-  dynamoDbConfig.endpoint = Config.dynamoDbEndpoint;
-  // Use dummy credentials for local DynamoDB
-  dynamoDbConfig.credentials = {
-    accessKeyId: "DUMMYIDEXAMPLE",
-    secretAccessKey: "DUMMYEXAMPLEKEY",
-  };
-} else if (Config.AWS_ACCESS_KEY_ID && Config.AWS_SECRET_ACCESS_KEY) {
-  // Use real credentials from environment
-  dynamoDbConfig.credentials = {
-    accessKeyId: Config.AWS_ACCESS_KEY_ID,
-    secretAccessKey: Config.AWS_SECRET_ACCESS_KEY,
-  };
-}
-// If neither are set, the SDK will use default credential provider chain
-
-const dynamoDbClient = new DynamoDB(dynamoDbConfig);
-
-// Create DocumentClient
-const docClient = DynamoDBDocument.from(dynamoDbClient);
+// The job types delphi/scripts/job_poller.py runs (KNOWN_JOB_TYPES there).
+// Anything else is refused here; the poller used to send an unknown type to
+// run_delphi.py, which starts by deleting the conversation's results.
+export const DELPHI_JOB_TYPES: ReadonlySet<string> = new Set([
+  "FULL_PIPELINE",
+  "CREATE_NARRATIVE_BATCH",
+  "AWAITING_NARRATIVE_BATCH",
+]);
 
 // Handler for POST /api/v3/delphi/jobs - Create a new Delphi job
 export async function handle_POST_delphi_jobs(
@@ -40,8 +26,11 @@ export async function handle_POST_delphi_jobs(
   res: Response
 ): Promise<void> {
   try {
+    // A refusal, not a fault: answered before the request is read, so no job
+    // is written. The catch below answers 500 for anything thrown.
     if (!req.p.delphiEnabled) {
-      throw new Error("Unauthorized");
+      failJson(res, 403, "polis_err_delphi_jobs_delphi_disabled");
+      return;
     }
     logger.info(
       `Creating Delphi job with parameters: ${JSON.stringify(req.body)}`
@@ -54,7 +43,18 @@ export async function handle_POST_delphi_jobs(
       job_type = "FULL_PIPELINE",
       priority = 50,
       include_moderation = false, // ignore comments that recieve a failing moderation score
+      idempotency_key = null,
     } = req.body;
+
+    if (typeof job_type !== "string" || !DELPHI_JOB_TYPES.has(job_type)) {
+      res.status(400).json({
+        status: "error",
+        error: `Unknown job_type: expected one of ${[...DELPHI_JOB_TYPES].join(
+          ", "
+        )}`,
+      });
+      return;
+    }
 
     // Validate required parameters
     if (!report_id && !conversation_id) {
@@ -128,11 +128,12 @@ export async function handle_POST_delphi_jobs(
       created_by: "api",
     };
 
-    // Put item in DynamoDB
+    // Put item in DynamoDB, behind the P-003 active-work guard: a scope that
+    // already has a live job gets that job back instead of a second paid run.
     try {
       logger.info(
         `Putting job item in DynamoDB: ${JSON.stringify({
-          TableName: "Delphi_JobQueue",
+          TableName: JOB_QUEUE_TABLE,
           Item: {
             job_id: jobItem.job_id,
             conversation_id: jobItem.conversation_id,
@@ -140,17 +141,50 @@ export async function handle_POST_delphi_jobs(
         })}`
       );
 
-      await docClient.put({
-        TableName: "Delphi_JobQueue",
-        Item: jobItem,
+      const admission = await admitDelphiJob({
+        scope: {
+          conversationId: jobItem.conversation_id,
+          reportId: report_id,
+          jobType: job_type,
+          jobConfig: jobItem.job_config,
+        },
+        jobItem,
+        idempotencyKey: idempotency_key,
       });
 
-      // Return success with job ID
+      if (admission.outcome === "idempotency_conflict") {
+        res.status(409).json({
+          status: "error",
+          error: "idempotency_key was already used for a different job payload",
+          job_id: admission.jobId,
+        });
+        return;
+      }
+
+      // Existing fields are unchanged for older clients; `deduplicated`,
+      // `job_status` and `work_live` are additive. `work_live` is the honest
+      // answer to "should the client keep polling": a root can be COMPLETED
+      // while a checker descendant of it is still running.
       res.json({
         status: "success",
-        job_id: job_id,
+        job_id: admission.jobId,
+        job_status: admission.jobStatus,
+        deduplicated: admission.outcome === "deduplicated",
+        work_live: admission.workLive,
       });
     } catch (dbError) {
+      if (dbError instanceof JobAdmissionUnavailableError) {
+        // Fail closed. Writing the job without a guard is how a second paid
+        // provider run happens, so no job was created and none will be.
+        logger.error(`Delphi job admission unavailable: ${dbError.message}`);
+        res.status(503).json({
+          status: "error",
+          error:
+            "Delphi job admission is temporarily unavailable; no job was created. Retry once the job queue and guard tables are reachable.",
+          code: "JOB_ADMISSION_UNAVAILABLE",
+        });
+        return;
+      }
       logger.error(
         `Error writing to DynamoDB: ${
           dbError instanceof Error ? dbError.message : dbError

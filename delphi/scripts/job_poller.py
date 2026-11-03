@@ -7,27 +7,13 @@ and execute them.
 """
 
 import argparse
-
-
-def _postgres_vote_to_delphi(pg_vote):
-    """
-    Convert PostgreSQL vote convention to Delphi convention.
-
-    PostgreSQL/Server/Client: AGREE=-1, DISAGREE=+1, PASS=0
-    Delphi internal:          AGREE=+1, DISAGREE=-1, PASS=0
-
-    Note: The canonical definition is in polismath.utils.general.postgres_vote_to_delphi()
-    This local copy exists to avoid import dependencies in the standalone poller.
-    """
-    return pg_vote * -1
-
-
 from contextlib import contextmanager
 import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, scoped_session
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import text
 from typing import Any, Dict, List, Optional
+from enum import Enum
 import boto3
 import json
 import logging
@@ -303,15 +289,16 @@ class PostgresClient:
         """
         Get all votes in a conversation.
 
-        Vote signs are flipped at this PostgreSQL boundary:
-        - PostgreSQL stores: AGREE=-1, DISAGREE=+1
-        - Delphi expects:    AGREE=+1, DISAGREE=-1
+        Votes are converted from the raw storage sign to semantic votes
+        (+1 agree) by the one vote convention,
+        polismath.utils.vote_convention.load_semantic_votes. A NULL vote stays
+        None, as before.
 
         Args:
             zid: Conversation ID
 
         Returns:
-            List of votes with signs converted to Delphi convention
+            List of votes with semantic signs
         """
         sql = """
         SELECT 
@@ -325,12 +312,12 @@ class PostgresClient:
             v.zid = :zid
         """
 
+        # Imported here, not at module load, so the poller still boots without
+        # the polismath package; only this loader needs it.
+        from polismath.utils.vote_convention import load_semantic_votes
+
         results = self.query(sql, {"zid": zid})
-        # Flip vote signs at PostgreSQL boundary
-        for r in results:
-            if r.get("vote") is not None:
-                r["vote"] = _postgres_vote_to_delphi(r["vote"])
-        return results
+        return load_semantic_votes(results, null_policy="keep")
 
     def get_participants_by_conversation(self, zid: int) -> List[Dict[str, Any]]:
         """
@@ -391,6 +378,141 @@ running = True
 # Exit code from 803_check_batch_status.py script if batch is still processing
 EXIT_CODE_PROCESSING_CONTINUES = 3
 
+# How long to wait for a job's child process to exit after terminate/kill
+# before giving up on confirming it. See JobProcessor.stop_child_process.
+CHILD_TERMINATE_GRACE_SECONDS = 30
+
+# Fallback only. When the poller cannot become a child-subreaper (macOS/BSD, or
+# prctl fails) it cannot reap a job's orphaned grandchildren, so process-group
+# emptiness is decided by a best-effort /proc scan. Enumeration is not a
+# snapshot — the group's last live member can fork a successor and exit between
+# the listing and the stat reads — so the scan requires this many consecutive
+# passes that all find no live member, with a short pause between them. This
+# still cannot beat an N-generation fork race; the subreaper path below is the
+# real fence. See JobProcessor._process_group_alive_by_scan.
+GROUP_EMPTY_STABLE_PASSES = 2
+GROUP_EMPTY_RECHECK_PAUSE_SECONDS = 0.05
+
+# PR_SET_CHILD_SUBREAPER from <linux/prctl.h>. Setting it makes this process the
+# reaper for its orphaned descendants (needs no capability).
+PR_SET_CHILD_SUBREAPER = 36
+
+# Set once mark_child_subreaper() succeeds. While True, process-group emptiness
+# is decided by the kernel (reap the group's dead members, then killpg(pgid, 0)
+# raising ESRCH proves it empty) instead of by scanning /proc.
+_child_subreaper_set = False
+
+
+def mark_child_subreaper() -> bool:
+    """Make the poller reap its orphaned descendants, so process-group emptiness
+    can be decided by the kernel rather than by scanning /proc.
+
+    Jobs are spawned by this process with ``start_new_session=True``; their
+    grandchildren, when orphaned, would normally re-parent to the container's
+    PID 1 — ``tail -f /dev/null`` under the CI compose file — which never reaps,
+    so their zombies pile up and keep ``killpg(pgid, 0)`` answering forever (the
+    round-10 hang). ``PR_SET_CHILD_SUBREAPER`` re-parents them here instead. The
+    exit confirmation can then reap them and trust that ``killpg`` raising ESRCH
+    means the group is truly empty: no lingering zombie fakes liveness, and a
+    just-forked successor is simply a live member that keeps ``killpg``
+    succeeding until it too exits and is reaped — so no enumeration race
+    (round 11) can hide it. Adding scan passes cannot make a scan race-free;
+    making the kernel the authority can.
+
+    Returns True if the poller is now a subreaper. On a platform without the
+    call (macOS/BSD) or if prctl fails, returns False and leaves the exit
+    confirmation on its best-effort /proc-scan fallback.
+    """
+    global _child_subreaper_set
+    if not sys.platform.startswith('linux'):
+        logger.info(
+            "child-subreaper unavailable on %s; process-exit confirmation is best-effort.",
+            sys.platform,
+        )
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            logger.warning(
+                "PR_SET_CHILD_SUBREAPER failed (errno %s); process-exit confirmation is best-effort.",
+                ctypes.get_errno(),
+            )
+            return False
+    except Exception as prctl_error:
+        logger.warning(
+            "Could not set child-subreaper (%s); process-exit confirmation is best-effort.",
+            prctl_error,
+        )
+        return False
+    _child_subreaper_set = True
+    logger.info(
+        "Poller marked as child-subreaper; orphaned job descendants re-parent here and are reaped."
+    )
+    return True
+
+
+def ensure_process_exit_fence() -> None:
+    """Establish the kernel exit fence at startup, or refuse to start on Linux.
+
+    ``PR_SET_CHILD_SUBREAPER`` needs no capability, so if it cannot be set on
+    Linux the container/runtime is broken — and without it the poller can only
+    fail closed (never confirm a job's process exit, so guards are never
+    released). Rather than run in that degraded state in production, refuse to
+    start. On a platform without the call (macOS/BSD dev) the poller continues
+    with the documented fail-closed confirmation.
+    """
+    if mark_child_subreaper():
+        return
+    if sys.platform.startswith('linux'):
+        logger.critical(
+            "PR_SET_CHILD_SUBREAPER could not be set; the poller requires the kernel "
+            "process-reaper fence to confirm job exits safely on Linux and refuses to "
+            "start. The call needs no capability, so its failure means the "
+            "container/runtime is misconfigured."
+        )
+        raise SystemExit(1)
+    logger.warning(
+        "child-subreaper unavailable on %s; job exit confirmation will fail closed "
+        "(the submission guard is never released from a /proc scan alone).",
+        sys.platform,
+    )
+
+
+class ExitConfirmation(Enum):
+    """Outcome of trying to prove a job's process tree has exited.
+
+    Only ``CONFIRMED`` may release the server's submission guard. The other two
+    both mean "not proven gone" and are handled like a timeout — the guard is
+    not released and the job records why — but they are kept distinct so the
+    reason is visible: ``LIVE`` when members remained and could not be stopped,
+    ``UNCONFIRMED`` when there is no kernel reaper fence and a /proc scan cannot
+    prove exit (fail closed).
+    """
+
+    CONFIRMED = "confirmed"
+    LIVE = "live"
+    UNCONFIRMED = "unconfirmed"
+
+    @property
+    def confirmed(self) -> bool:
+        return self is ExitConfirmation.CONFIRMED
+
+    @property
+    def note(self) -> Optional[str]:
+        if self is ExitConfirmation.CONFIRMED:
+            return None
+        if self is ExitConfirmation.UNCONFIRMED:
+            return (
+                "process exit unconfirmed: no kernel process-reaper fence "
+                "(child-subreaper unavailable); a /proc scan cannot prove the tree "
+                "exited, so the submission guard is not released"
+            )
+        return (
+            "process exit unconfirmed: live members remained in the job's process "
+            "group and could not be stopped"
+        )
+
 
 def signal_handler(sig, frame):
     """Handle exit signals gracefully."""
@@ -404,6 +526,8 @@ class JobProcessor:
     
     def __init__(self, endpoint_url=None, region='us-east-1'):
         """Initialize the job processor."""
+        if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+            raise RuntimeError('Postgres jobs run through polis-jobs, never the Dynamo poller')
         self.worker_id = str(uuid.uuid4())
         raw_endpoint = endpoint_url or os.environ.get('DYNAMODB_ENDPOINT')
         self.endpoint_url = raw_endpoint if raw_endpoint and raw_endpoint.strip() else None
@@ -633,8 +757,19 @@ class JobProcessor:
             # Log failure but do not crash the worker
             logger.error(f"Error updating job logs for {job['job_id']}: {e}")
 
-    def complete_job(self, job, success, result=None, error=None):
-        """Mark a job as completed or failed using optimistic locking."""
+    def complete_job(self, job, success, result=None, error=None, process_exited=False, process_exit_note=None):
+        """Mark a job as completed or failed using optimistic locking.
+
+        ``process_exited`` records whether this worker has *confirmed* that the
+        job's child process is gone (terminated and joined). The server's
+        submission guard reads ``process_exit_confirmed`` before it will release
+        a FAILED root: a root marked FAILED while its subprocess was still alive
+        can still create a checker row or submit provider work afterwards, so an
+        unconfirmed failure is not proof that the paid work ended. Defaults to
+        False so a caller that cannot make the claim does not make it by
+        accident. ``process_exit_note`` records *why* the exit was not confirmed
+        (see ExitConfirmation) so an unreleased guard is explainable.
+        """
         job_id = job['job_id']
         current_version = job.get('version', 1)
         new_status = 'COMPLETED' if success else 'FAILED'
@@ -653,7 +788,10 @@ class JobProcessor:
 
             if error:
                 job_results['error'] = str(error)
-            
+
+            if process_exit_note:
+                job_results['process_exit_note'] = str(process_exit_note)
+
             # Update the job with the new status using optimistic locking
             try:
                 self.table.update_item(
@@ -663,6 +801,7 @@ class JobProcessor:
                             updated_at = :now, 
                             completed_at = :now,
                             job_results = :job_results,
+                            process_exit_confirmed = :process_exited,
                             version = :new_version
                     ''',
                     ConditionExpression='version = :current_version',
@@ -671,6 +810,7 @@ class JobProcessor:
                         ':new_status': new_status,
                         ':now': now,
                         ':job_results': json.dumps(job_results),
+                        ':process_exited': bool(process_exited),
                         ':current_version': current_version,
                         ':new_version': current_version + 1
                     }
@@ -686,6 +826,394 @@ class JobProcessor:
         except Exception as e:
             logger.error(f"Error completing job {job_id}: {e}")
 
+    def _job_process_group(self, process, job_id: str):
+        """The process group this job owns, or None if it does not own one.
+
+        Jobs are started with ``start_new_session=True`` so the child leads its
+        own session and group; everything it spawns inherits that group. A child
+        that shares the poller's own group predates that change (or the call
+        failed), and signalling it would take the poller down with it — so it is
+        reported as "no owned group", which the caller treats as unconfirmable.
+        """
+        try:
+            pgid = os.getpgid(process.pid)
+        except Exception as lookup_error:
+            logger.warning(f"Job {job_id}: cannot read the child's process group ({lookup_error}).")
+            return None
+        try:
+            if pgid == os.getpgid(0):
+                logger.error(
+                    f"Job {job_id}: child shares the poller's process group; refusing to signal it."
+                )
+                return None
+        except Exception:
+            return None
+        return pgid
+
+    @staticmethod
+    def _pid_confirmed_gone(pid: int) -> bool:
+        """True only if ``pid`` is *definitively* gone (ESRCH), not merely unread.
+
+        Used to tell a pid that exited mid-scan (safe to drop from the live
+        count) apart from one whose ``/proc`` entry simply could not be read
+        (uncertain — must not be dropped). Anything other than a confirmed
+        ``ProcessLookupError`` means the pid still exists.
+        """
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            # EPERM or anything else: the pid still exists, just not ours.
+            return False
+        return False
+
+    @staticmethod
+    def _live_group_members(pgid) -> Optional[List[int]]:
+        """PIDs still *running* in the group, or None when that is uncertain.
+
+        A zombie is an entry in the process table, not a running process: it has
+        already exited and cannot spend provider money or write a row. It stays
+        an entry until its parent reaps it, and a grandchild orphaned by the
+        job's parent is re-parented to PID 1 — which in a container is whatever
+        the image's command is (``tail -f /dev/null`` under the CI compose file,
+        `bash` under the delphi image's own CMD), not an init that reaps. So a
+        group emptied of live processes can keep answering ``killpg(pgid, 0)``
+        forever, and a wait for it to disappear would never return.
+
+        ``None`` means the scan could not be completed with certainty; the caller
+        must then treat the group as still live, because an incomplete
+        observation never authorizes an exit. That covers /proc being
+        unavailable (macOS, BSD — where a reaping init makes the ``killpg``
+        answer sufficient), the directory failing to list, and any member whose
+        state could not be read (permission error, short read, malformed data).
+        A member is dropped from the count only for a definitive reason: it is a
+        zombie/dead entry, it is not in this group, or its ``/proc`` entry is
+        confirmed gone (ESRCH on recheck) because it exited mid-scan.
+        """
+        if not os.path.isdir('/proc'):
+            return None
+        try:
+            entries = os.listdir('/proc')
+        except OSError:
+            # Cannot enumerate the process table: unknown, not empty.
+            return None
+        live = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f'/proc/{entry}/stat', 'rb') as stat_file:
+                    data = stat_file.read()
+            except FileNotFoundError:
+                # The pid may have exited between listdir and open. Drop it only
+                # if that is confirmed; a pid that still exists but could not be
+                # read is uncertainty, not absence.
+                if JobProcessor._pid_confirmed_gone(pid):
+                    continue
+                return None
+            except OSError:
+                # Permission or any other read error: cannot classify -> unknown.
+                return None
+            # comm can contain spaces and parentheses; everything after the last
+            # ')' is state, ppid, pgrp, ...
+            fields = data.rpartition(b')')[2].split()
+            if len(fields) < 3:
+                # Short or malformed read: cannot classify -> unknown.
+                return None
+            state, pgrp = fields[0], fields[2]
+            try:
+                member_pgid = int(pgrp)
+            except ValueError:
+                # Cannot tell whether this member is in the group -> unknown.
+                return None
+            if member_pgid != pgid:
+                continue
+            if state in (b'Z', b'X', b'x'):
+                continue
+            live.append(pid)
+        return live
+
+    @staticmethod
+    def _reap_group(pgid) -> None:
+        """Reap the poller's now-dead children in this process group.
+
+        With the poller a child-subreaper, a job's orphaned grandchildren
+        re-parent here; collecting their zombies keeps ``killpg(pgid, 0)`` an
+        honest witness of live membership — a zombie left unreaped would keep
+        the group answering ``killpg`` even though nothing in it can do work.
+        Scoped to the group with ``P_PGID`` so a worker confirming one job never
+        reaps another concurrent job's child (each job leads its own group). The
+        job's own session-leader child is reaped by its ``subprocess`` object
+        before any confirmation runs, so this only ever collects re-parented
+        descendants. Best-effort: any error leaves the reap for the next pass.
+        """
+        while True:
+            try:
+                info = os.waitid(os.P_PGID, pgid, os.WEXITED | os.WNOHANG)
+            except ChildProcessError:
+                return  # no children of ours remain in this group
+            except (OSError, ValueError):
+                return
+            except Exception:
+                return
+            if info is None:
+                # A child of ours is still in the group but has not exited.
+                return
+
+    @staticmethod
+    def _process_group_alive(pgid) -> bool:
+        """True while the group may still hold a process that can do work.
+
+        When the poller is a child-subreaper (``mark_child_subreaper`` succeeded,
+        Linux) the kernel is the authority: reap the group's dead members, then a
+        ``killpg(pgid, 0)`` that raises ESRCH proves the group empty. This is not
+        an enumeration and so has no snapshot race — a zombie cannot linger to
+        fake liveness (it is reaped), and a just-forked successor is a live member
+        that keeps ``killpg`` succeeding until it too exits and is reaped. Adding
+        scan passes could never make that guarantee; the kernel can.
+
+        Without the subreaper (macOS/BSD, or prctl failed) orphaned grandchildren
+        re-parent to an init this process cannot reap through, so it falls back to
+        the best-effort ``_process_group_alive_by_scan``.
+        """
+        if pgid is None:
+            return False
+        if _child_subreaper_set:
+            JobProcessor._reap_group(pgid)
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                # ESRCH: nothing — live or zombie — remains. Proven empty.
+                return False
+            except PermissionError:
+                # A live member exists and is not ours to signal.
+                return True
+            except Exception:
+                return True
+            # killpg succeeded after reaping every dead member, so a live member
+            # remains.
+            return True
+        return JobProcessor._process_group_alive_by_scan(pgid)
+
+    @staticmethod
+    def _process_group_alive_by_scan(pgid) -> bool:
+        """Best-effort emptiness by /proc scan, used only without a subreaper.
+
+        Returns ``False`` only for a group that looks empty across
+        ``GROUP_EMPTY_STABLE_PASSES`` consecutive passes, each re-checked with
+        ``killpg(pgid, 0)``: ESRCH proves it gone; EPERM means a live member not
+        ours to signal; success means an entry remains — a zombie, absent from
+        the next live pass, or a successor a pass missed, present in it. An
+        incomplete scan (``_live_group_members`` returns ``None``) is reported as
+        alive, never as an authorized exit. This cannot defeat an N-generation
+        fork race — only the subreaper path can — so it is used solely where the
+        subreaper is unavailable, and the confirmation is documented best-effort.
+        """
+        if pgid is None:
+            return False
+        empty_passes = 0
+        while True:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                # The group no longer exists: definitively empty.
+                return False
+            except PermissionError:
+                # Something in the group is alive and not ours to signal.
+                return True
+            except Exception:
+                return True
+            live = JobProcessor._live_group_members(pgid)
+            if live is None:
+                # An incomplete scan is not proof of an empty group.
+                return True
+            if live:
+                return True
+            empty_passes += 1
+            if empty_passes >= GROUP_EMPTY_STABLE_PASSES:
+                return False
+            # killpg still succeeds but no live member was seen. Give a member a
+            # pass may have missed — a successor forked mid-scan — a moment to
+            # surface, then confirm emptiness with another pass.
+            time.sleep(GROUP_EMPTY_RECHECK_PAUSE_SECONDS)
+
+    @staticmethod
+    def _best_effort_signal_group(pgid, job_id: str) -> None:
+        """SIGTERM then SIGKILL the group, best-effort, without waiting.
+
+        Used on the fail-closed path: killpg needs no subreaper, so leftover
+        members are still stopped — but the caller does not, and must not, treat
+        this as proof the tree is gone.
+        """
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return
+            except Exception as signal_error:
+                logger.warning(f"Job {job_id}: could not signal process group {pgid}: {signal_error}")
+
+    def _decline_without_fence(self, pgid, job_id: str) -> 'ExitConfirmation':
+        """Fail closed: stop the group best-effort, but never confirm it gone.
+
+        Without the kernel reaper fence a /proc scan cannot prove a process group
+        empty (it is not a snapshot), so no scan result may authorize an exit.
+        The scan is attached to the log only as diagnostics.
+        """
+        self._best_effort_signal_group(pgid, job_id)
+        logger.warning(
+            f"Job {job_id}: no kernel process-reaper fence (child-subreaper unavailable); "
+            f"refusing to confirm the process tree exited. Diagnostics: process group "
+            f"{pgid} live members (best-effort /proc scan): {self._live_group_members(pgid)}. "
+            f"The job's submission guard will not be released."
+        )
+        return ExitConfirmation.UNCONFIRMED
+
+    def confirm_process_tree_gone(self, pgid, job_id: str) -> 'ExitConfirmation':
+        """Try to prove the job's process group is empty. See ExitConfirmation.
+
+        Every completion that claims `process_exit_confirmed` goes through here,
+        not just the timeout and error paths (the one exception is a job of an
+        unknown type, refused in process_job before any process is started, so
+        there is no tree to prove gone). A parent that exits — with any
+        status, including 0 — does not take its own subprocesses with it, so
+        `process.wait()` returning is evidence about one process and not about
+        the tree.
+
+        Returns CONFIRMED only when the kernel exit fence (child-subreaper) is in
+        place and the group is proven empty. Without that fence this fails closed
+        (UNCONFIRMED): a /proc scan cannot prove an empty group, so it must never
+        release the guard, even for a group that happens to look empty. If the
+        group was never owned, the claim is declined (LIVE).
+        """
+        if pgid is None:
+            return ExitConfirmation.LIVE
+        if not _child_subreaper_set:
+            return self._decline_without_fence(pgid, job_id)
+        if not self._process_group_alive(pgid):
+            return ExitConfirmation.CONFIRMED
+        logger.warning(
+            f"Job {job_id}: process group {pgid} still has members after the job's "
+            f"parent exited (live members: {self._live_group_members(pgid)})."
+        )
+        for sig, label in ((signal.SIGTERM, 'terminated'), (signal.SIGKILL, 'killed')):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return ExitConfirmation.CONFIRMED
+            except Exception as signal_error:
+                logger.warning(f"Job {job_id}: could not signal process group {pgid}: {signal_error}")
+            deadline = time.time() + CHILD_TERMINATE_GRACE_SECONDS
+            while self._process_group_alive(pgid) and time.time() < deadline:
+                time.sleep(0.05)
+            if not self._process_group_alive(pgid):
+                logger.warning(f"Job {job_id}: leftover job processes {label}.")
+                return ExitConfirmation.CONFIRMED
+        logger.error(
+            f"Job {job_id}: process group {pgid} still has live members; not claiming an exit."
+        )
+        return ExitConfirmation.LIVE
+
+    def stop_child_process(self, process, job_id: str, pgid=None) -> 'ExitConfirmation':
+        """Stop a job's whole process tree and join it. See ExitConfirmation.
+
+        Marking a job FAILED while its processes are still running leaves an
+        orphan that can still submit provider work, update the job row, or
+        create a checker row *after* the server has concluded the job finished.
+        The job is not failed until the work is.
+
+        Stopping only the direct child is not enough: a FULL_PIPELINE child is
+        `run_delphi.py`, which itself launches and waits on reset/math/UMAP
+        subprocesses. Signalling the job's **process group** reaches those
+        grandchildren; without an owned group there is nothing to signal them
+        with, and this reports LIVE rather than claiming an exit it cannot see.
+
+        Like confirm_process_tree_gone, this returns CONFIRMED only under the
+        kernel fence; without it, it stops the group best-effort but fails closed
+        (UNCONFIRMED). It proves the local process tree is gone, not that a
+        provider request the tree already sent has been reconciled — that is what
+        the outstanding-work sweep and `checker_schedule_failed` are for.
+        """
+        if process is None:
+            return ExitConfirmation.CONFIRMED
+
+        if pgid is None:
+            pgid = self._job_process_group(process, job_id)
+        if pgid is None:
+            # Stop what we can, then decline to make the claim.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
+            except Exception as kill_error:
+                logger.error(f"Job {job_id}: could not stop the child: {kill_error}")
+            logger.error(
+                f"Job {job_id}: no owned process group; cannot confirm descendants exited."
+            )
+            return ExitConfirmation.LIVE
+
+        if not _child_subreaper_set:
+            # Fail closed: signal the group and join the direct child, but a
+            # /proc scan cannot prove the tree gone, so decline the claim.
+            self._best_effort_signal_group(pgid, job_id)
+            try:
+                process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
+            except Exception:
+                pass
+            logger.warning(
+                f"Job {job_id}: no kernel process-reaper fence (child-subreaper unavailable); "
+                f"stopped process group {pgid} best-effort but cannot confirm the tree exited "
+                f"(diagnostics: {self._live_group_members(pgid)}). The job's submission guard "
+                f"will not be released."
+            )
+            return ExitConfirmation.UNCONFIRMED
+
+        for sig, label in ((signal.SIGTERM, 'terminated'), (signal.SIGKILL, 'killed')):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception as signal_error:
+                logger.warning(f"Job {job_id}: could not signal process group {pgid}: {signal_error}")
+            try:
+                process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
+            except Exception:
+                pass
+            # Re-parented grandchildren are reaped by the poller (subreaper) a
+            # moment later, so give the group a bounded chance to disappear
+            # before escalating.
+            deadline = time.time() + CHILD_TERMINATE_GRACE_SECONDS
+            while self._process_group_alive(pgid) and time.time() < deadline:
+                time.sleep(0.05)
+            if not self._process_group_alive(pgid):
+                logger.warning(
+                    f"Job {job_id}: job process tree {label} before the job was marked failed."
+                )
+                return ExitConfirmation.CONFIRMED
+
+        # Report the failure without the exit claim rather than pretending.
+        logger.error(
+            f"Job {job_id}: process group {pgid} still has live members; not claiming an exit."
+        )
+        return ExitConfirmation.LIVE
+
+    def _complete_with_confirmation(self, job, success, confirmation: 'ExitConfirmation', error=None) -> None:
+        """Complete a job, releasing the guard only on a CONFIRMED exit.
+
+        A CONFIRMED tree sets ``process_exit_confirmed=True``; LIVE and
+        UNCONFIRMED both leave it False and record why, so an unreleased guard is
+        explainable and a fail-closed exit reads like a timeout to the server.
+        """
+        self.complete_job(
+            job,
+            success,
+            error=error,
+            process_exited=confirmation.confirmed,
+            process_exit_note=confirmation.note,
+        )
+
     def process_job(self, job: Dict[str, Any]) -> None:
         """Processes a claimed job by executing the correct script with real-time log handling."""
         job_id = job['job_id']
@@ -694,12 +1222,23 @@ class JobProcessor:
         timeout_seconds = int(job.get('timeout_seconds', 3600))
 
         self.update_job_logs(job, {'level': 'INFO', 'message': f'Worker {self.worker_id} starting job {job_id}'})
-        
+
+        if not isinstance(job_type, str) or job_type not in KNOWN_JOB_TYPES:
+            # Refuse before anything runs. An unknown type used to fall through
+            # to run_delphi.py, which starts by deleting the conversation's
+            # existing results. No child was started, so its exit is certain.
+            error = f"Unknown job_type {job_type!r}; expected one of {sorted(KNOWN_JOB_TYPES)}. Nothing was run."
+            logger.error(f"Job {job_id}: {error}")
+            self.update_job_logs(job, {'level': 'ERROR', 'message': error})
+            self.complete_job(job, False, error=error, process_exited=True)
+            return
+
+        child_process = None
+        job_pgid = None
         try:
             # 1. Build the command
             job_config = json.loads(job.get('job_config', '{}'))
-            include_moderation = job_config.get('include_moderation', False)
-            exclude_comment_selections = job_config.get('exclude_comment_selections', True)
+            include_moderation, exclude_comment_selections = report_filter_flags(job_config)
             app_path = os.environ.get('DELPHI_APP_PATH', '/app')
             if job_type == 'CREATE_NARRATIVE_BATCH':
                 model = os.environ.get("ANTHROPIC_MODEL")
@@ -710,7 +1249,7 @@ class JobProcessor:
             elif job_type == 'AWAITING_NARRATIVE_BATCH':
                 cmd_job_id = job.get('batch_job_id', job_id)
                 cmd = ['python', f'{app_path}/umap_narrative/803_check_batch_status.py', f'--job-id={cmd_job_id}']
-            else: # FULL_PIPELINE
+            elif job_type == 'FULL_PIPELINE':
                 # Base command
                 cmd = ['python', f'{app_path}/run_delphi.py', f'--zid={conversation_id}', f'--include_moderation={include_moderation}', f'--exclude_comment_selections={exclude_comment_selections}',]
                 # Check for report_id and append if it exists
@@ -727,7 +1266,15 @@ class JobProcessor:
             env['DELPHI_JOB_ID'] = job_id
             env['DELPHI_REPORT_ID'] = str(job.get('report_id', conversation_id))
             
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True, env=env)
+            # start_new_session puts the child in its own session and process
+            # group, so everything it spawns can be signalled as one tree when
+            # the job has to be stopped. See stop_child_process.
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True, env=env, start_new_session=True)
+            child_process = process
+            # Read the group id now, while the leader is certainly alive. After
+            # the parent exits there is nothing left to ask, and the group may
+            # still hold its subprocesses.
+            job_pgid = self._job_process_group(process, job_id)
 
             start_time = time.time()
             for line in iter(process.stdout.readline, ''):
@@ -741,28 +1288,109 @@ class JobProcessor:
 
             # 3. Handle the results
             success = (return_code == 0)
+            # process.wait() has joined the parent, which says nothing about
+            # what the parent left running. Confirm the whole group is empty —
+            # stopping anything still in it — before any completion claims the
+            # job's processes are gone. This applies to a clean exit as much as
+            # a failing one: a zero exit code does not reap subprocesses.
             if job_type == 'AWAITING_NARRATIVE_BATCH':
                 if return_code == EXIT_CODE_PROCESSING_CONTINUES:
                     self.release_lock(job, is_still_processing=True)
                 else:
-                    self.complete_job(job, success, error=f"Script failed with exit code {return_code}" if not success else None)
-            
+                    confirmation = self.confirm_process_tree_gone(job_pgid, job_id)
+                    self._complete_with_confirmation(job, success, confirmation, error=f"Script failed with exit code {return_code}" if not success else None)
+
             elif job_type == 'CREATE_NARRATIVE_BATCH':
+                confirmation = self.confirm_process_tree_gone(job_pgid, job_id)
                 if success:
                     logger.info(f"Job {job_id}: CREATE_NARRATIVE_BATCH completed successfully.")
-                    self.complete_job(job, True)
+                    self._complete_with_confirmation(job, True, confirmation)
                 else:
-                    self.complete_job(job, False, error=f"CREATE_NARRATIVE_BATCH script failed with exit code {return_code}")
+                    self._complete_with_confirmation(job, False, confirmation, error=f"CREATE_NARRATIVE_BATCH script failed with exit code {return_code}")
 
             else: # Handle all other synchronous job types
-                self.complete_job(job, success, error=f"Process exited with code {return_code}" if not success else None)
+                confirmation = self.confirm_process_tree_gone(job_pgid, job_id)
+                self._complete_with_confirmation(job, success, confirmation, error=f"Process exited with code {return_code}" if not success else None)
 
         except subprocess.TimeoutExpired:
             logger.error(f"Job {job_id} timed out after {timeout_seconds} seconds.")
-            self.complete_job(job, False, error=f"Job process timed out after {timeout_seconds}s.")
+            # Stop the child before marking the job failed: a timed-out process
+            # that is still alive can keep spending provider money and can still
+            # create a checker row after the job looks finished.
+            confirmation = self.stop_child_process(child_process, job_id, job_pgid)
+            self._complete_with_confirmation(job, False, confirmation, error=f"Job process timed out after {timeout_seconds}s.")
         except Exception as e:
             logger.error(f"Critical error processing job {job_id}: {e}", exc_info=True)
-            self.complete_job(job, False, error=f"Critical poller error: {str(e)}")
+            confirmation = self.stop_child_process(child_process, job_id, job_pgid)
+            self._complete_with_confirmation(job, False, confirmation, error=f"Critical poller error: {str(e)}")
+
+
+#: The job types this poller runs. Anything else is refused without running.
+KNOWN_JOB_TYPES = frozenset({'FULL_PIPELINE', 'CREATE_NARRATIVE_BATCH', 'AWAITING_NARRATIVE_BATCH'})
+
+
+#: include_moderation is pinned to True (moderated-out comments are dropped)
+#: until honouring an explicit false is ruled on; see report_filter_flags.
+INCLUDE_MODERATION_PINNED = True
+
+
+def report_filter_flags(job_config: Dict[str, Any]) -> tuple:
+    """The two report-filter flags a job passes to its script.
+
+    ``POST /delphi/jobs`` puts ``include_moderation`` at the top level of
+    ``job_config``; ``POST /delphi/batchReports`` nests it under
+    ``stages[0].config``. Both are read, nested first.
+
+    ``include_moderation`` is read and parsed but then pinned to True
+    (moderated-out comments are dropped), with one log line if a job asked for
+    false: the scripts used to parse ``--include_moderation=False`` as True, so
+    True is what every job has run with, and honouring false awaits a ruling.
+    ``exclude_comment_selections`` defaults to True when a job does not say.
+    """
+    # Imported here, not at module load: the poller must still boot (and fail
+    # just this job) if the polismath package were ever missing.
+    from polismath.utils.cli_flags import parse_bool_flag
+
+    stages = job_config.get('stages') or []
+    stage_config = {}
+    if stages and isinstance(stages[0], dict):
+        stage_config = stages[0].get('config') or {}
+
+    def read(name: str, default: bool) -> bool:
+        for source in (stage_config, job_config):
+            value = source.get(name)
+            if value is not None:
+                return parse_bool_flag(value)
+        return default
+
+    requested = read('include_moderation', True)
+    if not requested:
+        # Pinned pending a ruling. -2 is the default moderation level of every
+        # report, and the report UI sends include_moderation=false for -2, so
+        # honouring false would put moderated-out comments into topics, topic
+        # names and narrative prompts for every default report. Until that is
+        # decided, jobs keep running with the value they have always had.
+        logger.warning(
+            "include_moderation=false requested; pinned to true pending a ruling "
+            "(moderated-out comments stay excluded)")
+    return INCLUDE_MODERATION_PINNED, read('exclude_comment_selections', True)
+
+
+def should_process_job(instance_type: str, job_actual_size: str) -> bool:
+    """
+    Decide whether a worker of the given instance type should process a job of
+    the given size.
+
+    The dedicated "large" worker ASG is scaled to zero, so the normal/default
+    worker class now processes ALL job sizes. "large" remains an opt-in,
+    large-only class (set INSTANCE_SIZE=large) for anyone who re-enables that
+    ASG; "dev" processes anything. get_job_actual_size is still consulted for
+    logging/visibility.
+    """
+    if instance_type == "large":
+        return job_actual_size == "large"
+    # 'default', 'small', 'dev' and anything else: process every size.
+    return True
 
 
 def poll_and_process(processor: JobProcessor, interval: int = 10):
@@ -782,19 +1410,8 @@ def poll_and_process(processor: JobProcessor, interval: int = 10):
                 else:
                     job_actual_size = "normal"
 
-                can_process = False
                 instance_type = processor.instance_type
-
-                if instance_type == "large":
-                    # A large instance ONLY processes large jobs.
-                    can_process = job_actual_size == "large"
-                else:  # This covers 'small' and the 'default' type.
-                    # Small/default instances ONLY process normal-sized jobs.
-                    can_process = job_actual_size == "normal"
-
-                if instance_type == "dev":
-                    # Dev instances can process any job size.
-                    can_process = True
+                can_process = should_process_job(instance_type, job_actual_size)
 
                 if not can_process:
                     logger.info(f"Worker instance type '{instance_type}' cannot process job '{job_to_process['job_id']}' of size '{job_actual_size}'. Skipping for now.")
@@ -820,6 +1437,9 @@ def poll_and_process(processor: JobProcessor, interval: int = 10):
 
 
 def main():
+    if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+        os.environ['POLIS_JOBS_ENABLED'] = '1'
+        os.execvp('polis-jobs', ['polis-jobs'])
     # This function is correct.
     parser = argparse.ArgumentParser(description='Delphi Job Poller Service')
     parser.add_argument('--endpoint-url', type=str, default=None)
@@ -835,6 +1455,12 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("Starting Delphi Job Poller Service...")
+
+    # Become the reaper for orphaned job descendants before any job is spawned,
+    # so process-exit confirmation can trust the kernel (killpg -> ESRCH) instead
+    # of scanning /proc. On Linux this must succeed or the poller refuses to
+    # start; on other platforms it falls back to fail-closed confirmation.
+    ensure_process_exit_fence()
 
     try:
         processor = JobProcessor(endpoint_url=args.endpoint_url, region=args.region)

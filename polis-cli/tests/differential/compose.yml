@@ -1,0 +1,179 @@
+# Overlay on server/characterization/compose.yml. All paths relative to it.
+services:
+  postgres:
+    image: ${CLI_DIFF_POSTGRES_IMAGE:?build the local fixture image}
+  oidc-simulator:
+    image: ${CLI_DIFF_OIDC_IMAGE:?build the local OIDC simulator}
+  server:
+    image: ${CLI_DIFF_NODE_IMAGE:?build the local Node image}
+    ports: !reset []
+    command: [node, /differential/entry.cjs]
+    volumes:
+      - ../../polis-cli/tests/differential:/differential:ro
+    environment:
+      TZ: UTC
+      OPS_ENABLED: "false"
+      P027_MARKERS: '0'
+      ADMIN_UIDS: '[2]'
+      CLI_DIFFERENTIAL_FIXTURE: '1'
+      STATIC_FILES_PARTICIPATION_PORT: "8081"
+  file-server:
+    image: ${CLI_DIFF_NODE_IMAGE:?build the local Node image}
+    command: [node, /differential/page-static.cjs]
+    volumes: [../../polis-cli/tests/differential:/differential:ro]
+  driver:
+    profiles: [unused]
+  polis-api:
+    image: ${CLI_DIFF_RUST_IMAGE:?build polis-api with fixture-clock}
+    networks: [sealed]
+    volumes: ["./artifacts:/artifacts:ro"]
+    environment:
+      POLIS_API_OWNER_LIST: "1"
+      POLIS_API_OWNER_JWKS_FILE: /artifacts/read-jwks.json
+      POLIS_API_OWNER_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      AUTH_ISSUER: https://oidc-simulator:3000/
+      AUTH_AUDIENCE: users
+      TZ: UTC
+      POLIS_API_PERF_STATS_READS: "1"
+      POLIS_API_METADATA_QUERY_READS: "1"
+      POLIS_API_METADATA_QUERY_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_REPORT_EXPORT_READS: "1"
+      POLIS_API_REPORT_EXPORT_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_PARTICIPANT_READS: "1"
+      POLIS_API_PARTICIPANTS_READS: "1"
+      POLIS_API_PTPTOIS_READS: "1"
+      POLIS_API_BID_READS: "1"
+      POLIS_API_LOCATIONS_READS: "1"
+      POLIS_API_MY_INVITES_CSV_READS: "1"
+      POLIS_API_CONVERSATION_PAGE_READS: "1"
+      POLIS_API_PARTICIPANTS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_PTPTOIS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_BID_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_LOCATIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_MY_INVITES_CSV_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_CONVERSATION_PAGES_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      STATIC_FILES_PARTICIPATION_PORT: "8081"
+      POLIS_API_VOTES_READS: "1"
+      POLIS_API_VOTES_READ_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_PARTICIPANT_PUBLIC_KEY_FILE: /artifacts/participant-public.pem
+      POLIS_JWT_ISSUER: https://pol.is/
+      POLIS_JWT_AUDIENCE: participants
+      POLIS_API_NEXT_COMMENT_READS: "1"
+      POLIS_API_NEXT_COMMENT_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      TOPICAL_COMMENT_RATIO: "0"
+      POLIS_API_CONNECTION_READS: "1"
+      POLIS_API_ROBOTS_READS: "1"
+      POLIS_API_OPS_CATCHALL_READS: "1"
+      POLIS_API_OPS_PAGE_READS: "1"
+      POLIS_API_OPS_WHOAMI_READS: "1"
+      OPS_ENABLED: "false"
+      POLIS_API_COLLECTIVE_STATEMENT_READS: "1"
+      POLIS_API_COLLECTIVE_STATEMENT_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TOPIC_STATS_READS: "1"
+      POLIS_API_TOPIC_STATS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DELPHI_RESULT_READS: "1"
+      POLIS_API_DELPHI_RESULT_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DELPHI_RUN_READS: "1"
+      POLIS_API_DELPHI_RUN_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      DELPHI_RESULT_ENV: p027
+      POLIS_API_DELPHI_VISUALIZATIONS_READS: "1"
+      POLIS_API_DELPHI_VISUALIZATIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DELPHI_REPORTS_READS: "1"
+      POLIS_API_DELPHI_REPORTS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DELPHI_READS: "1"
+      POLIS_API_DELPHI_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_INTEGRATE_PAGE_READS: "1"
+      POLIS_API_ADMIN_PAGE_READS: "1"
+      STATIC_FILES_HOST: file-server
+      STATIC_FILES_ADMIN_PORT: "8080"
+      POLIS_API_EINVITES_READ_READS: "1"
+      POLIS_API_EINVITES_READ_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_XID_REPORT_READS: "1"
+      POLIS_API_XID_REPORT_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TREEVITE_ME_READS: "1"
+      POLIS_API_TREEVITE_ME_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TREEVITE_MY_INVITES_READS: "1"
+      POLIS_API_TREEVITE_MY_INVITES_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_LEGACY_CONVERSATIONS_READS: "1"
+      POLIS_API_LEGACY_CONVERSATIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TOPIC_PRIORITIZE_READS: "1"
+      POLIS_API_TOPIC_PRIORITIZE_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_STATEMENT_IMPORTANCE_READS: "1"
+      POLIS_API_STATEMENT_IMPORTANCE_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TOPIC_SELECTIONS_READS: "1"
+      POLIS_API_TOPIC_SELECTIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_CONVERSATION_STATS_READS: "1"
+      POLIS_API_CONVERSATION_STATS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_BID_TO_PID_READS: "1"
+      POLIS_API_BID_TO_PID_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_REPORTS_READ_READS: "1"
+      POLIS_API_REPORTS_READ_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_ALL_CONVERSATIONS_READS: "1"
+      POLIS_API_ALL_CONVERSATIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_PARTICIPATION_READS: "1"
+      POLIS_API_PARTICIPATION_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_CONVERSATION_PRELOAD_READS: "1"
+      POLIS_API_CONVERSATION_PRELOAD_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TREEVITE_CSV_READS: "1"
+      POLIS_API_TREEVITE_CSV_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TREEVITE_INVITES_READS: "1"
+      POLIS_API_TREEVITE_INVITES_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_TREEVITE_WAVES_READS: "1"
+      POLIS_API_TREEVITE_WAVES_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_RECENT_ACTIVITY_READS: "1"
+      POLIS_API_RECENT_ACTIVITY_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_RECENT_STARTED_READS: "1"
+      POLIS_API_RECENT_STARTED_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      ADMIN_UIDS: "[2]"
+      POLIS_API_METADATA_CHOICES_READS: "1"
+      POLIS_API_METADATA_CHOICES_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_METADATA_READS: "1"
+      POLIS_API_METADATA_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_METADATA_ANSWERS_READS: "1"
+      POLIS_API_METADATA_ANSWERS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_METADATA_QUESTIONS_READS: "1"
+      POLIS_API_METADATA_QUESTIONS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DOMAIN_WHITELIST_READS: "1"
+      POLIS_API_DOMAIN_WHITELIST_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_CONTEXTS_READS: "1"
+      POLIS_API_CONTEXTS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_READ_JWKS_FILE: /artifacts/read-jwks.json
+      AUTH_NAMESPACE: https://pol.is/
+      POLIS_API_DATABASE_READS: "1"
+      POLIS_API_DATABASE_PROBE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_COMMENT_READS: "1"
+      POLIS_API_COMMENTS_DATABASE_URL: postgres://postgres@postgres:5432/p027
+      MATH_ENV: p027
+      DEV_MODE: 'true'
+      NODE_ENV: production
+      DOMAIN_OVERRIDE: localhost
+      DATABASE_URL: postgres://postgres@postgres:5432/p027
+      POLIS_API_DB_TRANSPORT: docker-internal
+      POLIS_API_DB_PLAIN_HOSTS: postgres
+      POLIS_API_LISTEN: 0.0.0.0:5100
+      POLIS_API_FIXTURE_CLOCK: '1700000000000'
+    depends_on:
+      postgres: {condition: service_healthy}
+  proxy:
+    image: ${CLI_DIFF_NGINX_IMAGE:-cli-diff-nginx:local}
+    environment:
+      API_SERVER_PORT: '5000'
+      RUST_API_ROUTES: ${RUST_API_ROUTES:-}
+    volumes:
+      - routing:/var/lib/polis-routing
+      - ../../polis-cli/tests/differential/nginx.conf.template:/etc/nginx/conf.d/default.conf.template:ro
+    networks: [sealed]
+    depends_on: [server, polis-api]
+  gateway:
+    image: ${CLI_DIFF_NODE_IMAGE}
+    command: [node, /differential/gateway.cjs]
+    volumes: [../../polis-cli/tests/differential:/differential:ro]
+    ports:
+      - '127.0.0.1:${P027_HTTP_PORT}:5000'
+      - '127.0.0.1:${P027_CONTROL_PORT}:5001'
+    networks: [sealed, cli]
+    depends_on: [proxy]
+networks:
+  cli: {}
+volumes:
+  routing: {}

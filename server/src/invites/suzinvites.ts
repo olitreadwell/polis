@@ -1,12 +1,8 @@
 import _ from "underscore";
 
-import { escapeLiteral } from "../utils/common";
 import { generateToken } from "../auth";
 import { getZinvite } from "../utils/zinvite";
-import { sendTextEmail } from "../email/senders";
-import Config from "../config";
 import pg from "../db/pg-query";
-import type { PostUsersInviteRequest } from "../routes/users";
 
 function getSUZinviteInfo(suzinvite: any) {
   return new Promise(function (
@@ -77,19 +73,6 @@ function checkSuzinviteCodeValidity(
   );
 }
 
-// Helper function to generate random invitation tokens
-function generateSUZinvites(count: number): string[] {
-  const invites: string[] = [];
-  for (let i = 0; i < count; i++) {
-    // Generate a random string similar to the original implementation
-    const invite =
-      Math.random().toString(36).substring(2, 15) +
-      Math.random().toString(36).substring(2, 15);
-    invites.push(invite);
-  }
-  return invites;
-}
-
 function _generateConversationURLPrefix() {
   // not 1 or 0 since they look like "l" and "O"
   return "" + _.random(2, 9);
@@ -123,67 +106,4 @@ function _generateSUZinvitesP(numTokens: number) {
   });
 }
 
-// Helper function to send invitation email
-async function sendSuzinviteEmail(
-  req: PostUsersInviteRequest,
-  email: string,
-  conversation_id: string,
-  suzinvite: string
-): Promise<void> {
-  const serverName = Config.getServerNameWithProtocol(req);
-  const body = [
-    "Welcome to pol.is!",
-    "",
-    "Click this link to open your account:",
-    "",
-    `${serverName}/ot/${conversation_id}/${suzinvite}`,
-    "",
-    "Thank you for using Polis",
-  ].join("\n");
-
-  await sendTextEmail(
-    Config.polisFromAddress,
-    email,
-    "Join the pol.is conversation!",
-    body
-  );
-}
-
-// Helper function to save invites to database
-async function saveSuzinvites(
-  emails: string[],
-  suzinvites: string[],
-  zid: number,
-  owner: number
-): Promise<void> {
-  const pairs = _.zip(emails, suzinvites) as [string, string][];
-
-  const valuesStatements = pairs.map(([email, suzinvite]) => {
-    const xid = escapeLiteral(email);
-    const suzinviteEscaped = escapeLiteral(suzinvite);
-    return `(${suzinviteEscaped}, ${xid}, ${zid}, ${owner})`;
-  });
-
-  const query = `INSERT INTO suzinvites (suzinvite, xid, zid, owner) VALUES ${valuesStatements.join(
-    ","
-  )}`;
-
-  return new Promise((resolve, reject) => {
-    pg.query(query, [], (err: any) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve();
-      }
-    });
-  });
-}
-
-export {
-  checkSuzinviteCodeValidity,
-  createOneSuzinvite,
-  generateSUZinvites,
-  getSUZinviteInfo,
-  saveSuzinvites,
-  sendSuzinviteEmail,
-};
+export { checkSuzinviteCodeValidity, createOneSuzinvite, getSUZinviteInfo };

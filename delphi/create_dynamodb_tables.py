@@ -237,18 +237,41 @@ def create_job_queue_table(dynamodb, delete_existing=False):
                     'Projection': {'ProjectionType': 'ALL'},
                 }
             ],
+        },
+        # Server-side active-work guard (P-003 S3).
+        #
+        # One row per authorized submission scope (conversation + report +
+        # job type + job config). The server creates it in the SAME
+        # TransactWriteItems as the Delphi_JobQueue row, so a scope can own at
+        # most one active root job and an impatient resubmit cannot pay for a
+        # second provider run.
+        #
+        # It is a SEPARATE table on purpose: guard rows must never appear in
+        # Delphi_JobQueue, where they would look like missing-status anomalies
+        # to the queue observer. There is deliberately NO TTL: an automatic
+        # expiry could fire while paid provider work is still live. Rows are
+        # released by the server under an exact job_id + version condition once
+        # the root job is terminal and no checker descendant is outstanding.
+        'Delphi_JobActiveGuard': {
+            'KeySchema': [
+                {'AttributeName': 'guard_key', 'KeyType': 'HASH'}
+            ],
+            'AttributeDefinitions': [
+                {'AttributeName': 'guard_key', 'AttributeType': 'S'}
+            ],
+            'BillingMode': 'PAY_PER_REQUEST',
         }
     }
-    
+
     # Handle table deletion if requested
     if delete_existing:
         _delete_tables(dynamodb, tables.keys(), existing_tables)
         # Update list of existing tables
         existing_tables = [t.name for t in dynamodb.tables.all()]
-    
+
     # Create tables
     created_tables = _create_tables(dynamodb, tables, existing_tables)
-    
+
     return created_tables
 
 def create_evoc_tables(dynamodb, delete_existing=False):
@@ -507,6 +530,8 @@ def _create_tables(dynamodb, tables, existing_tables):
 def create_tables(endpoint_url=None, region_name='us-east-1', 
                  delete_existing=False, evoc_only=False, polismath_only=False,
                  aws_profile=None):
+    if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+        return []
     # Use the environment variable if endpoint_url is not provided
     if endpoint_url is None:
         endpoint_url = os.environ.get('DYNAMODB_ENDPOINT')
@@ -523,13 +548,6 @@ def create_tables(endpoint_url=None, region_name='us-east-1',
         polismath_only: If True, create only Polis math tables
         aws_profile: AWS profile to use (optional)
     """
-    # Set up environment variables for credentials if not already set (for local development)
-    if not os.environ.get('AWS_ACCESS_KEY_ID') and endpoint_url and ('localhost' in endpoint_url or 'host.docker.internal' in endpoint_url or 'polis-dynamodb-local' in endpoint_url):
-        os.environ['AWS_ACCESS_KEY_ID'] = 'fakeMyKeyId'
-    
-    if not os.environ.get('AWS_SECRET_ACCESS_KEY') and endpoint_url and ('localhost' in endpoint_url or 'host.docker.internal' in endpoint_url or 'polis-dynamodb-local' in endpoint_url):
-        os.environ['AWS_SECRET_ACCESS_KEY'] = 'fakeSecretAccessKey'
-    
     # Create DynamoDB session and resource
     session_args = {'region_name': region_name}
     if aws_profile:
@@ -578,6 +596,9 @@ def create_tables(endpoint_url=None, region_name='us-east-1',
     return created_tables
 
 def main():
+    if os.environ.get('DELPHI_RESULT_BACKEND') == 'postgres':
+        print('Postgres result schema is managed by migrations; no Dynamo bootstrap')
+        return
     # Parse arguments
     parser = argparse.ArgumentParser(description='Create DynamoDB tables for Delphi system')
     parser.add_argument('--endpoint-url', type=str, default=None,

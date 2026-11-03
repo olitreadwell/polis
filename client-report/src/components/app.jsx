@@ -137,7 +137,6 @@ const App = (props) => {
       : "false"
   );
 
-  let corMatRetries;
 
   // Effect to get auth token when authentication state changes
   useEffect(() => {
@@ -228,7 +227,7 @@ const App = (props) => {
       }, authToken)
       .then((data) => {
         if (!data) {
-          return {};
+          return { pca: {} };
         }
         return data;
       });
@@ -340,45 +339,6 @@ const App = (props) => {
     }, authToken);
   };
 
-  const getCorrelationMatrix = (math_tick, authToken = null) => {
-    const attemptResponse = net.polisGet("/api/v3/math/correlationMatrix", {
-      math_tick: math_tick,
-      report_id: report_id,
-    }, authToken);
-
-    return new Promise((resolve, reject) => {
-      attemptResponse.then(
-        (response) => {
-          if (response.status && response.status === "pending") {
-            if (typeof corMatRetries === "number") {
-              corMatRetries = corMatRetries + 1;
-            } else {
-              corMatRetries = 1;
-            }
-            setTimeout(
-              () => {
-                getCorrelationMatrix(math_tick, authToken).then(resolve, reject);
-              },
-              corMatRetries < 10 ? 200 : 3000
-            ); // try to get a quick response, but don't keep polling at that rate for more than 10 seconds.
-          } else if (
-            globals.enableMatrix &&
-            response &&
-            response.status === "polis_report_needs_comment_selection"
-          ) {
-            setErrorText("Select some comments");
-            reject("Currently, No comments are selected for display in the matrix.");
-          } else {
-            resolve(response);
-          }
-        },
-        (err) => {
-          reject(err);
-        }
-      );
-    });
-  };
-
   const getData = async (authToken = null) => {
     const reportPromise = getReport(report_id, authToken);
     const mathPromise = reportPromise.then((report) => {
@@ -392,12 +352,6 @@ const App = (props) => {
     const participantsOfInterestPromise = reportPromise.then((report) => {
       return getParticipantsOfInterest(report.conversation_id, authToken);
     });
-    const matrixPromise = globals.enableMatrix
-      ? mathPromise.then((math) => {
-          const math_tick = math.math_tick;
-          return getCorrelationMatrix(math_tick, authToken);
-        })
-      : Promise.resolve();
     const conversationPromise = reportPromise.then((report) => {
       return getConversation(report.conversation_id, authToken);
     });
@@ -411,7 +365,6 @@ const App = (props) => {
       mathPromise,
       commentsPromise,
       participantsOfInterestPromise,
-      matrixPromise,
       conversationPromise,
       narrativePromise,
     ])
@@ -421,7 +374,6 @@ const App = (props) => {
           mathResult,
           _comments,
           _participants,
-          correlationHClust,
           _conversation,
           narrative,
         ] = a;
@@ -437,12 +389,12 @@ const App = (props) => {
         assertExists(mathResult, "tids");
         assertExists(mathResult, "user-vote-counts");
         assertExists(mathResult, "votes-base");
-        assertExists(mathResult.pca, "center");
-        assertExists(mathResult.pca, "comment-extremity");
-        assertExists(mathResult.pca, "comment-projection");
-        assertExists(mathResult.pca, "comps");
+        assertExists(mathResult.pca || {}, "center");
+        assertExists(mathResult.pca || {}, "comment-extremity");
+        assertExists(mathResult.pca || {}, "comment-projection");
+        assertExists(mathResult.pca || {}, "comps");
 
-        let indexToTid = mathResult.tids;
+        let indexToTid = mathResult.tids || [];
 
         // # ptpts that voted
         var _ptptCountTotal = _conversation.participant_count;
@@ -458,32 +410,6 @@ const App = (props) => {
         var _badTids = {};
         var _filteredTids = {};
         var _filteredProbabilities = {};
-
-        // prep Correlation matrix.
-        if (globals.enableMatrix && correlationHClust) {
-          var probabilities = correlationHClust.matrix;
-          var tids = correlationHClust.comments;
-          for (let row = 0; row < probabilities.length; row++) {
-            if (probabilities[row][0] === "NaN") {
-              let tid = correlationHClust.comments[row];
-              _badTids[tid] = true;
-            }
-          }
-          _filteredProbabilities = probabilities
-            .map((row) => {
-              return row.filter((cell, colNum) => {
-                let colTid = correlationHClust.comments[colNum];
-                return _badTids[colTid] !== true;
-              });
-            })
-            .filter((row, rowNum) => {
-              let rowTid = correlationHClust.comments[rowNum];
-              return _badTids[rowTid] !== true;
-            });
-          _filteredTids = tids.filter((tid /*, index*/) => {
-            return _badTids[tid] !== true;
-          });
-        }
 
         var maxTid = -1;
         for (let i = 0; i < _comments.length; i++) {
@@ -545,8 +471,8 @@ const App = (props) => {
 
         const _extremity = {};
 
-        for (const index in mathResult.pca["comment-extremity"]) {
-          const e = mathResult.pca["comment-extremity"][index];
+        for (const index in mathResult.pca?.["comment-extremity"]) {
+          const e = mathResult.pca?.["comment-extremity"][index];
           const tid = indexToTid[index];
           _extremity[tid] = e;
         }
@@ -557,7 +483,7 @@ const App = (props) => {
           // Use normalized consensus if available, fall back to raw
           c["group-aware-consensus"] = mathResult["group-consensus-normalized"] ? 
             mathResult["group-consensus-normalized"][c.tid] : 
-            mathResult["group-aware-consensus"][c.tid];
+            mathResult["group-aware-consensus"]?.[c.tid];
           uniqueCommenters[c.pid] = 1;
           c = Object.assign(c, voteTotals[c.tid]);
           return c;
@@ -568,8 +494,8 @@ const App = (props) => {
           totalVotes += mathResult["user-vote-counts"][key];
         }
         const _computedStats = {
-          votesPerVoterAvg: totalVotes / _ptptCountTotal,
-          commentsPerCommenterAvg: _comments.length / numUniqueCommenters,
+          votesPerVoterAvg: _ptptCountTotal ? totalVotes / _ptptCountTotal : 0,
+          commentsPerCommenterAvg: numUniqueCommenters ? _comments.length / numUniqueCommenters : 0,
         };
 
         // Enrich math results with normalized consensus values
@@ -602,6 +528,7 @@ const App = (props) => {
       })
       .catch((err) => {
         console.error(err);
+        setLoading(false);
         setError(true);
         setErrorText(String(err));
       });
@@ -760,7 +687,7 @@ const App = (props) => {
             </div>
             <div style={{ flex: 1, minWidth: "200px", border: "1px solid #333", padding: "1rem", textAlign: "center"}}>
               <h3>Comments</h3>
-              <p style={{ fontFamily: "'VT323', monospace", fontSize: "2.5rem", margin: 0}}>{math["n-cmts"]}</p>
+              <p style={{ fontFamily: "'VT323', monospace", fontSize: "2.5rem", margin: 0}}>{math["n-cmts"] ?? 0}</p>
             </div>
             <div style={{ flex: 1, minWidth: "200px", border: "1px solid #333", padding: "1rem", textAlign: "center"}}>
               <h3>Votes</h3>
@@ -768,7 +695,7 @@ const App = (props) => {
             </div>
             <div style={{ flex: 1, minWidth: "200px", border: "1px solid #333", padding: "1rem", textAlign: "center"}}>
               <h3>Opinion Groups</h3>
-              <p style={{ fontFamily: "'VT323', monospace", fontSize: "2.5rem", margin: 0}}>{math["group-clusters"].length}</p>
+              <p style={{ fontFamily: "'VT323', monospace", fontSize: "2.5rem", margin: 0}}>{(math["group-clusters"] || []).length}</p>
             </div>
           </section>
         </div>
@@ -1075,23 +1002,6 @@ const App = (props) => {
               voteColors={voteColors}
               narrative={narrative}
             />
-            {/* {false ? <CommentsGraph
-              comments={comments}
-              groupNames={groupNames}
-              badTids={badTids}
-              formatTid={formatTid}
-              repfulAgreeTidsByGroup={repfulAgreeTidsByGroup}
-              math={math}
-              renderHeading={true}
-              report={report}
-              voteColors={voteColors}/> : null}
-            {globals.enableMatrix && false ? <Matrix
-              probabilities={filteredCorrelationMatrix}
-              comments={comments}
-              tids={filteredCorrelationTids}
-              formatTid={formatTid}
-              ptptCount={ptptCount}
-              voteColors={voteColors}/> : ""} */}
             <ParticipantsGraph
               comments={comments}
               groupNames={groupNames}
