@@ -402,6 +402,58 @@ Email verified! You can close this tab or hit the back button.
       });
   }
 
+  function handle_POST_contributors(
+    req: {
+      p: {
+        uid: null;
+        agreement_version: any;
+        name: any;
+        email: any;
+        github_id: any;
+        company_name: any;
+      };
+    },
+    res: { json: (arg0: {}) => void }
+  ) {
+    const uid = req.p.uid || null;
+    const agreement_version = req.p.agreement_version;
+    const name = req.p.name;
+    const email = req.p.email;
+    const github_id = req.p.github_id;
+    const company_name = req.p.company_name;
+
+    pg.queryP(
+      "insert into contributor_agreement_signatures (uid, agreement_version, github_id, name, email, company_name) " +
+        "values ($1, $2, $3, $4, $5, $6);",
+      [uid, agreement_version, github_id, name, email, company_name]
+    ).then(
+      () => {
+        emailTeam(
+          "contributor agreement signed",
+          [uid, agreement_version, github_id, name, email, company_name].join(
+            "\n"
+          )
+        );
+
+        res.json({});
+      },
+      (err: any) => {
+        // contributor_agreement_signatures is not created by any migration in
+        // server/postgres/migrations, so on a schema built from this repo the
+        // insert always fails with 42601-adjacent 42P01 (undefined_table).
+        // Answer with a code that names the real condition instead of the
+        // generic misc 500. See P-029 notes: the route has no caller in
+        // client-admin, client-participation-alpha, client-report or e2e and
+        // is a remove-or-410 candidate.
+        if (err && err.code === "42P01") {
+          failJson(res, 503, "polis_err_contributors_unavailable", err);
+          return;
+        }
+        failJson(res, 500, "polis_err_POST_contributors_misc", err);
+      }
+    );
+  }
+
   function handle_GET_testConnection(
     req: ExpressRequest,
     res: ExpressResponse

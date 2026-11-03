@@ -14,7 +14,7 @@ Rough explanation of the intended structure (general schema, not all files):
 
 📁 server/src/report_experimental/
 ├── readme.md # This documentation file
-├── system.xml # Main system prompt, specificying the role of the LLM agent
+├── system.xml # Main system prompt, specifying the role of the LLM agent
 └── 📁 subtaskPrompts/ # Folder containing subtask prompts
 ....├── uncertainty.xml # Handling uncertainty in reports
 ....└── 📁 common/ # Common subtask components
