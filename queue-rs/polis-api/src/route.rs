@@ -514,7 +514,7 @@ impl App {
             production: cfg.production,
             topic_selection_writer: None,
             cors: Cors::from_env(),
-            pca: Pca::new(db.clone(), cfg.math_env.clone(), cfg.cache_size),
+            pca: Pca::new(db.clone(), cfg.math_env.clone(), cfg.pca_cache_size),
             db,
             zids: Mutex::new(Lru::new(1000)),
             served: AtomicU64::new(0),
@@ -1127,7 +1127,10 @@ fn host(req: &Request) -> &str {
 /// request path this process does not serve: nginx forwards the raw URI, so
 /// a path nginx normalised to the route (`//`, `%70ca2`) arrives here
 /// unnormalised and goes back to Node, which answers it as it always has.
+#[cfg_attr(test, track_caller)]
 pub fn bad_gateway() -> Outgoing {
+    #[cfg(test)]
+    crate::startup_routes::dispatch_tests::observe_handback(std::panic::Location::caller());
     let bytes = b"Bad Gateway\n".to_vec();
     Outgoing {
         status: 502,
@@ -2347,7 +2350,7 @@ async fn pca2(app: &App, req: &Request, body: &Js, mut res: Res) -> anyhow::Resu
     if let Some(etag) = etag {
         res.set("Etag", etag);
     }
-    Ok(send(req, res, Payload::Bytes(data.gzip.clone())))
+    Ok(send(req, res, Payload::Bytes(data.gzip.to_vec())))
 }
 
 #[cfg(test)]
@@ -2458,6 +2461,7 @@ mod tests {
             listen: String::new(),
             math_env: "p".into(),
             cache_size: 300,
+            pca_cache_size: 300,
             dev_mode,
             use_network_host: false,
             production: true,
@@ -7048,3 +7052,7 @@ mod tests {
             c.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();}).await.unwrap();
     }
 }
+
+#[cfg(all(test, feature = "db-tests"))]
+#[path = "startup_pools_tests.rs"]
+mod startup_pools_tests;
