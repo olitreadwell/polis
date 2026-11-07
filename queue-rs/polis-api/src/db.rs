@@ -40,13 +40,26 @@ pub fn zid_for_conversation_id(client: &mut Client, conversation_id: &str) -> Re
     Ok(rows.first().map(|r| r.get::<_, i32>(0)))
 }
 
-/// Read the committed generation without fetching the JSONB payload.
-pub fn math_main_tick(client: &mut Client, zid: i32, math_env: &str) -> Result<Option<i64>> {
-    let rows = client.query(
-        "select math_tick from math_main where zid = ($1) and math_env = ($2)",
-        &[&zid, &math_env],
+/// Read the committed generation and transfer the JSONB text only when it
+/// differs from a reusable body. Typed parameters let the client send parse,
+/// bind and execute together, without preparing/closing a named statement.
+pub fn math_main_refresh(
+    client: &mut Client,
+    zid: i32,
+    math_env: &str,
+    held_tick: Option<f64>,
+) -> Result<Option<(i64, Option<String>)>> {
+    use postgres::types::Type;
+    let rows = client.query_typed(
+        "select math_tick, case when math_tick::float8 = $3 then null else data::text end \
+         from math_main where zid = $1 and math_env = $2",
+        &[
+            (&zid, Type::INT4),
+            (&math_env, Type::TEXT),
+            (&held_tick, Type::FLOAT8),
+        ],
     )?;
-    Ok(rows.first().map(|r| r.get(0)))
+    Ok(rows.first().map(|r| (r.get(0), r.get(1))))
 }
 
 pub fn math_main(client: &mut Client, zid: i32, math_env: &str) -> Result<Option<MathMainRow>> {
@@ -159,6 +172,12 @@ impl Drop for Pool {
 }
 
 impl Pool {
+    pub(crate) fn refresh_timeout(&self) -> Duration {
+        self.limits
+            .acquire_timeout
+            .saturating_add(self.limits.statement_timeout)
+    }
+
     pub(crate) fn health(&self, reachable: bool) -> crate::js::Js {
         let mut body = crate::js::Obj::new();
         body.set("readOnly", crate::js::Js::Bool(!self.writable));
@@ -299,6 +318,7 @@ impl Pool {
             .acquired
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pool = self.clone();
+        let observation = crate::db_connect::OBSERVATION.try_with(Arc::clone).ok();
         tokio::task::spawn_blocking(move || -> Result<T> {
             let _permit = permit;
             #[cfg(all(test, feature = "db-tests"))]
@@ -324,7 +344,15 @@ impl Pool {
                 Some((c, born)) if !c.is_closed() && born.elapsed() < pool.limits.max_lifetime => {
                     (c, born)
                 }
-                _ => (pool.connect().map_err(unavailable)?, Instant::now()),
+                _ => {
+                    let mut scope = observation.as_ref().map(|o| o.begin());
+                    let client = pool.connect().map_err(unavailable)?;
+                    if let Some(scope) = scope.as_mut() {
+                        scope.succeeded();
+                    }
+                    drop(scope);
+                    (client, Instant::now())
+                }
             };
             let out = f(&mut client).map_err(unavailable);
             if !client.is_closed() && born.elapsed() < pool.limits.max_lifetime {
