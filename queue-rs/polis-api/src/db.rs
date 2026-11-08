@@ -23,15 +23,6 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-/// One `math_main` row for `(zid, math_env)`.
-#[derive(Clone, Debug)]
-pub struct MathMainRow {
-    /// `math_main.math_tick` (BIGINT, default -1 before a tick is assigned).
-    pub math_tick: i64,
-    /// `math_main.data` (JSONB) as Postgres prints it.
-    pub data: String,
-}
-
 pub fn zid_for_conversation_id(client: &mut Client, conversation_id: &str) -> Result<Option<i32>> {
     let rows = client.query(
         "select zid from zinvites where zinvite = ($1)",
@@ -62,17 +53,6 @@ pub fn math_main_refresh(
     Ok(rows.first().map(|r| (r.get(0), r.get(1))))
 }
 
-pub fn math_main(client: &mut Client, zid: i32, math_env: &str) -> Result<Option<MathMainRow>> {
-    let rows = client.query(
-        "select math_tick, data::text from math_main where zid = ($1) and math_env = ($2)",
-        &[&zid, &math_env],
-    )?;
-    Ok(rows.first().map(|r| MathMainRow {
-        math_tick: r.get(0),
-        data: r.get(1),
-    }))
-}
-
 /// `select tid from comments where zid = ($1) and mod >= 1 order by tid`
 pub fn approved_tids(client: &mut Client, zid: i32) -> Result<Vec<i32>> {
     let rows = client.query(
@@ -96,6 +76,17 @@ impl std::fmt::Display for Unavailable {
 
 impl std::error::Error for Unavailable {}
 
+#[derive(Debug)]
+pub(crate) struct DispatchedAcquireTimeout {
+    pub waited: Duration,
+}
+impl std::fmt::Display for DispatchedAcquireTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dispatched pool acquire timeout")
+    }
+}
+impl std::error::Error for DispatchedAcquireTimeout {}
+
 /// True when `e` (or anything it wraps) is a database failure.
 pub fn is_unavailable(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Unavailable>())
@@ -113,6 +104,31 @@ pub struct Limits {
     pub statement_timeout: Duration,
     /// A connection older than this is closed instead of reused.
     pub max_lifetime: Duration,
+}
+
+// Keepalive idle (2 s) plus three probes at one-second intervals. Recently
+// used clients incur no checkout round trip; their first operation is bounded.
+const IDLE_CHECK_AFTER: Duration = Duration::from_secs(5);
+
+/// Connection bounds are local to each pool and independent of route timers.
+/// Five seconds leaves room for a slow TLS/SCRAM setup without retaining slots
+/// for minutes. Protocol operations also allow the existing statement timeout
+/// plus one second for the server response; statement timeouts never change.
+#[derive(Clone, Debug)]
+pub struct ConnectionBounds {
+    pub setup: Duration,
+    pub io: Duration,
+    pub dispatched_acquire: Duration,
+}
+
+impl Limits {
+    pub fn connection_bounds(&self) -> ConnectionBounds {
+        ConnectionBounds {
+            setup: Duration::from_secs(5),
+            io: Duration::from_secs(5).max(self.statement_timeout + Duration::from_secs(1)),
+            dispatched_acquire: Duration::from_secs(5),
+        }
+    }
 }
 
 // Test-only observations preserve the production acquisition future and limits.
@@ -145,9 +161,10 @@ impl PoolEvidence {
 
 pub struct Pool {
     connector: Connector,
-    idle: Mutex<Vec<(Client, Instant)>>,
+    idle: Mutex<Vec<(Client, Instant, Instant)>>,
     permits: Arc<Semaphore>,
     limits: Limits,
+    bounds: ConnectionBounds,
     writable: bool,
     #[cfg(all(test, feature = "db-tests"))]
     pub(crate) evidence: PoolEvidence,
@@ -211,6 +228,7 @@ impl Pool {
             connector,
             idle: Mutex::new(Vec::new()),
             permits: Arc::new(Semaphore::new(limits.size)),
+            bounds: limits.connection_bounds(),
             limits,
             writable,
             #[cfg(all(test, feature = "db-tests"))]
@@ -219,7 +237,8 @@ impl Pool {
     }
 
     fn connect(&self) -> Result<Client> {
-        let mut client = self.connector.connect()?;
+        let deadline = Instant::now() + self.bounds.setup;
+        let mut client = self.connector.connect_bounded(deadline, self.bounds.io)?;
         // Read pools retain their session guard. The writer has independent
         // slots and bounds lock waits as well as statement execution.
         let mode = if self.writable { "WRITE" } else { "ONLY" };
@@ -232,6 +251,7 @@ impl Pool {
                 "SET lock_timeout = 100; SET idle_in_transaction_session_timeout = 1000",
             )?;
         }
+        client.set_deadline(None);
         Ok(client)
     }
 
@@ -251,9 +271,10 @@ impl Pool {
         self.with_acquire_policy(None, f).await
     }
 
-    /// Wait indefinitely for an already dispatched write, reporting a long wait
-    /// once without cancelling its acquisition or losing its queue position.
-    /// No connection or blocking worker is held while waiting for the permit.
+    /// Wait for an already dispatched write within its pool's acquisition
+    /// bound, reporting the alarm once without losing queue position. Expiry
+    /// is a dispatch error, never a pre-dispatch hand-back. No connection or
+    /// blocking worker is held while waiting for the permit.
     pub(crate) async fn with_acquire_alarm<T, F>(
         self: &Arc<Self>,
         alarm_after: Duration,
@@ -293,14 +314,25 @@ impl Pool {
             })
         };
         let permit = if let Some((alarm_after, alarm)) = alarm {
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + self.bounds.dispatched_acquire;
             tokio::pin!(acquire);
-            match tokio::time::timeout(alarm_after, &mut acquire).await {
-                Ok(result) => result,
-                Err(_) => {
-                    alarm();
-                    acquire.await
+            tokio::time::timeout_at(deadline, async {
+                match tokio::time::timeout(alarm_after, &mut acquire).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        alarm();
+                        acquire.await
+                    }
                 }
-            }
+            })
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(DispatchedAcquireTimeout {
+                    waited: started.elapsed(),
+                })
+                .context(Unavailable("dispatched pool acquire timeout".into()))
+            })?
         } else {
             tokio::time::timeout(self.limits.acquire_timeout, acquire)
                 .await
@@ -340,11 +372,29 @@ impl Pool {
                 .lock()
                 .map_err(|_| unavailable("pool lock"))?
                 .pop();
-            let (mut client, born) = match cached {
-                Some((c, born)) if !c.is_closed() && born.elapsed() < pool.limits.max_lifetime => {
-                    (c, born)
+            let cached = match cached {
+                Some((mut client, born, returned))
+                    if born.elapsed() < pool.limits.max_lifetime && !client.is_closed() =>
+                {
+                    // Idle sockets are not polled by the synchronous runtime.
+                    // Only check after the keepalive detection window. A failed
+                    // check discards the client without a second setup attempt.
+                    if returned.elapsed() > IDLE_CHECK_AFTER {
+                        client.check_connection().map_err(unavailable)?;
+                    }
+                    Some((client, born))
                 }
-                _ => {
+                Some((client, _, _)) => {
+                    // Close the old socket before starting its replacement;
+                    // a discarded match value otherwise lives to scope end.
+                    drop(client);
+                    None
+                }
+                None => None,
+            };
+            let (mut client, born) = match cached {
+                Some(cached) => cached,
+                None => {
                     let mut scope = observation.as_ref().map(|o| o.begin());
                     let client = pool.connect().map_err(unavailable)?;
                     if let Some(scope) = scope.as_mut() {
@@ -358,7 +408,7 @@ impl Pool {
             if !client.is_closed() && born.elapsed() < pool.limits.max_lifetime {
                 let mut idle = pool.idle.lock().map_err(|_| unavailable("pool lock"))?;
                 if idle.len() < pool.limits.size {
-                    idle.push((client, born));
+                    idle.push((client, born, Instant::now()));
                 }
             }
             #[cfg(all(test, feature = "db-tests"))]
@@ -553,10 +603,19 @@ mod tests {
                 .unwrap(),
             None
         );
-        let row = pool.with(|c| math_main(c, 7, "p")).await.unwrap().unwrap();
-        assert_eq!(row.math_tick, 9);
-        assert_eq!(row.data, r#"{"n": 2, "tids": [1]}"#);
-        assert!(pool.with(|c| math_main(c, 7, "r")).await.unwrap().is_none());
+        let row = pool
+            .with(|c| math_main_refresh(c, 7, "p", None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.0, 9);
+        assert_eq!(row.1.unwrap(), r#"{"n": 2, "tids": [1]}"#);
+        assert!(
+            pool.with(|c| math_main_refresh(c, 7, "r", None))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             pool.with(|c| approved_tids(c, 7)).await.unwrap(),
             vec![2, 3]
@@ -639,3 +698,7 @@ mod tests {
         .unwrap();
     }
 }
+
+#[cfg(all(test, feature = "db-tests"))]
+#[path = "connection_bounds_tests.rs"]
+pub(crate) mod connection_bounds_tests;

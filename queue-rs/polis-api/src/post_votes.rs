@@ -25,9 +25,9 @@ pub(crate) const MAX_BODY_BYTES: usize = 65536;
 const REJECTED_COMMENT_MOD: i32 = -1;
 const ADMISSION_DEADLINE: Duration = Duration::from_millis(250);
 const DISPATCH_DEADLINE: Duration = Duration::from_secs(1);
-// Accepted work may outlive the HTTP response. Report a minute of writer
-// contention, then keep the same acquisition queued until a slot is available.
-const DISPATCH_ACQUIRE_ALARM: Duration = Duration::from_secs(60);
+// Accepted work may outlive the HTTP response. Report writer contention while
+// preserving queue position until the pool's dispatched-acquisition cutoff.
+const DISPATCH_ACQUIRE_ALARM: Duration = Duration::from_secs(1);
 
 pub(crate) struct Writer {
     pool: Arc<db::Pool>,
@@ -73,6 +73,10 @@ impl Writer {
             std::env::var("TOPICAL_COMMENT_RATIO").ok().as_deref() == Some("0"),
             "post votes requires explicit ordinary next-statement selection"
         );
+        anyhow::ensure!(
+            std::env::var("SHOULD_USE_TRANSLATION_API").ok().as_deref() == Some("false"),
+            "post votes requires SHOULD_USE_TRANSLATION_API=false"
+        );
         let dsn = std::env::var("POLIS_API_POST_VOTES_DATABASE_URL")
             .context("post votes requires an explicit primary database")?;
         let key = std::fs::read(std::env::var("POLIS_API_PARTICIPANT_PUBLIC_KEY_FILE")?)?;
@@ -117,7 +121,6 @@ fn request(req: &Request) -> Option<(String, contract::Request)> {
     if req.method != "POST"
         || req.query().is_some_and(|q| !q.is_empty())
         || req.body.len() > MAX_BODY_BYTES
-        || req.headers.get("cookie").is_some()
         || req.headers.get("content-encoding").is_some()
         || !matches!(
             req.headers.get("content-type"),
@@ -131,11 +134,20 @@ fn request(req: &Request) -> Option<(String, contract::Request)> {
     if obj.keys().any(|k| {
         !matches!(
             k.as_str(),
-            "conversation_id" | "tid" | "vote" | "starred" | "high_priority" | "lang"
+            "conversation_id"
+                | "tid"
+                | "vote"
+                | "starred"
+                | "high_priority"
+                | "lang"
+                | "pid"
+                | "agid"
         )
     }) {
         return None;
     }
+    // Node ignores body pid/agid. The field codec discards them too; only the
+    // verified token and resolved membership may identify the voter.
     let raw: contract::Request = serde_json::from_value(value).ok()?;
     let cid = contract::string(raw.conversation_id.as_ref()?, 100)?;
     if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -145,6 +157,8 @@ fn request(req: &Request) -> Option<(String, contract::Request)> {
 }
 
 pub(crate) fn eligible(app: &App, req: &Request) -> bool {
+    // Cookies neither authenticate nor disqualify a caller. handle still
+    // requires a supported verified Bearer and membership before dispatch.
     app.post_votes.is_some()
         && app.production
         && request(req).is_some()
@@ -236,7 +250,13 @@ fn admit(
     }))
 }
 
-fn next(c: &mut Client, a: &Admitted, env: &str, unit: f64) -> Result<Option<Js>> {
+fn next(
+    c: &mut Client,
+    a: &Admitted,
+    env: &str,
+    unit: f64,
+    lang: Option<&str>,
+) -> Result<Option<Js>> {
     let strict = c
         .query_one(
             "select strict_moderation from conversations where zid=$1",
@@ -251,10 +271,10 @@ fn next(c: &mut Client, a: &Admitted, env: &str, unit: f64) -> Result<Option<Js>
     };
     let rows = c.query(
         &format!(
-            "select * from comments where zid=$1
+            "select tid from comments where zid=$1
          and tid not in (select tid from votes_latest_unique where zid=$1 and pid=$2)
          and active=true and {moderation} and velocity>0
-         order by created limit 999"
+         order by created"
         ),
         &[&a.zid, &a.pid],
     )?;
@@ -262,10 +282,6 @@ fn next(c: &mut Client, a: &Admitted, env: &str, unit: f64) -> Result<Option<Js>
         .iter()
         .map(|row| row.try_get::<_, i32>("tid"))
         .collect::<Result<Vec<_>, _>>()?;
-    let rows = rows
-        .iter()
-        .map(comments::project)
-        .collect::<Result<Vec<_>>>()?;
     let data = priorities(c, a.zid, env)?;
     let counts = c.query_one(
         "with v as (select * from votes_latest_unique where zid=$1 and pid=$2),
@@ -275,17 +291,65 @@ fn next(c: &mut Client, a: &Admitted, env: &str, unit: f64) -> Result<Option<Js>
          select remaining.n,total.n from remaining,total",
         &[&a.zid, &a.pid],
     )?;
-    if rows.is_empty() {
+    if tids.is_empty() {
         return Ok(None);
     }
     let priorities = data.as_ref().and_then(Js::as_obj);
     let (index, random) = next_comment::select(&tids, priorities, unit)?;
-    let mut row = rows[index].as_obj().cloned().context("invalid statement")?;
+    let selected = c.query_one(
+        "select * from comments where zid=$1 and tid=$2",
+        &[&a.zid, &tids[index]],
+    )?;
+    let mut row = comments::project(&selected)?
+        .as_obj()
+        .cloned()
+        .context("invalid statement")?;
     row.set("randomN", Js::Num(random));
     row.set("remaining", Js::Num(counts.try_get::<_, i64>(0)? as f64));
     row.set("total", Js::Num(counts.try_get::<_, i64>(1)? as f64));
-    row.set("translations", Js::Arr(vec![]));
+    // Node skips the stored read entirely without a requested language. Keep
+    // language admission closed until provider suppression is known before
+    // dispatch; this follow-on must never authorize replaying a committed vote.
+    let translations = if lang.is_some_and(|lang| !lang.is_empty()) {
+        // Optional translation failure keeps the selected statement, as Node
+        // does. This SELECT uses the existing reads client/statement deadline,
+        // after commit, with no provider, transaction or explicit lock.
+        stored_translations(c, a.zid, tids[index]).unwrap_or_default()
+    } else {
+        vec![]
+    };
+    row.set("translations", Js::Arr(translations));
     Ok(Some(Js::Obj(row)))
+}
+
+// Node's SELECT * returns all languages/sources, in database order. Preserve
+// both that row order and column order; int8 values remain strings, as in pg.
+fn stored_translations(c: &mut Client, zid: i32, tid: i32) -> Result<Vec<Js>> {
+    c.query(
+        "select * from comment_translations where zid = ($1) and tid = ($2);",
+        &[&zid, &tid],
+    )?
+    .iter()
+    .map(|row| {
+        let mut out = js::Obj::new();
+        for (index, column) in row.columns().iter().enumerate() {
+            let value = match *column.type_() {
+                postgres::types::Type::INT4 => row
+                    .try_get::<_, Option<i32>>(index)?
+                    .map(|n| Js::Num(f64::from(n))),
+                postgres::types::Type::INT8 => row
+                    .try_get::<_, Option<i64>>(index)?
+                    .map(|n| Js::Str(n.to_string())),
+                postgres::types::Type::VARCHAR | postgres::types::Type::TEXT => {
+                    row.try_get::<_, Option<String>>(index)?.map(Js::Str)
+                }
+                _ => anyhow::bail!("unsupported translation column"),
+            };
+            out.set(column.name(), value.unwrap_or(Js::Null));
+        }
+        Ok(Js::Obj(out))
+    })
+    .collect()
 }
 
 enum Outcome {
@@ -370,8 +434,14 @@ fn star(c: &mut Client, a: &Admitted, fields: &ParsedFields, created: i64) -> Re
     Ok(())
 }
 
-fn complete(c: &mut Client, a: &Admitted, env: &str, unit: f64) -> Result<contract::Success> {
-    let next_comment = next(c, a, env, unit)?
+fn complete(
+    c: &mut Client,
+    a: &Admitted,
+    env: &str,
+    unit: f64,
+    lang: Option<&str>,
+) -> Result<contract::Success> {
+    let next_comment = next(c, a, env, unit, lang)?
         .map(|next| {
             serde_json::value::RawValue::from_string(js::stringify(&next))
                 .map(contract::NextComment)
@@ -423,9 +493,7 @@ pub(crate) async fn handle(app: &App, req: &Request, res: Res) -> Outgoing {
         Ok(fields) => fields,
         Err(_) => return route::parameter_error(app, req, res),
     };
-    if fields.lang.as_ref().is_some_and(|s| !s.is_empty())
-        || !(i32::MIN as f64..=i32::MAX as f64).contains(&fields.tid)
-    {
+    if !(i32::MIN as f64..=i32::MAX as f64).contains(&fields.tid) {
         return route::bad_gateway();
     }
     if !admitted.active {
@@ -550,12 +618,12 @@ async fn dispatch(
         .as_ref()
         .and_then(|o| o.lock().unwrap().acquire_alarm_after)
         .unwrap_or(alarm_after);
-    let (zid, pid, tid, vote) = (admitted.zid, admitted.pid, fields.tid, fields.vote.wire());
+    let (zid, tid) = (admitted.zid, fields.tid);
     let created = pool
         .with_acquire_alarm(alarm_after, move || {
-            let count = ACQUIRE_ALARM_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            ACQUIRE_ALARM_HITS.fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "{{\"event\":\"post_votes_writer_acquire_alarm\",\"count\":{count},\"alarmMs\":{},\"zid\":{zid},\"pid\":{pid},\"tid\":{tid},\"vote\":{vote}}}",
+                "{{\"event\":\"post_votes_writer_acquire_alarm\",\"alarmMs\":{},\"zid\":{zid},\"tid\":{tid}}}",
                 alarm_after.as_millis()
             );
             #[cfg(all(test, feature = "db-tests"))]
@@ -578,7 +646,15 @@ async fn dispatch(
                 },
             }
         })
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if let Some(timeout) = error.downcast_ref::<db::DispatchedAcquireTimeout>() {
+                eprintln!(
+                    "{{\"event\":\"post_votes_writer_acquire_cutoff\",\"zid\":{zid},\"tid\":{tid},\"wait_ms\":{}}}",
+                    timeout.waited.as_millis()
+                );
+            }
+        })?;
     let created = match created {
         Ok(created) => created,
         Err(outcome) => return Ok(outcome),
@@ -593,6 +669,7 @@ async fn dispatch(
     if !notified {
         body.follow_on.notifications = NotificationState::Degraded;
     }
+    let lang = fields.lang.clone();
     if fields.starred.is_some() {
         let a = admitted.clone();
         if pool
@@ -605,7 +682,10 @@ async fn dispatch(
         body.follow_on.star = FollowOnState::Complete;
     }
     let a = admitted.clone();
-    if let Ok(completed) = reads.with(move |c| complete(c, &a, &env, unit)).await {
+    if let Ok(completed) = reads
+        .with(move |c| complete(c, &a, &env, unit, lang.as_deref()))
+        .await
+    {
         body.next_comment = completed.next_comment;
         body.follow_on.next_comment = if body.next_comment.is_some() {
             FollowOnState::Complete

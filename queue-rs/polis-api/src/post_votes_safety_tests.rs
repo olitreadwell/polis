@@ -1845,3 +1845,245 @@ fn revocation_snapshot_adds_no_vote_request_statements() {
         );
     }
 }
+
+#[path = "post_votes_connection_tests.rs"]
+mod connection_bounds;
+
+// Exercise the real route, verifier, membership lookup and writer. Body hints
+// and cookies cannot select the actor; handbacks must precede dispatch.
+fn vote_admission_case(
+    label: &str,
+    hints: bool,
+    cookie: bool,
+    token: &str,
+    extra: Option<&str>,
+    served: bool,
+) {
+    let db = Database::new(label);
+    let (app, mut request) = setup(&db);
+    let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    if hints {
+        body["pid"] = json!(999);
+        body["agid"] = json!({"ignored": true});
+    }
+    if let Some(field) = extra {
+        body[field] = json!("en");
+    }
+    request.body = serde_json::to_vec(&body).unwrap();
+    let saved = request.headers.get("authorization").unwrap().to_owned();
+    let mut headers = vec![
+        ("host", "localhost"),
+        ("content-type", "application/json"),
+        ("x-forwarded-proto", "https"),
+    ];
+    if cookie {
+        headers.push(("cookie", "pc=another-participant; session=untrusted"));
+    }
+    match token {
+        "valid" => headers.push(("authorization", &saved)),
+        "invalid" => headers.push(("authorization", "Bearer invalid")),
+        "missing" => {}
+        _ => panic!("unknown fixture credential"),
+    }
+    request.headers = Headers::from_raw(headers);
+    runtime().block_on(async {
+        let (response, _, observation) =
+            observed_handle_with_completion(app.clone(), request).await;
+        if served {
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                accepted_body(&response).current_pid,
+                0,
+                "signed pid wins over body and cookie"
+            );
+            let receipt = durable_dispatch(&db, &response, observation).await;
+            assert!(!receipt.replayed);
+        } else {
+            assert_handback(&response);
+            assert!(!observation.lock().unwrap().created);
+        }
+        wait_for_idle(app.post_votes.as_ref().unwrap()).await;
+    });
+    let mut c = db.connect();
+    assert_eq!(
+        c.query_one("SELECT count(*) FROM votes", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        i64::from(served)
+    );
+    assert_eq!(
+        c.query_one("SELECT count(*) FROM votes_latest_unique", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        i64::from(served)
+    );
+    if served {
+        let row = c.query_one("SELECT pid, vote FROM votes", &[]).unwrap();
+        assert_eq!(row.get::<_, i32>(0), 0);
+        assert_eq!(
+            i32::from(row.get::<_, i16>(1)),
+            contract::stored_vote(VoteChoice::Agree)
+        );
+    }
+}
+
+#[test]
+fn vote_admission_body_hints_with_verified_token_are_served() {
+    vote_admission_case("admit_hints", true, false, "valid", None, true);
+}
+
+#[test]
+fn vote_admission_other_unknown_key_hands_back() {
+    vote_admission_case(
+        "admit_unknown",
+        true,
+        false,
+        "valid",
+        Some("unknown"),
+        false,
+    );
+}
+
+#[test]
+fn vote_admission_cookie_with_verified_token_is_served() {
+    vote_admission_case("admit_cookie", false, true, "valid", None, true);
+}
+
+#[test]
+fn vote_admission_cookie_and_body_hints_with_verified_token_are_served() {
+    vote_admission_case("admit_combined", true, true, "valid", None, true);
+}
+
+#[test]
+fn vote_admission_cookie_without_token_hands_back() {
+    vote_admission_case("admit_missing", false, true, "missing", None, false);
+}
+
+#[test]
+fn vote_admission_cookie_with_invalid_token_hands_back() {
+    vote_admission_case("admit_invalid", false, true, "invalid", None, false);
+}
+
+#[test]
+fn vote_admission_language_serves_stored_node_bytes_without_a_provider() {
+    for (index, lang) in ["fr", "EN-gb", ""].into_iter().enumerate() {
+        let db = Database::new(&format!("admit_language_{index}"));
+        let (app, mut request) = setup(&db);
+        db.connect()
+            .batch_execute(
+                "INSERT INTO comments(zid,pid,uid,txt,lang,created)
+            VALUES(1,0,1,'Generated statement','en',10);
+            INSERT INTO comment_translations(zid,tid,src,txt,lang,created,modified) VALUES
+            (1,0,23,'Bonjour 🌍','fr',9007199254740993,NULL),
+            (1,0,-1,'Hallo \"Welt\"','de',12,13);",
+            )
+            .unwrap();
+        let mut fields: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        fields["lang"] = json!(lang);
+        fields["pid"] = json!(999);
+        request.body = serde_json::to_vec(&fields).unwrap();
+        runtime().block_on(async {
+            let (response, _, observation) =
+                observed_handle_with_completion(app.clone(), request).await;
+            assert_eq!(response.status, 200);
+            assert!(observation.lock().unwrap().created);
+            let receipt = durable_dispatch(&db, &response, observation).await;
+            assert!(!receipt.replayed);
+            let body = accepted_body(&response);
+            let next = body.next_comment.unwrap();
+            let raw = next.0.get();
+            let start = raw.find("\"translations\":").unwrap() + "\"translations\":".len();
+            let expected = if lang.is_empty() {
+                "[]"
+            } else {
+                super::translations::stored_node_rows()
+            };
+            assert_eq!(&raw[start..raw.len() - 1], expected);
+            wait_for_idle(app.post_votes.as_ref().unwrap()).await;
+        });
+        let mut c = db.connect();
+        assert_eq!(
+            c.query_one("SELECT count(*) FROM votes", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            c.query_one("SELECT count(*) FROM votes_latest_unique", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            i32::from(
+                c.query_one("SELECT vote FROM votes", &[])
+                    .unwrap()
+                    .get::<_, i16>(0)
+            ),
+            contract::stored_vote(VoteChoice::Agree)
+        );
+    }
+}
+
+#[test]
+fn stored_translation_dispatch_uses_reads_after_commit_and_keeps_receipt_on_timeout() {
+    let db = Database::new("translation_dispatch");
+    let (app, _) = setup(&db);
+    db.connect()
+        .batch_execute(
+            "INSERT INTO comments(zid,pid,uid,txt,lang) VALUES(1,0,1,'Generated statement','en');
+         INSERT INTO comment_translations(zid,tid,src,txt,lang,created,modified)
+         VALUES(1,0,23,'Bonjour','fr',10,11);",
+        )
+        .unwrap();
+    let mut lock = db.connect();
+    for blocked in [false, true] {
+        if blocked {
+            lock.batch_execute("BEGIN; LOCK TABLE comment_translations IN ACCESS EXCLUSIVE MODE")
+                .unwrap();
+        }
+        let receipt = Arc::new(Mutex::new(None));
+        let mut fields = database::fields(VoteChoice::Agree);
+        fields.lang = Some("fr".into());
+        // Exercise the follow-on directly to isolate translation-read failure
+        // after the receipt has committed.
+        let body = runtime().block_on(async {
+            let writer = app.post_votes.as_ref().unwrap();
+            let result = dispatch(
+                writer.pool.clone(),
+                writer.reads.clone(),
+                writer.background.clone(),
+                database::actor(),
+                fields,
+                "test".into(),
+                0.5,
+                receipt.clone(),
+                ActiveDispatch::new(),
+            )
+            .await
+            .unwrap();
+            wait_for_idle(writer).await;
+            match result {
+                Outcome::Success(body) => body,
+                Outcome::Failure(_, code) => panic!("unexpected failure: {code}"),
+            }
+        });
+        assert!(receipt.lock().unwrap().is_some());
+        assert_eq!(body.vote.replayed, blocked);
+        assert_eq!(body.follow_on.next_comment, FollowOnState::Complete);
+        let bytes = serde_json::to_string(&body.next_comment.unwrap()).unwrap();
+        if blocked {
+            assert!(bytes.ends_with("\"translations\":[]}"));
+            lock.batch_execute("ROLLBACK").unwrap();
+        } else {
+            assert!(bytes.ends_with(r#""translations":[{"zid":1,"tid":0,"src":23,"txt":"Bonjour","lang":"fr","created":"10","modified":"11"}]}"#));
+        }
+        assert_eq!(
+            db.connect()
+                .query_one("SELECT count(*) FROM votes", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+    }
+}
