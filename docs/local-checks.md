@@ -138,7 +138,13 @@ check and v1 ratchet remain required. TLS is a twelve-image matrix: set one
 every leg. The server leg also runs the backup-package tests.
 
 Server integration needs an owned `RUNNER_TEMP`, `POLIS_TEST_IMAGE_TAG`,
-Compose project and database port. It generates certificates and edits only
+Compose project and database port. When `RUNNER_ENVIRONMENT=github-hosted`,
+the shared entry point installs mkcert from the signed Ubuntu package
+repositories with three download retries and trusts its CA. A failed package
+index update or install stops setup with an error naming the failed step.
+There is no GitHub release download. Local and self-hosted runs use the
+existing mkcert and leave host trust stores unchanged.
+It generates certificates and edits only
 the disposable checkout's test environment. Other service ports follow the
 existing test stack. Choose published ports below 32768 (for example 20000–29999);
 the entrypoint refuses any published Compose port at or above 32768 before
@@ -150,6 +156,14 @@ override too. It retains the original 60-iteration readiness loop,
 contract generation check, migration check and Jest arguments. A redundant,
 nonfatal AWS CLI localhost diagnostic is omitted; Dynamo readiness still uses
 the same HTTP request. No cloud account is needed.
+
+For E2E, the shared entry point installs mkcert from the signed Ubuntu package
+repositories when `RUNNER_ENVIRONMENT=github-hosted`, with three
+package-download retries, and trusts its CA there. Package failures stop setup
+with an error naming the failed apt step. It does not download a GitHub release.
+The distribution's mkcert 1.4.4 supports the DNS names and IP addresses used by
+the test certificates. Local and self-hosted runs use the existing mkcert and
+leave host trust stores unchanged.
 
 For E2E use an exclusive host with the fixed stack ports free. Set
 `E2E_CHECK_PROJECT` and `E2E_CHECK_OUT` per shard, and leave `E2E_CHECK_KEEP`
