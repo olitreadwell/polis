@@ -115,6 +115,10 @@ esac
 POLIS_API_IMAGE_AVAILABLE=1
 SHADOW_SELECTED=0
 COMMENTS_SHADOW_SELECTED=0
+READS_SHADOW_SELECTED=0
+VOTES_READ_SHADOW_SELECTED=0
+COMMENTS_READ_SHADOW_SELECTED=0
+NEXT_COMMENT_SHADOW_SELECTED=0
 if [ "$SERVICE_FROM_FILE" == "server" ]; then
   # Resolve the new revision's environment before pulling images. The previous
   # image override is not needed here. Never print config: it contains credentials.
@@ -128,12 +132,25 @@ if [ "$SERVICE_FROM_FILE" == "server" ]; then
   VOTES_SHADOW_SELECTED=0
   POST_VOTES_SELECTED=0
   POST_COMMENTS_SELECTED=0
+  # The read shadows (votesReadShadow, commentsReadShadow, nextCommentShadow):
+  # nginx copies each GET of that read Node answers to polis-api-shadow-reads,
+  # a service of its own, which runs when any of them is selected. Each is
+  # refused together with the read route that has Rust answer that read.
+  VOTES_READ_SELECTED=0
+  COMMENT_READS_SELECTED=0
+  NEXT_COMMENT_SELECTED=0
   for route in $(printf '%s' "$RUST_API_ROUTES_SELECTED" | tr ',' ' '); do
     case "$route" in
       votesShadow) VOTES_SHADOW_SELECTED=1; SHADOW_SELECTED=1 ;;
       commentsShadow) COMMENTS_SHADOW_SELECTED=1; SHADOW_SELECTED=1 ;;
+      votesReadShadow) VOTES_READ_SHADOW_SELECTED=1; READS_SHADOW_SELECTED=1 ;;
+      commentsReadShadow) COMMENTS_READ_SHADOW_SELECTED=1; READS_SHADOW_SELECTED=1 ;;
+      nextCommentShadow) NEXT_COMMENT_SHADOW_SELECTED=1; READS_SHADOW_SELECTED=1 ;;
       postVotes) POST_VOTES_SELECTED=1 ;;
       postComments) POST_COMMENTS_SELECTED=1 ;;
+      votesRead) VOTES_READ_SELECTED=1 ;;
+      comments) COMMENT_READS_SELECTED=1 ;;
+      nextComment) NEXT_COMMENT_SELECTED=1 ;;
     esac
   done
   if [ "$VOTES_SHADOW_SELECTED" = 1 ] && [ "$POST_VOTES_SELECTED" = 1 ]; then
@@ -142,6 +159,18 @@ if [ "$SERVICE_FROM_FILE" == "server" ]; then
   fi
   if [ "$COMMENTS_SHADOW_SELECTED" = 1 ] && [ "$POST_COMMENTS_SELECTED" = 1 ]; then
     echo "commentsShadow and postComments cannot be selected together; refusing service replacement" >&2
+    exit 1
+  fi
+  if [ "$VOTES_READ_SHADOW_SELECTED" = 1 ] && [ "$VOTES_READ_SELECTED" = 1 ]; then
+    echo "votesReadShadow and votesRead cannot be selected together; refusing service replacement" >&2
+    exit 1
+  fi
+  if [ "$COMMENTS_READ_SHADOW_SELECTED" = 1 ] && [ "$COMMENT_READS_SELECTED" = 1 ]; then
+    echo "commentsReadShadow and comments cannot be selected together; refusing service replacement" >&2
+    exit 1
+  fi
+  if [ "$NEXT_COMMENT_SHADOW_SELECTED" = 1 ] && [ "$NEXT_COMMENT_SELECTED" = 1 ]; then
+    echo "nextCommentShadow and nextComment cannot be selected together; refusing service replacement" >&2
     exit 1
   fi
   POLIS_API_START=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["polis-api"].environment.POLIS_API_START // "0"')
@@ -160,6 +189,13 @@ if [ "$SERVICE_FROM_FILE" == "server" ]; then
     SHADOW_TRANSPORT=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["polis-api-shadow"].environment.POLIS_API_DB_TRANSPORT // "tls"')
     if [ "$SHADOW_TRANSPORT" != tls ]; then
       echo "The web deployment requires verified TLS for polis-api-shadow" >&2
+      exit 1
+    fi
+  fi
+  if [ "$READS_SHADOW_SELECTED" = 1 ]; then
+    READS_SHADOW_TRANSPORT=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml --profile rust-api config --format json | jq -r '.services["polis-api-shadow-reads"].environment.POLIS_API_DB_TRANSPORT // "tls"')
+    if [ "$READS_SHADOW_TRANSPORT" != tls ]; then
+      echo "The web deployment requires verified TLS for polis-api-shadow-reads" >&2
       exit 1
     fi
   fi
@@ -266,6 +302,21 @@ if [ -n "$ROLE_IMAGES" ]; then
       if [ "$COMMENTS_SHADOW_SELECTED" = 1 ]; then
         printf '    environment:\n      - POLIS_API_POST_COMMENTS=observe\n'
       fi
+      # The read shadow service, only when a read shadow is named: the
+      # polis-api image, and observe on the switch of each lane whose
+      # selector is named. With none named this file says nothing about it.
+      if [ "$READS_SHADOW_SELECTED" = 1 ]; then
+        printf '  polis-api-shadow-reads:\n    image: %s\n    environment:\n' "$(image_ref polis-api)"
+        if [ "$VOTES_READ_SHADOW_SELECTED" = 1 ]; then
+          printf '      - POLIS_API_VOTES_READS=observe\n'
+        fi
+        if [ "$COMMENTS_READ_SHADOW_SELECTED" = 1 ]; then
+          printf '      - POLIS_API_COMMENT_READS=observe\n'
+        fi
+        if [ "$NEXT_COMMENT_SHADOW_SELECTED" = 1 ]; then
+          printf '      - POLIS_API_NEXT_COMMENT_READS=observe\n'
+        fi
+      fi
     fi
   } | sudo tee docker-compose.images.yml > /dev/null
 else
@@ -297,11 +348,34 @@ if [ "$SHADOW_SELECTED" = 1 ]; then
   # would start as the main role, without the shadow's listener and with the
   # env document's signing key. So the composed service must have the shadow
   # role, the listener nginx sends its copies to, the vote observer's switch
-  # at observe, and both signing-key settings blank. jq prints the names of
-  # the settings that are not so, never a value. Never print config.
-  SHADOW_SETTINGS_WRONG=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml -f docker-compose.images.yml --profile rust-api config --format json | jq -r '.services["polis-api-shadow"].environment as $e | [(if ($e.POLIS_API_ROLE // "") == "shadow" then empty else "POLIS_API_ROLE" end), (if ($e.POLIS_API_SHADOW_LISTEN // "") == "0.0.0.0:5101" then empty else "POLIS_API_SHADOW_LISTEN" end), (if ($e.POLIS_API_POST_VOTES // "") == "observe" then empty else "POLIS_API_POST_VOTES" end), (if ($e.JWT_PRIVATE_KEY // "") == "" then empty else "JWT_PRIVATE_KEY" end), (if ($e.JWT_PRIVATE_KEY_PATH // "") == "" then empty else "JWT_PRIVATE_KEY_PATH" end)] | join(" ")')
+  # at observe, both signing-key settings blank, and the three read lanes'
+  # switches empty: the read lanes never run beside the vote and comment
+  # observers. jq prints the names of the settings that are not so, never a
+  # value. Never print config.
+  SHADOW_SETTINGS_WRONG=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml -f docker-compose.images.yml --profile rust-api config --format json | jq -r '.services["polis-api-shadow"].environment as $e | [(if ($e.POLIS_API_ROLE // "") == "shadow" then empty else "POLIS_API_ROLE" end), (if ($e.POLIS_API_SHADOW_LISTEN // "") == "0.0.0.0:5101" then empty else "POLIS_API_SHADOW_LISTEN" end), (if ($e.POLIS_API_POST_VOTES // "") == "observe" then empty else "POLIS_API_POST_VOTES" end), (if ($e.JWT_PRIVATE_KEY // "") == "" then empty else "JWT_PRIVATE_KEY" end), (if ($e.JWT_PRIVATE_KEY_PATH // "") == "" then empty else "JWT_PRIVATE_KEY_PATH" end), (if ($e.POLIS_API_VOTES_READS // "") == "" then empty else "POLIS_API_VOTES_READS" end), (if ($e.POLIS_API_COMMENT_READS // "") == "" then empty else "POLIS_API_COMMENT_READS" end), (if ($e.POLIS_API_NEXT_COMMENT_READS // "") == "" then empty else "POLIS_API_NEXT_COMMENT_READS" end)] | join(" ")')
   if [ -n "$SHADOW_SETTINGS_WRONG" ]; then
     echo "polis-api-shadow's composed settings are not the shadow service's ($SHADOW_SETTINGS_WRONG); refusing service replacement" >&2
+    exit 1
+  fi
+fi
+
+# The read shadow service is about to start: each lane's switch that the
+# composed configuration gives it must be the one the route list calls for,
+# observe exactly when its selector is named and empty otherwise; and what
+# starts must be the read shadow service: the shadow role, the listener nginx
+# sends its read copies to, no vote, identity or comment observer (they share
+# no process with the read lanes), participant tokens verified, and both
+# signing-key settings blank. jq prints the names of the settings that are
+# not so, never a value. Never print config.
+if [ "$READS_SHADOW_SELECTED" = 1 ]; then
+  READS_SHADOW_SWITCHES_WRONG=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml -f docker-compose.images.yml --profile rust-api config --format json | jq -r --arg votes "$VOTES_READ_SHADOW_SELECTED" --arg comments "$COMMENTS_READ_SHADOW_SELECTED" --arg next "$NEXT_COMMENT_SHADOW_SELECTED" '.services["polis-api-shadow-reads"].environment as $e | [["POLIS_API_VOTES_READS", $votes], ["POLIS_API_COMMENT_READS", $comments], ["POLIS_API_NEXT_COMMENT_READS", $next]] | map(select(($e[.[0]] // "") != (if .[1] == "1" then "observe" else "" end)) | .[0]) | join(" ")')
+  if [ -n "$READS_SHADOW_SWITCHES_WRONG" ]; then
+    echo "polis-api-shadow-reads's read lane switches do not follow RUST_API_ROUTES ($READS_SHADOW_SWITCHES_WRONG); refusing service replacement" >&2
+    exit 1
+  fi
+  READS_SHADOW_SETTINGS_WRONG=$(sudo /usr/local/bin/docker-compose -f docker-compose.yml -f docker-compose.images.yml --profile rust-api config --format json | jq -r '.services["polis-api-shadow-reads"].environment as $e | [(if ($e.POLIS_API_ROLE // "") == "shadow" then empty else "POLIS_API_ROLE" end), (if ($e.POLIS_API_SHADOW_LISTEN // "") == "0.0.0.0:5102" then empty else "POLIS_API_SHADOW_LISTEN" end), (if ($e.POLIS_API_POST_VOTES // "") == "" then empty else "POLIS_API_POST_VOTES" end), (if ($e.POLIS_API_POST_VOTES_IDENTITY // "") == "" then empty else "POLIS_API_POST_VOTES_IDENTITY" end), (if ($e.POLIS_API_POST_COMMENTS // "") == "" then empty else "POLIS_API_POST_COMMENTS" end), (if ($e.POLIS_API_PARTICIPANT_READS // "") == "observe" then empty else "POLIS_API_PARTICIPANT_READS" end), (if ($e.JWT_PRIVATE_KEY // "") == "" then empty else "JWT_PRIVATE_KEY" end), (if ($e.JWT_PRIVATE_KEY_PATH // "") == "" then empty else "JWT_PRIVATE_KEY_PATH" end)] | join(" ")')
+  if [ -n "$READS_SHADOW_SETTINGS_WRONG" ]; then
+    echo "polis-api-shadow-reads's composed settings are not the read shadow service's ($READS_SHADOW_SETTINGS_WRONG); refusing service replacement" >&2
     exit 1
   fi
 fi
@@ -364,6 +438,16 @@ if [ "$SERVICE_FROM_FILE" == "server" ]; then
   if [ "$SHADOW_SELECTED" = 1 ]; then
     if ! "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate polis-api-shadow; then
       echo "polis-api-shadow start failed" >&2
+      exit 1
+    fi
+  fi
+  # A read shadow is selected (votesReadShadow, commentsReadShadow,
+  # nextCommentShadow, or more than one), so the read shadow service's start
+  # is a requirement of this deploy. It was removed with the rust-api profile
+  # above; with none selected, it stays removed.
+  if [ "$READS_SHADOW_SELECTED" = 1 ]; then
+    if ! "${COMPOSE[@]}" up -d --no-deps --no-build --force-recreate polis-api-shadow-reads; then
+      echo "polis-api-shadow-reads start failed" >&2
       exit 1
     fi
   fi
@@ -477,27 +561,59 @@ elif [ "$SERVICE_FROM_FILE" == "delphi" ]; then
   # publication fence. Delphi's report role on every box is unaffected. An
   # ASG max of 1 for the Delphi small group is a later belt-and-braces CDK
   # change, not needed for correctness.
-  # Durable stop: remove `math-python` from this line and redeploy (the hook
-  # removes this Compose project's containers before starting the named ones).
+  # Durable stop: remove `math-python` from DELPHI_SERVICES below and redeploy
+  # (the hook removes this Compose project's containers before starting the
+  # named ones). ValidateService (scripts/validate_service.sh) requires
+  # exactly the services that line names, read from this file, so keep it one
+  # line of plain names. The tests that pin the Delphi box's services
+  # (delphi/tests/test_compose_math_env.py, test_after_install_hook.py) change
+  # with it.
   # Removing only the holder's container is a FAILOVER, not a stop: a waiting
   # poller on another Delphi box takes the lock. Fleet-wide emergency stop:
   #   1. Pause anything that runs this hook: no deploy, and suspend Launch on
   #      both Delphi ASGs (AsgDelphiSmall, AsgDelphiLarge) so no new box starts
   #      a poller; list every InService instance in both groups.
-  #   2. On every box, via SSM Run Command targeted at both groups, find the
-  #      math-python container; its log says `holding single-writer lock` on
-  #      the holder, `waiting for single-writer lock` on standbys.
+  #   2. On every box, via SSM, list the math-python containers by label
+  #      (docker ps -a --filter label=com.docker.compose.service=math-python).
+  #      The holder is the session holding the advisory lock
+  #      hashtext('polis-math-python:python') in pg_locks; its
+  #      application_name is math-python:python@<short container id>. Every
+  #      other math-python container is a standby. Run the SQL on a Delphi box
+  #      (inside its delphi container), never from outside the VPC.
   #   3. `sudo docker rm -f` the standbys' math-python containers first, then
   #      the holder's, so nothing is admitted during the stop.
-  #   4. Verify: no math-python container on any box (SSM across both groups);
-  #      zero rows from `SELECT application_name FROM pg_stat_activity WHERE
-  #      application_name LIKE 'math-python:%'`; max(math_tick) under
-  #      math_env='python' no longer advances.
-  #   5. Make it durable (remove `math-python` here and redeploy) before
-  #      resuming deploys or ASG launches.
+  #   4. Verify: no math-python container on any box; no holder of that lock
+  #      and no session with application_name LIKE 'math-python:python@%'
+  #      (not 'math-python:%', which also matches the large class's
+  #      math-python:python-large@ queue child); max(modified) from math_ticks
+  #      under math_env='python' unchanged between two readings.
+  #   5. Make it durable (remove `math-python` from DELPHI_SERVICES and
+  #      redeploy), check that deployment succeeded and was not rolled back
+  #      (a rollback runs the previous revision, which starts math-python),
+  #      repeat step 4, and only then resume deploys or ASG launches.
   poller_identity
+  DELPHI_SERVICES=(delphi math-python)
   "${COMPOSE[@]}" down
-  "${COMPOSE[@]}" up -d delphi math-python --no-build --force-recreate
+  # With the -f files named, Compose v2.40.0's `down` leaves the containers of
+  # a profile-gated service running (math-python is one), so a service taken
+  # off DELPHI_SERVICES would keep running on the previous image. Remove, by
+  # name, every service of this project that still has a container and is not
+  # in DELPHI_SERVICES; the services in it are left to `up` exactly as before.
+  # `ps -a --services` lists those containers; `rm -s -f` with no service
+  # named would remove every service's, so it runs only with a name.
+  DELPHI_LEFT_RUNNING=$("${COMPOSE[@]}" ps -a --services)
+  DELPHI_UNNAMED=()
+  for service in $DELPHI_LEFT_RUNNING; do
+    case " ${DELPHI_SERVICES[*]} " in
+      *" $service "*) ;;
+      *) DELPHI_UNNAMED+=("$service") ;;
+    esac
+  done
+  if [ "${#DELPHI_UNNAMED[@]}" -gt 0 ]; then
+    echo "Removing containers of services this box no longer runs: ${DELPHI_UNNAMED[*]}"
+    "${COMPOSE[@]}" rm -s -f "${DELPHI_UNNAMED[@]}"
+  fi
+  "${COMPOSE[@]}" up -d "${DELPHI_SERVICES[@]}" --no-build --force-recreate
 elif [ "$SERVICE_FROM_FILE" == "delphi-large" ]; then
   # The large memory class box (P-073 r2). Its worker is the polis-jobs
   # daemon run as worker class `large`, which starts `math_poller.py --job`
