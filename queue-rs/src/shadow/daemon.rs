@@ -13,10 +13,10 @@
 //! Before it replaces itself it also decides the thread counts of the
 //! pipeline's libraries (`thread_settings`). None of torch, Numba or the BLAS
 //! libraries reads a CPU quota, so when the container is fenced (a CPU quota,
-//! such as an operator's `DELPHI_SHADOW_CONTAINER_CPUS=2` for Compose's
-//! `cpus:`, or a CPU set narrower than the box) it sets one thread per CPU
-//! the container may use. Unfenced (the shadow's default: no CPU limit) it
-//! sets nothing, and each library counts the box's CPUs itself.
+//! Compose's `cpus:`, 2 by default for the shadow, or a CPU set narrower than
+//! the box) it sets one thread per CPU the container may use. Unfenced (an
+//! operator's `DELPHI_SHADOW_CONTAINER_CPUS=0`) it sets nothing, and each
+//! library counts the box's CPUs itself.
 use super::config::{ConfigError, ENV_PREFIX, valid_env};
 use std::path::Path;
 
@@ -166,6 +166,25 @@ pub fn check<F: Fn(&str) -> Option<String>>(get: F) -> Result<String, ConfigErro
             "daemon: DELPHI_RESULT_ENV must equal QUEUE_ENV: the shadow's runs never write results under another env"
                 .into(),
         ));
+    }
+    if get("DELPHI_SHADOW_GRAPH_DAEMON").as_deref() == Some("1") {
+        let stages = get("POLIS_JOBS_STAGES").unwrap_or_default();
+        let stages: std::collections::BTreeSet<_> = stages.split(',').collect();
+        let expected: std::collections::BTreeSet<_> =
+            crate::jobs::config::GRAPH_STAGES.iter().copied().collect();
+        if stages != expected
+            || get("POLIS_JOBS_CONCURRENCY").as_deref() != Some("1")
+            || get("POLIS_JOBS_JOURNAL_HOST_FILE").is_none_or(|v| v.is_empty())
+        {
+            return Err(ConfigError(
+                "graph daemon: stages, concurrency or host journal setting".into(),
+            ));
+        }
+        if std::process::id() != 1 {
+            return Err(ConfigError(
+                "graph daemon: requires PID 1 in its private container namespace".into(),
+            ));
+        }
     }
     Ok(queue)
 }
